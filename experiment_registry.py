@@ -49,13 +49,25 @@ def evaluate_experiment(row: dict[str, Any], train_metrics: dict[str, Any], test
     status = "passed" if not errors else "failed"
     return {**row, "status": status, "evaluated_at": utc_now(), "train_metrics": train_metrics, "test_metrics": test_metrics, "errors": errors}
 
+def latest_by_experiment(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered: list[str] = []
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("experiment_id") or "")
+        if not key:
+            continue
+        if key not in latest:
+            ordered.append(key)
+        latest[key] = row
+    return [latest[key] for key in ordered]
+
 
 def write_latest(path: Path = EXPERIMENTS_JSONL, output_path: Path = EXPERIMENTS_LATEST) -> dict[str, Any]:
-    rows = read_jsonl(path)
+    rows = latest_by_experiment(read_jsonl(path))
     by_status: dict[str, int] = {}
     for row in rows:
         status = str(row.get("status") or "unknown")
         by_status[status] = by_status.get(status, 0) + 1
-    payload = {"schema_version": SCHEMA_VERSION, "updated_at": utc_now(), "experiment_count": len(rows), "by_status": by_status}
+    payload = {"schema_version": SCHEMA_VERSION, "updated_at": utc_now(), "experiment_count": len(rows), "by_status": by_status, "rows": rows[-30:], "can_place_live_orders": False}
     write_json_atomic(output_path, payload)
     return payload

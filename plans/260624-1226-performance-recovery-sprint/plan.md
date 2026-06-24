@@ -944,6 +944,66 @@ venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\te
 
 Result: `131 passed`.
 
+### 2026-06-24 Phase 7 Walk-Forward Validation Active
+
+Implemented conservative walk-forward validation for paper-only skill patches:
+
+- Created `walk_forward_validator.py` to evaluate applied skill patches against future post-trade reviews.
+- The validator writes:
+  - `state/agent_memory/experiments.jsonl`
+  - `state/agent_memory/experiments_latest.json`
+  - `state/agent_memory/walk_forward_latest.json`
+- Train/test windows are separated at `applied_at`; reviews at the exact patch timestamp stay out of the future test window.
+- Invalid patch metadata such as missing setup id or invalid `applied_at` fails closed.
+- Experiment latest snapshots now dedupe repeated history rows by experiment id and expose recent rows for dashboard use.
+- Promotion board now consumes walk-forward status:
+  - active paper-only skill patches require walk-forward evidence.
+  - each active patch id must have its own latest walk-forward row; stale passed experiments for other patches cannot satisfy the gate.
+  - running/missing/failed walk-forward validation keeps promotion in `paper_learning`.
+  - no code path enables live order placement.
+- Walk-forward latest only summarizes `wf_` patch experiments, so unrelated hypothesis experiments cannot inflate pass/fail/running counts.
+- Dashboard Learning/Ops now shows:
+  - walk-forward experiment counts
+  - running/passed/failed status
+  - recent experiment rows with future trade count, expectancy, PF, and errors.
+
+Runtime state after first validator pass:
+
+- Active patch: `skill_patch_f4c58c4c21a885694a1e`
+- Setup: `exhaustion_fade`
+- Walk-forward status: `running`
+- Future sample: `6 / 20` required trades
+- Future expectancy after fees: `-0.29683855`
+- Promotion remains blocked by:
+  - `daily_exam_below_threshold`
+  - `trial_too_short`
+  - `walk_forward_validation_running`
+  - `walk_forward_not_all_patches_passed`
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile walk_forward_validator.py experiment_registry.py promotion_board.py agent_status_dashboard.py tests\test_phase_d_skill_evolution.py tests\test_phase_f_autonomy_promotion.py tests\test_agent_status_dashboard.py
+venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\test_phase_f_autonomy_promotion.py tests\test_agent_status_dashboard.py -q
+venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py tests\test_candidate_feeder_and_promotion_loop.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_process_supervisor.py tests\test_agent_status_dashboard.py tests\test_phase_f_autonomy_promotion.py -q
+venv\Scripts\python.exe walk_forward_validator.py --once --min-test-trades 20
+venv\Scripts\python.exe agent_status_dashboard.py --once
+venv\Scripts\python.exe agent_process_supervisor.py --status
+```
+
+Audit fixes after independent review:
+
+- Fixed aggregate-count promotion risk by matching active `patch_id` values directly.
+- Fixed mixed experiment-history risk by filtering `walk_forward_latest.json` to `wf_` patch rows with `patch_id`.
+- Added tests for old passed patch vs new active patch and non-walk-forward experiment contamination.
+
+Results:
+
+- Focused tests after audit fix: `50 passed`.
+- Expanded regression after audit fix: `148 passed`.
+- Dashboard API: `200`.
+- Supervisor duplicate count: `0`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

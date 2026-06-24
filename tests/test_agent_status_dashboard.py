@@ -307,6 +307,7 @@ def test_load_dashboard_status_from_fake_state(tmp_path: Path, monkeypatch):
     write_json(memory / "daily_exam_latest.json", {"ts": "now", "local_date": "2026-06-21", "exam_type": "risk_gate_review", "quality_score": 62.5, "quality_grade": "D", "exam_score": 85, "passed": True, "rubric": {"scores": {"risk_discipline": {"score": 0.9}}}, "contract": {"paper_only": True}})
     write_json(memory / "llm_reasoning_latest.json", {"ts": "now", "status": "ok", "provider": {"provider": "9router", "deep_model": "gpt-5.5", "quick_model": "gpt-5.5"}, "reasoning": {"summary": "gom thêm mẫu", "critical_blindspots": ["negative_shadow_edge"], "risk_proposal": {"can_place_live_orders": False, "can_loosen_risk": False}}})
     write_json(memory / "promotion_board_latest.json", {"evaluated_at": "now", "state": "paper_learning", "passed": False, "failures": ["insufficient_paper_trades"], "requirements": {"paper_trades": 300}, "metrics": {"paper_trades": 2}, "can_place_live_orders": False})
+    write_json(memory / "walk_forward_latest.json", {"updated_at": "now", "experiment_count": 1, "by_status": {"running": 1}, "rows": [{"patch_id": "p1", "setup_id": "fade", "status": "running", "test_metrics": {"trades": 3, "expectancy_after_fees": 0.01, "profit_factor": 1.2}, "errors": ["insufficient_future_trades"]}], "can_place_live_orders": False})
     write_json(memory / "model_usage_latest.json", {"call_count": 3, "input_tokens_est": 100, "output_tokens_est": 50, "cost_usd_est": 0, "can_place_live_orders": False})
     write_json(state / "paper_account.json", {"equity": "100.0", "starting_equity": "100.0", "open_positions": [{"symbol": "BTCUSDT", "margin": "5", "notional": "50"}]})
     write_json(state / "market_observer_heartbeat.json", {"ts": dash.utc_now(), "pid": 123, "status": "ok"})
@@ -338,6 +339,9 @@ def test_load_dashboard_status_from_fake_state(tmp_path: Path, monkeypatch):
     assert status["llm_reasoning"]["can_place_live_orders"] is False
     assert status["ops"]["promotion"]["state"] == "paper_learning"
     assert status["ops"]["promotion"]["can_place_live_orders"] is False
+    assert status["ops"]["experiments"]["experiment_count"] == 1
+    assert status["ops"]["experiments"]["running"] == 1
+    assert status["ops"]["experiments"]["can_place_live_orders"] is False
     assert status["ops"]["model_usage"]["call_count"] == 3
 
 
@@ -390,4 +394,6 @@ def test_html_is_single_page_dashboard():
     assert "Counterfactual attach" in dash.HTML
     assert "Counterfactual replay" in dash.HTML
     assert "renderCounterfactualLearning" in dash.HTML
+    assert "Walk-forward validation" in dash.HTML
+    assert "renderWalkForwardLearning" in dash.HTML
     assert "window.open" not in dash.HTML

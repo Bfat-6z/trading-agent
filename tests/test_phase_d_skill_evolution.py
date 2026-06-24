@@ -4,6 +4,15 @@ import capital_allocation_policy as cap
 import experiment_registry as exp
 import setup_ranker
 import skill_forge_agent as sfa
+import walk_forward_validator as wfv
+
+def review_row(setup_id: str, ts: str, net: float, review_id: str) -> dict:
+    return {
+        "review_id": review_id,
+        "reviewed_at": ts,
+        "source_trade": {"setup_id": setup_id, "close_ts": ts, "net": str(net)},
+        "costs": {"net": str(net)},
+    }
 
 
 def test_experiment_rejects_overlapping_train_test_windows(tmp_path: Path, monkeypatch):
@@ -28,6 +37,101 @@ def test_experiment_fails_train_only_edge():
 
     assert result["status"] == "failed"
     assert "test_metric_not_positive" in result["errors"]
+
+def test_walk_forward_running_until_future_sample():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    reviews = [
+        review_row("fade", "2026-06-24T09:00:00+00:00", -0.2, "r1"),
+        review_row("fade", "2026-06-24T10:00:00+00:00", 5.0, "boundary"),
+        review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r2"),
+    ]
+
+    result = wfv.evaluate_patch_walk_forward(patch, reviews, min_test_trades=2)
+
+    assert result["status"] == "running"
+    assert result["test_metrics"]["trades"] == 1
+    assert "insufficient_future_trades" in result["errors"]
+    assert result["can_place_live_orders"] is False
+
+def test_walk_forward_passes_with_future_positive_expectancy():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    reviews = [
+        review_row("fade", "2026-06-24T09:00:00+00:00", -0.2, "r1"),
+        review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r2"),
+        review_row("fade", "2026-06-24T10:10:00+00:00", 0.4, "r3"),
+    ]
+
+    result = wfv.evaluate_patch_walk_forward(patch, reviews, min_test_trades=2)
+
+    assert result["status"] == "passed"
+    assert result["test_metrics"]["trades"] == 2
+    assert result["test_metrics"]["expectancy_after_fees"] == 0.3
+
+def test_walk_forward_fails_with_future_negative_expectancy():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    reviews = [
+        review_row("fade", "2026-06-24T10:05:00+00:00", -0.5, "r1"),
+        review_row("fade", "2026-06-24T10:10:00+00:00", 0.1, "r2"),
+    ]
+
+    result = wfv.evaluate_patch_walk_forward(patch, reviews, min_test_trades=2)
+
+    assert result["status"] == "failed"
+    assert "future_expectancy_not_positive" in result["errors"]
+    assert "future_profit_factor_too_low" in result["errors"]
+
+def test_walk_forward_run_once_writes_latest_rows_without_live_permission(tmp_path: Path):
+    applied = tmp_path / "applied.jsonl"
+    pending = tmp_path / "pending.jsonl"
+    reviews = tmp_path / "reviews.jsonl"
+    history = tmp_path / "experiments.jsonl"
+    latest = tmp_path / "experiments_latest.json"
+    walk_latest = tmp_path / "walk_forward_latest.json"
+    wfv.append_jsonl(applied, {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "status": "paper_only_applied"})
+    wfv.append_jsonl(reviews, review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1"))
+    wfv.append_jsonl(reviews, review_row("fade", "2026-06-24T10:10:00+00:00", 0.2, "r2"))
+
+    result = wfv.run_once(
+        applied_path=applied,
+        pending_path=pending,
+        reviews_path=reviews,
+        history_path=history,
+        latest_path=latest,
+        walk_forward_path=walk_latest,
+        min_test_trades=2,
+    )
+
+    assert result["experiment_count"] == 1
+    assert result["by_status"]["passed"] == 1
+    assert result["rows"][0]["patch_id"] == "p1"
+    assert result["can_place_live_orders"] is False
+    assert walk_latest.exists()
+
+def test_walk_forward_latest_ignores_non_walk_forward_experiments(tmp_path: Path):
+    history = tmp_path / "experiments.jsonl"
+    latest = tmp_path / "experiments_latest.json"
+    walk_latest = tmp_path / "walk_forward_latest.json"
+    wfv.append_jsonl(history, {"experiment_id": "exp_old", "status": "passed", "setup_id": "other"})
+    result = wfv.write_outputs(
+        [
+            {
+                "experiment_id": "wf_p1",
+                "patch_id": "p1",
+                "setup_id": "fade",
+                "status": "running",
+                "errors": ["insufficient_future_trades"],
+                "test_metrics": {"trades": 1},
+                "can_place_live_orders": False,
+            }
+        ],
+        history_path=history,
+        latest_path=latest,
+        walk_forward_path=walk_latest,
+    )
+
+    assert result["experiment_count"] == 1
+    assert result["by_status"] == {"running": 1}
+    assert result["rows"][0]["experiment_id"] == "wf_p1"
 
 
 def test_setup_ranker_penalizes_high_winrate_bad_expectancy(tmp_path: Path):

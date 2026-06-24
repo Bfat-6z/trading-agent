@@ -60,6 +60,58 @@ def test_promotion_board_passes_live_review_candidate_without_live_orders(tmp_pa
     assert result["state"] == "live_review_candidate"
     assert result["can_place_live_orders"] is False
 
+def test_promotion_board_blocks_running_walk_forward_patch(tmp_path: Path):
+    result = pb.evaluate_promotion(
+        {
+            "paper_trades": 300,
+            "shadow_closes": 1000,
+            "lifecycle_completeness": 0.995,
+            "daily_exam_avg": 85,
+            "trial_days": 14,
+            "portfolio_risk_status": "ok",
+            "walk_forward_required": True,
+            "walk_forward_status": "running",
+            "walk_forward_running": 1,
+            "walk_forward_passed": 0,
+            "walk_forward_failed": 0,
+            "active_skill_patches": 1,
+        },
+        output_path=tmp_path / "promotion.json",
+    )
+
+    assert result["passed"] is False
+    assert result["state"] == "paper_learning"
+    assert "walk_forward_validation_running" in result["failures"]
+    assert "walk_forward_not_all_patches_passed" in result["failures"]
+    assert result["can_place_live_orders"] is False
+
+def test_promotion_board_requires_active_patch_identity_match(tmp_path: Path):
+    metrics = {
+        "paper_trades": 300,
+        "shadow_closes": 1000,
+        "lifecycle_completeness": 0.995,
+        "daily_exam_avg": 85,
+        "trial_days": 14,
+        "portfolio_risk_status": "ok",
+        **pb.walk_forward_metrics(
+            {
+                "experiment_count": 1,
+                "by_status": {"passed": 1},
+                "rows": [{"patch_id": "old_patch", "status": "passed"}],
+            },
+            ["new_patch"],
+        ),
+    }
+
+    result = pb.evaluate_promotion(metrics, output_path=tmp_path / "promotion.json")
+
+    assert result["passed"] is False
+    assert result["state"] == "paper_learning"
+    assert result["metrics"]["walk_forward_status"] == "missing"
+    assert result["metrics"]["walk_forward_missing_patch_ids"] == ["new_patch"]
+    assert "walk_forward_missing" in result["failures"]
+    assert result["can_place_live_orders"] is False
+
 
 def test_alert_manager_redacts_and_dedupes(tmp_path: Path):
     latest = tmp_path / "alerts_latest.json"
