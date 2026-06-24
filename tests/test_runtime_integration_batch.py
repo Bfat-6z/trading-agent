@@ -1,0 +1,240 @@
+from pathlib import Path
+
+import agent_work_queue as awq
+import autonomous_paper_trading_loop as loop
+import inner_critic
+import dont_do_memory as ddm
+import llm_output_quality_gate as lqg
+import paper_execution_simulator as pes
+import paper_portfolio_manager as ppm
+import skill_forge_agent as sfa
+import instrument_registry as registry
+import microstructure_observer_loop as micro_loop
+import alert_manager as alerts
+import backup_restore as br
+import daily_exam_agent as dea
+import llm_council
+import model_usage_ledger as mul
+import security_import_guard as sig
+import preflight_guard as pfg
+
+def test_claim_next_of_types_ignores_unrelated_jobs(tmp_path: Path):
+    db = tmp_path / "jobs.sqlite"
+    awq.enqueue_job("daily_exam_task", {"x": 1}, priority=99, db_path=db)
+    awq.enqueue_job("setup_review", {"candidate": {"symbol": "BTCUSDT", "side": "LONG", "setup_id": "s"}}, priority=1, db_path=db)
+
+    job = awq.claim_next_of_types("worker", ["setup_review"], db_path=db)
+
+    assert job is not None
+    assert job["job_type"] == "setup_review"
+
+def test_autonomous_paper_loop_once_is_paper_only(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(loop, "MEMORY_DIR", memory)
+    monkeypatch.setattr(loop, "LATEST_PATH", memory / "autonomous_paper_trading_loop_latest.json")
+    monkeypatch.setattr(loop, "HISTORY_PATH", memory / "autonomous_paper_trading_loop_history.jsonl")
+    monkeypatch.setattr(loop, "HEARTBEAT_PATH", tmp_path / "autonomous_paper_trading_loop_heartbeat.json")
+    monkeypatch.setattr(loop, "CANDIDATES_PATH", memory / "paper_candidates_latest.json")
+    monkeypatch.setattr(loop, "kill_switch_active", lambda: False)
+    monkeypatch.setattr(loop, "evaluate_live_permission", lambda request: {"allowed": True})
+    monkeypatch.setattr(loop, "evaluate_circuit_breakers", lambda metrics: {"allowed": True, "action": "allow"})
+    monkeypatch.setattr(loop, "load_account", lambda: {"equity": "100", "cash": "100"})
+    monkeypatch.setattr(loop, "load_queue_candidate_batch", lambda worker_id: ({}, None))
+    monkeypatch.setattr(loop, "decide_paper_action", lambda candidates, setup_stats, account, exploration_allowed=False: {"action": "skip", "can_place_live_orders": False})
+
+    result = loop.run_once()
+
+    assert result["can_place_live_orders"] is False
+    assert result["decision"]["can_place_live_orders"] is False
+    assert loop.HEARTBEAT_PATH.exists()
+
+def test_inner_critic_uses_dont_do_shadow_only(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(ddm, "DONT_DO_PATH", tmp_path / "dont_do.json")
+    monkeypatch.setattr(inner_critic, "evaluate_dont_do_candidate", lambda signal: {"action": "shadow_only", "blocked": True, "matches": [{"rule_id": "r1"}]})
+    monkeypatch.setattr(inner_critic, "safe_append_event", lambda *args, **kwargs: None)
+    signal = {"symbol": "BTCUSDT", "side": "LONG", "score": 9, "setup_id": "momentum_continuation"}
+    snapshot = {"ts": inner_critic.utc_now()}
+    library = {"skills": {"momentum_continuation": {"enabled": True, "stats": {}}}}
+    monkeypatch.setattr(inner_critic, "match_setup", lambda *args, **kwargs: [{"setup_id": "momentum_continuation", "confidence": 0.8}])
+
+    verdict = inner_critic.evaluate_signal(signal, bias={"min_signal_score": 6}, snapshot=snapshot, market_model={}, library=library, hypotheses_result={"hypotheses": [{"setup_id": "momentum_continuation", "symbols": ["BTCUSDT"], "prediction": {"side": "LONG"}, "hypothesis_id": "h1"}]}, news_context={})
+
+    assert verdict["verdict"] == "tighten"
+    assert "dont_do_memory_shadow_only" in verdict["reasons"]
+
+def test_llm_reasoning_quality_gate_forces_no_live():
+    result = lqg.sanitize_output({"summary": "ok", "risk_proposal": {"can_place_live_orders": True, "can_loosen_risk": True}}, kind="llm_reasoning")
+
+    assert result["ok"] is False
+    assert result["sanitized"]["can_place_live_orders"] is False
+    assert "unsafe_risk_or_live_permission" in result["errors"]
+
+def test_skill_forge_applies_paper_shadow_patch_metadata(monkeypatch, tmp_path: Path):
+    pending = tmp_path / "pending.jsonl"
+    output = tmp_path / "integration.json"
+    library = {"skills": {"s1": {"setup_id": "s1", "metadata": {}}}, "history": []}
+    saved = {}
+    monkeypatch.setattr(sfa, "load_library", lambda: library)
+    monkeypatch.setattr(sfa, "save_library", lambda payload: saved.setdefault("library", payload) or payload)
+    sfa.append_jsonl_once(pending, {"patch_id": "p1", "setup_id": "s1", "patch_type": "tighten", "invalidation": "bad spread", "status": "paper_shadow_only", "evidence": {"sample_size": 30}}, "patch_id")
+
+    result = sfa.apply_paper_shadow_patches(pending_path=pending, output_path=output)
+
+    assert result["applied_count"] == 1
+    patch = saved["library"]["skills"]["s1"]["metadata"]["paper_shadow_patches"][0]
+    assert patch["live_enabled"] is False
+
+def test_paper_portfolio_open_and_close_lifecycle(monkeypatch, tmp_path: Path):
+    account_path = tmp_path / "paper_account.json"
+    monkeypatch.setattr(ppm, "POSITION_HISTORY_PATH", tmp_path / "positions.jsonl")
+    account = ppm.default_account()
+    risk = ppm.evaluate_paper_order("BTCUSDT", "LONG", "100", "99", "102", requested_margin="5", requested_leverage="2", account=account, config={"mode": "paper_learning", "live_execution_enabled": False, "feature_flags": {"paper_trading": True, "live_orders": False}})
+
+    opened = ppm.open_paper_position(risk, account=account, path=account_path)
+    closed = ppm.close_paper_position(opened["position"]["position_id"], "101", fee="0.01", account=opened["account"], path=account_path)
+
+    assert opened["ok"] is True
+    assert closed["ok"] is True
+    assert closed["account"]["open_positions"] == []
+    assert float(closed["account"]["equity"]) > 100
+
+def test_paper_execution_partial_fill_tracks_remaining_qty(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "orders.jsonl")
+
+    result = pes.simulate_entry_order("BTCUSDT", "LONG", "market", "2", "100", {"ts": "x", "open": 100, "high": 101, "low": 99, "fill_fraction": "0.25"})
+
+    assert result["status"] == "partial"
+    assert result["filled_qty"] == "0.5"
+    assert result["remaining_qty"] == "1.5"
+
+def test_instrument_registry_refreshes_exchange_info_with_leverage_brackets(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(registry, "QUALITY_PATH", tmp_path / "quality.json")
+    exchange_info = {"symbols": [{"symbol": "btcusdt", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING", "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.1"}, {"filterType": "LOT_SIZE", "stepSize": "0.001"}, {"filterType": "MIN_NOTIONAL", "notional": "5"}]}]}
+    leverage = [{"symbol": "BTCUSDT", "brackets": [{"initialLeverage": 50}]}]
+
+    payload = registry.refresh_registry_from_exchange_info(exchange_info, leverage_payload=leverage, path=tmp_path / "registry.json")
+
+    btc = payload["instruments"]["BTCUSDT"]
+    assert btc["max_leverage"] == "50"
+    assert registry.can_trade_paper("BTCUSDT", payload)["can_trade_paper"] is True
+
+def test_microstructure_loop_evaluates_local_sources(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(micro_loop, "MEMORY_DIR", memory)
+    monkeypatch.setattr(micro_loop, "LATEST_PATH", memory / "micro_latest.json")
+    monkeypatch.setattr(micro_loop, "HISTORY_PATH", memory / "micro_history.jsonl")
+    monkeypatch.setattr(micro_loop, "HEARTBEAT_PATH", tmp_path / "micro_heartbeat.json")
+    monkeypatch.setattr(micro_loop, "DERIVATIVES_SOURCE", tmp_path / "derivatives_source_latest.json")
+    monkeypatch.setattr(micro_loop, "ORDERBOOK_SOURCE", tmp_path / "orderbook_source_latest.json")
+    monkeypatch.setattr(micro_loop, "LIQUIDATIONS_SOURCE", tmp_path / "liquidations_source_latest.json")
+    micro_loop.write_json_atomic(micro_loop.DERIVATIVES_SOURCE, {"symbol": "BTCUSDT", "funding_rate": "0.0001", "oi_now": 110, "oi_prev": 100})
+    micro_loop.write_json_atomic(micro_loop.ORDERBOOK_SOURCE, {"symbol": "BTCUSDT", "bids": [[100, 10]], "asks": [[100.01, 10]], "max_spread_bps": 8})
+    micro_loop.write_json_atomic(micro_loop.LIQUIDATIONS_SOURCE, {"symbol": "BTCUSDT", "events": [{"ts": "x", "side": "LONG", "notional": 2_000_000}]})
+
+    result = micro_loop.run_once()
+
+    assert result["status"] == "ok"
+    assert result["result_count"] == 3
+    assert result["can_place_live_orders"] is False
+
+def test_microstructure_loop_reads_evaluated_latest_snapshots(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(micro_loop, "MEMORY_DIR", memory)
+    monkeypatch.setattr(micro_loop, "LATEST_PATH", memory / "micro_latest.json")
+    monkeypatch.setattr(micro_loop, "HISTORY_PATH", memory / "micro_history.jsonl")
+    monkeypatch.setattr(micro_loop, "HEARTBEAT_PATH", tmp_path / "micro_heartbeat.json")
+    monkeypatch.setattr(micro_loop, "DERIVATIVES_SOURCE", tmp_path / "derivatives_latest.json")
+    monkeypatch.setattr(micro_loop, "ORDERBOOK_SOURCE", tmp_path / "orderbook_microstructure_latest.json")
+    monkeypatch.setattr(micro_loop, "LIQUIDATIONS_SOURCE", tmp_path / "liquidations_latest.json")
+    micro_loop.write_json_atomic(micro_loop.DERIVATIVES_SOURCE, {"symbol": "BTCUSDT", "status": "ok", "funding_rate": 0.0001, "open_interest_delta": 0.1})
+    micro_loop.write_json_atomic(micro_loop.ORDERBOOK_SOURCE, {"symbol": "BTCUSDT", "paper_entry_allowed": True, "spread_bps": 1.0})
+    micro_loop.write_json_atomic(micro_loop.LIQUIDATIONS_SOURCE, {"symbol": "BTCUSDT", "burst": True, "total_notional": 2_000_000})
+
+    result = micro_loop.run_once()
+
+    assert result["status"] == "ok"
+    assert result["result_count"] == 3
+    assert result["results"]["orderbook"]["paper_entry_allowed"] is True
+
+def test_preflight_reads_actual_market_and_news_latest_paths(monkeypatch, tmp_path: Path):
+    state = tmp_path / "state"
+    memory = state / "agent_memory"
+    memory.mkdir(parents=True)
+    monkeypatch.setattr(pfg, "STATE_DIR", state)
+    monkeypatch.setattr(pfg, "MEMORY_DIR", memory)
+    pfg.write_json_atomic(state / "market_updates_latest.json", {"ts": pfg.utc_now(), "hot": [{"symbol": "BTCUSDT"}]})
+    pfg.write_json_atomic(memory / "news_latest.json", {"ts": pfg.utc_now(), "macro_risk_score": 0.2})
+    pfg.write_json_atomic(memory / "trade_lifecycle_latest.json", {"ts": pfg.utc_now(), "learning_allowed": True})
+
+    result = pfg.run_preflight(
+        {"action": "paper_decision", "requires_fresh_market": True, "requires_lifecycle_clean": True},
+        config={"mode": "paper_learning", "live_execution_enabled": False, "feature_flags": {"paper_trading": True, "live_orders": False}},
+        output_path=state / "preflight_latest.json",
+    )
+
+    assert result["allowed"] is True
+    assert "missing_market_observer" not in result["warnings"]
+    assert "missing_news_observer" not in result["warnings"]
+    assert result["freshness"]["market_observer"]["exists"] is True
+    assert result["freshness"]["news_observer"]["exists"] is True
+
+def test_alert_manager_queues_local_and_webhook(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(alerts, "ALERTS_HISTORY", tmp_path / "alerts.jsonl")
+    monkeypatch.setattr(alerts, "ALERTS_LATEST", tmp_path / "alerts.json")
+    monkeypatch.setattr(alerts, "ALERT_OUTBOX", tmp_path / "outbox.jsonl")
+    monkeypatch.setattr(alerts, "WEBHOOK_OUTBOX", tmp_path / "webhook.jsonl")
+
+    result = alerts.emit_and_queue_alert("warn", "quota low", "token=SECRET123456789012345678901234567890", channels=["local", "webhook"])
+
+    assert len(result["queued_channels"]) == 2
+    assert "SECRET" not in (tmp_path / "webhook.jsonl").read_text(encoding="utf-8")
+
+def test_backup_restore_migrates_json_state(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(br, "BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(br, "BACKUP_MANIFESTS", tmp_path / "manifests")
+    source = tmp_path / "state.json"
+    br.write_json_atomic(source, {"value": 1})
+
+    result = br.migrate_json_state([source], target_schema_version=99, output_path=tmp_path / "migration.json")
+
+    assert result["ok"] is True
+    assert br.sha256_file(source)
+    assert br.write_json_atomic is not None
+
+def test_daily_exam_prioritizes_self_model_gaps(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(dea, "SELF_MODEL", tmp_path / "self_model.json")
+    dea.write_json(dea.SELF_MODEL, {"known_gaps": ["trade_lifecycle_not_clean"]})
+    inputs = dea.load_inputs(max_log_lines=50)
+
+    assert dea.choose_exam_type(inputs, "2026-06-21") == "risk_gate_review"
+
+def test_llm_council_run_role_uses_router_and_sanitizer(tmp_path: Path):
+    def fake_call(system: str, user: str, model: str) -> str:
+        return '{"summary":"ok","data_ids":["d1"],"recommendation":"paper test only","risk_proposal":{"can_place_live_orders":true}}'
+
+    result = llm_council.run_role("risk_critic", {"x": 1}, ["d1"], llm_call=fake_call, history_path=tmp_path / "council.jsonl")
+
+    assert result["accepted"] is False
+    assert "unsafe_risk_or_live_permission" in result["errors"]
+    assert result["payload"]["can_place_live_orders"] is False
+
+def test_model_usage_ledger_records_local_cost_summary(tmp_path: Path):
+    history = tmp_path / "usage.jsonl"
+    latest = tmp_path / "usage.json"
+
+    row = mul.record_model_usage("daily_exam", "gpt-5.5", "9router", prompt="hello", response="world", history_path=history, latest_path=latest)
+
+    assert row["input_tokens_est"] >= 1
+    assert mul.summarize_model_usage(history)["call_count"] == 1
+
+def test_security_import_guard_flags_forbidden_live_import(tmp_path: Path):
+    module = tmp_path / "paper_agent.py"
+    module.write_text("import binance.client\n", encoding="utf-8")
+
+    result = sig.scan_import_guard([module], output_path=tmp_path / "guard.json")
+
+    assert result["ok"] is False
+    assert result["violations"][0]["forbidden_imports"] == ["binance.client"]

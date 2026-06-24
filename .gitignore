@@ -1,0 +1,56 @@
+# Secrets — NEVER commit these
+.env
+.env.local
+secrets/
+bot-wallet.json
+*.key
+*.pem
+
+# Runtime state
+state/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Project
+# Cloned upstream source, do not commit into this repo.
+tradingagents_crypto_src/
+
+# Generated research/runtime artifacts
+plans/reports/
+plans/**/reports/
+charts/
+dashboard-*.png
+_*.json
+temp_*.json
+depth_*.json
+reddit_*.json
+funding_snap.json
+hype.json
+doge.json
+near.json
+pepe.json
+sol.json
+sui.json
+zec.json
+keo-moi-mailtrading-agent*.json
+trading-agent.bat
