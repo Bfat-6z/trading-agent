@@ -18,7 +18,16 @@ def test_quality_rubric_rewards_risk_discipline_and_fresh_data():
         "self_improvement": {"ts": now, "overall_learning_score": 0.7, "guardrail_proposal": {"can_trade_live": False, "can_loosen": False}},
         "live_readiness": {"mode": "paper"},
         "shadow": {"overall": {"closed": 500, "win_rate": 0.55, "expectancy": 0.01, "profit_factor": 1.3}},
-        "paper": {"closes": 50, "win_rate": 0.5},
+        "paper": {"closes": 50, "win_rate": 0.5, "net": 2.0},
+        "post_trade": {"review_quality": {"cost_coverage_pct": 0.9, "r_multiple_coverage_pct": 0.85}},
+        "counterfactual": {"ts": now, "coverage_pct": 0.85, "replay_count": 40, "complete_count": 36},
+        "walk_forward": {
+            "updated_at": now,
+            "by_status": {"passed": 1, "running": 0, "failed": 0},
+            "rows": [{"status": "passed", "min_test_trades": 20, "test_metrics": {"trades": 24, "expectancy_after_fees": 0.03, "profit_factor": 1.2}, "errors": [], "can_place_live_orders": False}],
+            "can_place_live_orders": False,
+        },
+        "promotion": {"can_place_live_orders": False, "failures": []},
         "setups": [{"trades": 25, "expectancy": 0.01, "win_rate": 0.55}],
         "previous_exam": {},
     }

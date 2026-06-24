@@ -179,3 +179,25 @@ def test_autonomous_paper_brain_floors_margin_cap_to_avoid_cap_reject():
 
     assert margin <= 98.28012261 * brain.MAX_PAPER_MARGIN_FRACTION
     assert margin == 24.57003
+
+def test_autonomous_paper_brain_clamps_rounded_risk_budget_before_order_eval():
+    account = {"equity": "82.284433469018500", "cash": "79.428892"}
+    candidate = {"symbol": "HUSDT", "side": "LONG", "entry": "0.06279", "sl": "0.06122025", "tp": "0.0644382375", "leverage": 5}
+
+    margin = brain.futures_margin_from_risk_budget(candidate, {"max_loss_usdt": 1.645689}, account)
+    risk = brain.evaluate_paper_order(
+        candidate["symbol"],
+        candidate["side"],
+        candidate["entry"],
+        candidate["sl"],
+        candidate["tp"],
+        requested_margin=margin,
+        requested_leverage=candidate["leverage"],
+        setup_id="funding_squeeze",
+        account=account,
+        config={"mode": "paper_learning", "feature_flags": {"paper_trading": True, "live_orders": False}},
+    )
+
+    assert risk["can_open_paper"] is True
+    assert "estimated_loss_above_risk_cap" not in risk["errors"]
+    assert float(risk["estimated_loss"]) <= float(risk["max_loss"])

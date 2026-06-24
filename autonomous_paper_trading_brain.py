@@ -13,7 +13,7 @@ from agent_data_contracts import SCHEMA_VERSION
 from atomic_state import append_jsonl, write_json_atomic
 from capital_allocation_policy import allocate_capital
 from dont_do_memory import evaluate_candidate
-from paper_portfolio_manager import evaluate_paper_order
+from paper_portfolio_manager import DEFAULT_MAX_RISK_FRACTION, evaluate_paper_order
 from preflight_guard import run_preflight
 from setup_ranker import rank_setups
 from timebase import utc_now
@@ -56,15 +56,43 @@ def futures_margin_from_risk_budget(candidate: dict[str, Any], allocation: dict[
     risk_distance = stop_distance_fraction(str(candidate.get("side") or ""), candidate.get("entry"), candidate.get("sl"))
     if risk_budget <= 0 or risk_distance <= 0:
         return 0.0
-    raw_margin = risk_budget / (risk_distance * leverage)
+    hard_risk_cap = equity * safe_float(DEFAULT_MAX_RISK_FRACTION, 0.02)
+    usable_risk_budget = min(risk_budget, hard_risk_cap)
+    raw_margin = usable_risk_budget / (risk_distance * leverage)
     max_margin = min(cash, equity * MAX_PAPER_MARGIN_FRACTION)
     capped = max(0.0, min(raw_margin, max_margin))
     return floor(capped * 1_000_000) / 1_000_000
 
 
-def choose_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+def candidate_route_score(candidate: dict[str, Any], setup_row: dict[str, Any] | None = None) -> float:
+    score = safe_float(candidate.get("score") or candidate.get("setup_score"))
+    row = setup_row or {}
+    if not row:
+        return score - 1.0
+    hint = str(row.get("allocation_hint") or "")
+    evidence_expectancy = safe_float(row.get("evidence_expectancy"), safe_float(row.get("expectancy")))
+    rank_score = safe_float(row.get("rank_score"))
+    if row.get("paper_only_retired"):
+        return score - 100.0
+    score += min(2.0, max(-2.0, rank_score / 2.0))
+    if hint == "normal" and evidence_expectancy > 0:
+        score += 2.0
+    elif hint == "tiny" and evidence_expectancy >= 0:
+        score += 0.75
+    elif hint == "reduced" and evidence_expectancy > 0:
+        score += 0.25
+    if evidence_expectancy <= 0:
+        score -= 3.0
+    if "non_positive_evidence_expectancy" in (row.get("rank_reasons") or []):
+        score -= 2.0
+    if safe_float(row.get("paper_only_min_score_adjustment")) > 0:
+        score -= 1.0
+    return score
+
+def choose_candidate(candidates: list[dict[str, Any]], rankings: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     eligible = [row for row in candidates if row.get("symbol") and row.get("side") and row.get("setup_id")]
-    eligible.sort(key=lambda row: float(row.get("score") or row.get("setup_score") or 0.0), reverse=True)
+    lookup = {str(row.get("setup_id")): row for row in (rankings or []) if isinstance(row, dict)}
+    eligible.sort(key=lambda row: candidate_route_score(row, lookup.get(str(row.get("setup_id") or ""))), reverse=True)
     return eligible[0] if eligible else None
 
 
@@ -83,7 +111,8 @@ def paper_only_patch_errors(candidate: dict[str, Any], rankings: list[dict[str, 
 
 
 def decide_paper_action(candidates: list[dict[str, Any]], setup_stats: list[dict[str, Any]], account: dict[str, Any], exploration_allowed: bool = False) -> dict[str, Any]:
-    candidate = choose_candidate(candidates)
+    rankings = rank_setups(setup_stats)["rankings"]
+    candidate = choose_candidate(candidates, rankings)
     if not candidate:
         decision = {"schema_version": SCHEMA_VERSION, "decided_at": utc_now(), "action": "skip", "reason": "no_candidate", "can_place_live_orders": False}
         write_json_atomic(BRAIN_LATEST, decision)
@@ -91,7 +120,6 @@ def decide_paper_action(candidates: list[dict[str, Any]], setup_stats: list[dict
         return decision
     preflight = run_preflight({"action": "paper_decision", "requires_fresh_market": False, "requires_lifecycle_clean": False}, symbol=candidate.get("symbol"))
     dont_do = evaluate_candidate(candidate)
-    rankings = rank_setups(setup_stats)["rankings"]
     allocation = allocate_capital(str(candidate.get("setup_id")), rankings, account, exploration_allowed=exploration_allowed)
     requested_margin = futures_margin_from_risk_budget(candidate, allocation, account)
     if allocation.get("allowed"):
@@ -101,6 +129,7 @@ def decide_paper_action(candidates: list[dict[str, Any]], setup_stats: list[dict
     risk["paper_sizing"] = {
         "method": "risk_budget_to_isolated_margin",
         "risk_budget_usdt": allocation.get("max_loss_usdt"),
+        "usable_risk_budget_usdt": round(min(max(0.0, safe_float(allocation.get("max_loss_usdt"))), max(0.0, safe_float(account.get("equity"), 100.0)) * safe_float(DEFAULT_MAX_RISK_FRACTION, 0.02)), 8),
         "requested_margin": requested_margin,
         "stop_distance_fraction": round(stop_distance_fraction(str(candidate.get("side") or ""), candidate.get("entry"), candidate.get("sl")), 8),
         "max_margin_fraction": MAX_PAPER_MARGIN_FRACTION,

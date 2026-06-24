@@ -156,9 +156,11 @@ def validate_trade_events(
     rows: list[dict[str, Any]],
     max_open_age_seconds: int = 6 * 60 * 60,
     max_snapshot_age_seconds: int = 15 * 60,
+    min_open_ts: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
+    min_open = parse_utc(min_open_ts)
     open_trades: dict[str, dict[str, Any]] = {}
     close_trades: set[str] = set()
     invalid_events: list[dict[str, Any]] = []
@@ -173,6 +175,10 @@ def validate_trade_events(
             ignored_events += 1
             continue
         event = canonical_trade_event(row, kind)
+        opened_at = parse_utc(event.get("open_ts"))
+        if min_open and opened_at and opened_at < min_open:
+            ignored_events += 1
+            continue
         trade_id = event.get("trade_id")
         errors: list[str] = []
         warnings: list[str] = []
@@ -240,8 +246,8 @@ def read_trade_rows(paths: Iterable[Path]) -> list[dict[str, Any]]:
     return rows
 
 
-def write_latest_report(paths: Iterable[Path] = DEFAULT_EVENT_PATHS, output_path: Path = LATEST_PATH) -> dict[str, Any]:
-    report = validate_trade_events(read_trade_rows(paths))
+def write_latest_report(paths: Iterable[Path] = DEFAULT_EVENT_PATHS, output_path: Path = LATEST_PATH, min_open_ts: Any = None) -> dict[str, Any]:
+    report = validate_trade_events(read_trade_rows(paths), min_open_ts=min_open_ts)
     write_json_atomic(output_path, report)
     return report
 

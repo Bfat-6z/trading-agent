@@ -29,7 +29,9 @@ MARKET_LATEST = STATE_DIR / "market_updates_latest.json"
 LATEST_PATH = MEMORY_DIR / "paper_candidate_feeder_latest.json"
 HISTORY_PATH = MEMORY_DIR / "paper_candidate_feeder_history.jsonl"
 CANDIDATES_PATH = MEMORY_DIR / "paper_candidates_latest.json"
+SETUP_RANKINGS_PATH = MEMORY_DIR / "setup_rankings_latest.json"
 DEFAULT_PAPER_FUTURES_LEVERAGE = 5
+PREFERRED_FUNDING_THRESHOLD = 0.15
 PAPER_SCALP_STOP_CAPS = {
     "exhaustion_fade": 0.035,
     "funding_squeeze": 0.025,
@@ -78,7 +80,113 @@ def paper_scalp_geometry(side: str, price: float, raw_sl: float, raw_tp: float, 
         return sl, tp
     return raw_sl, raw_tp
 
-def candidate_from_market_row(row: dict[str, Any], snapshot_ts: str) -> dict[str, Any] | None:
+def setup_routing_from_rankings(payload: dict[str, Any] | None) -> dict[str, Any]:
+    rankings = payload.get("rankings") if isinstance(payload, dict) and isinstance(payload.get("rankings"), list) else []
+    preferred: set[str] = set()
+    blocked: dict[str, list[str]] = {}
+    rows: dict[str, dict[str, Any]] = {}
+    for item in rankings:
+        if not isinstance(item, dict):
+            continue
+        setup_id = str(item.get("setup_id") or "")
+        if not setup_id:
+            continue
+        rows[setup_id] = item
+        reasons = [str(value) for value in item.get("rank_reasons", []) if value]
+        expectancy = f(item.get("evidence_expectancy"), f(item.get("expectancy")))
+        hint = str(item.get("allocation_hint") or "")
+        if item.get("paper_only_retired") or expectancy <= 0 or hint == "skip" or "non_positive_evidence_expectancy" in reasons:
+            blocked[setup_id] = reasons or ["setup_not_tradeable"]
+            continue
+        if hint == "normal" or expectancy > 0:
+            preferred.add(setup_id)
+    return {"preferred": preferred, "blocked": blocked, "rows": rows}
+
+def funding_squeeze_candidate(
+    row: dict[str, Any],
+    snapshot_ts: str,
+    *,
+    price: float,
+    high: float,
+    low: float,
+    range_pos: float,
+    quote_volume: float,
+    funding_pct: float,
+    preferred: bool = False,
+) -> dict[str, Any] | None:
+    threshold = PREFERRED_FUNDING_THRESHOLD if preferred else 0.25
+    if abs(funding_pct) < threshold or quote_volume < 20_000_000:
+        return None
+    setup_id = "funding_squeeze"
+    reason: list[str] = []
+    if funding_pct < 0 and range_pos <= 0.45:
+        side = "LONG"
+        raw_sl = min(low * 0.997, price * 0.99)
+        raw_tp = min(high, price + (price - raw_sl) * 1.05)
+        sl, tp = paper_scalp_geometry(side, price, raw_sl, raw_tp, setup_id)
+        reason.extend(["negative_funding_crowded", "possible_long_squeeze"])
+    elif funding_pct > 0 and range_pos >= 0.55:
+        side = "SHORT"
+        raw_sl = max(high * 1.003, price * 1.01)
+        raw_tp = max(low, price - (raw_sl - price) * 1.05)
+        sl, tp = paper_scalp_geometry(side, price, raw_sl, raw_tp, setup_id)
+        reason.extend(["positive_funding_crowded", "possible_short_squeeze"])
+    else:
+        return None
+    return build_candidate_payload(row, snapshot_ts, setup_id, side, price, sl, tp, reason, setup_bonus=0.6 if preferred else 0.0)
+
+def build_candidate_payload(
+    row: dict[str, Any],
+    snapshot_ts: str,
+    setup_id: str,
+    side: str,
+    price: float,
+    sl: float,
+    tp: float,
+    reason: list[str],
+    *,
+    setup_bonus: float = 0.0,
+    blocked_reasons: list[str] | None = None,
+) -> dict[str, Any] | None:
+    if side == "LONG" and not (sl < price < tp):
+        return None
+    if side == "SHORT" and not (tp < price < sl):
+        return None
+    change = f(row.get("change_pct"))
+    quote_volume = f(row.get("quote_volume"))
+    funding_pct = f(row.get("funding_pct"))
+    score = min(10.0, 5.0 + min(2.5, abs(change) / 18.0) + min(1.5, quote_volume / 400_000_000) + min(1.0, abs(funding_pct) / 0.5) + setup_bonus)
+    candidate = {
+        "schema_version": SCHEMA_VERSION,
+        "candidate_id": "",
+        "generated_at": utc_now(),
+        "market_snapshot_ts": snapshot_ts,
+        "symbol": str(row.get("symbol") or "").upper(),
+        "side": side,
+        "setup_id": setup_id,
+        "score": round(score, 4),
+        "entry": round(price, 10),
+        "sl": round(sl, 10),
+        "tp": round(tp, 10),
+        "leverage": DEFAULT_PAPER_FUTURES_LEVERAGE,
+        "exploration_allowed": True,
+        "source": "paper_candidate_feeder",
+        "reason": reason,
+        "setup_routing": {"setup_bonus": round(setup_bonus, 4), "blocked_reasons": blocked_reasons or []},
+        "market_features": {
+            "change_pct": change,
+            "range_pos": f(row.get("range_pos"), 0.5),
+            "quote_volume": quote_volume,
+            "funding_pct": funding_pct,
+            "hot_score": f(row.get("hot_score")),
+            "trade_count": int(f(row.get("trade_count"))),
+        },
+        "can_place_live_orders": False,
+    }
+    candidate["candidate_id"] = candidate_id(candidate, snapshot_ts)
+    return candidate
+
+def candidate_from_market_row(row: dict[str, Any], snapshot_ts: str, setup_routing: dict[str, Any] | None = None) -> dict[str, Any] | None:
     symbol = str(row.get("symbol") or "").upper()
     price = f(row.get("price"))
     high = f(row.get("high"))
@@ -89,6 +197,14 @@ def candidate_from_market_row(row: dict[str, Any], snapshot_ts: str) -> dict[str
     funding_pct = f(row.get("funding_pct"))
     if not symbol or price <= 0 or high <= 0 or low <= 0:
         return None
+    routing = setup_routing or {}
+    preferred = routing.get("preferred") if isinstance(routing.get("preferred"), set) else set()
+    blocked = routing.get("blocked") if isinstance(routing.get("blocked"), dict) else {}
+    funding_first = "funding_squeeze" in preferred
+    if funding_first:
+        candidate = funding_squeeze_candidate(row, snapshot_ts, price=price, high=high, low=low, range_pos=range_pos, quote_volume=quote_volume, funding_pct=funding_pct, preferred=True)
+        if candidate:
+            return candidate
     side = None
     setup_id = "exhaustion_fade"
     reason = []
@@ -104,60 +220,18 @@ def candidate_from_market_row(row: dict[str, Any], snapshot_ts: str) -> dict[str
         raw_tp = min(high, price + (price - raw_sl) * 1.15)
         sl, tp = paper_scalp_geometry(side, price, raw_sl, raw_tp, setup_id)
         reason.extend(["overextended_loser", "snapback_after_extreme"])
-    elif abs(funding_pct) >= 0.25 and quote_volume >= 20_000_000:
-        setup_id = "funding_squeeze"
-        if funding_pct < 0 and range_pos <= 0.45:
-            side = "LONG"
-            raw_sl = min(low * 0.997, price * 0.99)
-            raw_tp = min(high, price + (price - raw_sl) * 1.05)
-            sl, tp = paper_scalp_geometry(side, price, raw_sl, raw_tp, setup_id)
-            reason.extend(["negative_funding_crowded", "possible_long_squeeze"])
-        elif funding_pct > 0 and range_pos >= 0.55:
-            side = "SHORT"
-            raw_sl = max(high * 1.003, price * 1.01)
-            raw_tp = max(low, price - (raw_sl - price) * 1.05)
-            sl, tp = paper_scalp_geometry(side, price, raw_sl, raw_tp, setup_id)
-            reason.extend(["positive_funding_crowded", "possible_short_squeeze"])
-        else:
-            return None
     else:
+        candidate = funding_squeeze_candidate(row, snapshot_ts, price=price, high=high, low=low, range_pos=range_pos, quote_volume=quote_volume, funding_pct=funding_pct)
+        if candidate:
+            return candidate
         return None
-    if side == "LONG" and not (sl < price < tp):
-        return None
-    if side == "SHORT" and not (tp < price < sl):
-        return None
-    score = min(10.0, 5.0 + min(2.5, abs(change) / 18.0) + min(1.5, quote_volume / 400_000_000) + min(1.0, abs(funding_pct) / 0.5))
-    candidate = {
-        "schema_version": SCHEMA_VERSION,
-        "candidate_id": "",
-        "generated_at": utc_now(),
-        "market_snapshot_ts": snapshot_ts,
-        "symbol": symbol,
-        "side": side,
-        "setup_id": setup_id,
-        "score": round(score, 4),
-        "entry": round(price, 10),
-        "sl": round(sl, 10),
-        "tp": round(tp, 10),
-        "leverage": DEFAULT_PAPER_FUTURES_LEVERAGE,
-        "exploration_allowed": True,
-        "source": "paper_candidate_feeder",
-        "reason": reason,
-        "market_features": {
-            "change_pct": change,
-            "range_pos": range_pos,
-            "quote_volume": quote_volume,
-            "funding_pct": funding_pct,
-            "hot_score": f(row.get("hot_score")),
-            "trade_count": int(f(row.get("trade_count"))),
-        },
-        "can_place_live_orders": False,
-    }
-    candidate["candidate_id"] = candidate_id(candidate, snapshot_ts)
-    return candidate
+    blocked_reasons = blocked.get(setup_id, [])
+    setup_bonus = -1.2 if blocked_reasons else 0.0
+    return build_candidate_payload(row, snapshot_ts, setup_id, side, price, sl, tp, reason, setup_bonus=setup_bonus, blocked_reasons=blocked_reasons)
 
-def build_candidates(market: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
+def build_candidates(market: dict[str, Any], limit: int = 8, setup_rankings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     snapshot_ts = str(market.get("ts") or market.get("updated_at") or utc_now())
+    setup_routing = setup_routing_from_rankings(setup_rankings)
     raw_rows = []
     for key in ("hot", "top_gainers", "top_losers", "funding_extremes"):
         rows = market.get(key) if isinstance(market.get(key), list) else []
@@ -167,7 +241,7 @@ def build_candidates(market: dict[str, Any], limit: int = 8) -> list[dict[str, A
         symbol = str(row.get("symbol") or "").upper()
         if symbol and symbol not in by_symbol:
             by_symbol[symbol] = row
-    candidates = [candidate for row in by_symbol.values() if (candidate := candidate_from_market_row(row, snapshot_ts))]
+    candidates = [candidate for row in by_symbol.values() if (candidate := candidate_from_market_row(row, snapshot_ts, setup_routing))]
     candidates.sort(key=lambda row: (f(row.get("score")), f((row.get("market_features") or {}).get("quote_volume"))), reverse=True)
     return candidates[:limit]
 
@@ -218,9 +292,10 @@ def write_heartbeat(status: str, payload: dict[str, Any] | None = None) -> None:
 
 def run_once(limit: int = 8, enqueue: bool = True) -> dict[str, Any]:
     market = read_json(MARKET_LATEST, default={})
+    setup_rankings = read_json(SETUP_RANKINGS_PATH, default={})
     registry_update = bootstrap_paper_instrument_registry(market)
-    candidates = build_candidates(market, limit=limit)
-    payload = {"schema_version": SCHEMA_VERSION, "updated_at": utc_now(), "market_ts": market.get("ts"), "candidate_count": len(candidates), "registry_update": {"added": registry_update["added"], "instrument_count": registry_update["instrument_count"]}, "candidates": candidates, "can_place_live_orders": False}
+    candidates = build_candidates(market, limit=limit, setup_rankings=setup_rankings)
+    payload = {"schema_version": SCHEMA_VERSION, "updated_at": utc_now(), "market_ts": market.get("ts"), "candidate_count": len(candidates), "registry_update": {"added": registry_update["added"], "instrument_count": registry_update["instrument_count"]}, "setup_routing": {"top_setup_id": setup_rankings.get("top_setup_id"), "ranking_updated_at": setup_rankings.get("updated_at")}, "candidates": candidates, "can_place_live_orders": False}
     write_json_atomic(CANDIDATES_PATH, payload)
     write_json_atomic(LATEST_PATH, payload)
     append_jsonl(HISTORY_PATH, payload)

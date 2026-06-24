@@ -1066,6 +1066,46 @@ Results after audit hardening:
 - Dashboard API: `200`.
 - Supervisor duplicate count: `0`.
 
+### 2026-06-25 Phase 6/1 Runtime Routing And Reset-Window Fix
+
+Runtime audit found the paper brain was still favoring high raw-score `exhaustion_fade` candidates even after setup ranking had moved `exhaustion_fade` to weak/shadow-only evidence and ranked `funding_squeeze` as the current positive setup.
+
+Fixes:
+
+- `paper_candidate_feeder.py` now reads `setup_rankings_latest.json`.
+- Candidate generation prioritizes ranked-positive `funding_squeeze` rows and discounts blocked setups with `setup_routing.blocked_reasons`.
+- `autonomous_paper_trading_brain.py` now chooses candidates by setup evidence/rank route score instead of raw candidate score only.
+- Paper futures sizing now clamps the usable risk budget to the portfolio manager hard risk cap before converting it to isolated margin.
+- This fixes dust-level rounding rejects where allocation rounded `max_loss_usdt` slightly above `equity * 2%`.
+- `trade_lifecycle_validator.py` now supports a `min_open_ts` reset boundary.
+- `paper_execution_lifecycle_loop.py` validates paper lifecycle rows from the current account `created_at`, so stale opens from previous resets do not block current learning.
+- Daily exam test fixture now includes the objective proof fields required by the stricter `performance_improvement` rubric.
+
+Runtime smoke:
+
+- Paper loop changed from `skip` with `estimated_loss_above_risk_cap` to `paper_open_candidate`.
+- Lifecycle opened/held current paper positions and returned `status=ok`.
+- Current lifecycle validation after reset:
+  - `learning_allowed=true`
+  - `trade_lifecycle_completeness=1.0`
+  - stale current-window open count `0`
+- Open paper positions observed after smoke: `REUSDT`, `HUSDT`.
+- Dashboard API returned `200`.
+- Supervisor duplicate count: `0`.
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile paper_candidate_feeder.py autonomous_paper_trading_brain.py autonomous_paper_trading_loop.py paper_portfolio_manager.py trade_lifecycle_validator.py paper_execution_lifecycle_loop.py daily_exam_agent.py
+venv\Scripts\python.exe -m pytest tests\test_candidate_feeder_and_promotion_loop.py tests\test_phase_f_autonomy_promotion.py tests\test_phase_a_foundation.py tests\test_paper_execution_lifecycle_loop.py tests\test_daily_exam_agent.py -q
+venv\Scripts\python.exe -m pytest -q
+```
+
+Results:
+
+- Focused runtime/lifecycle/daily-exam tests: `40 passed`.
+- Full suite: `576 passed, 1 skipped, 11 warnings, 75 subtests passed`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

@@ -417,7 +417,8 @@ def run_once(max_hold_seconds: int = MAX_HOLD_SECONDS) -> dict[str, Any]:
     monitor_results = monitor_open_positions(account, market, max_hold_seconds=max_hold_seconds)
     account_after_monitor = load_account()
     open_result = try_open_latest_decision(account_after_monitor, market=market)
-    lifecycle_report = write_latest_report(paths=[PAPER_TRADES_PATH])
+    account_for_validation = load_account()
+    lifecycle_report = write_latest_report(paths=[PAPER_TRADES_PATH], min_open_ts=account_for_validation.get("created_at"))
     actions = [row.get("action") for row in monitor_results]
     if open_result:
         actions.append(str(open_result.get("action")))

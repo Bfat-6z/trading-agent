@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import autonomous_paper_trading_loop as paper_loop
+import autonomous_paper_trading_brain as brain
 import paper_candidate_feeder as feeder
 import promotion_evaluator_loop as promo_loop
 
@@ -16,6 +17,51 @@ def test_candidate_feeder_builds_extreme_reversal_candidates():
     stop_distance = (candidates[0]["sl"] - candidates[0]["entry"]) / candidates[0]["entry"]
     assert stop_distance <= 0.0351
     assert candidates[0]["can_place_live_orders"] is False
+
+def test_candidate_feeder_prefers_ranked_funding_squeeze_over_exhaustion():
+    market = {
+        "ts": "2026-06-21T00:00:00+00:00",
+        "hot": [
+            {
+                "symbol": "HUSDT",
+                "price": 0.06238,
+                "high": 0.12,
+                "low": 0.06,
+                "change_pct": -43.857,
+                "range_pos": 0.025,
+                "quote_volume": 89_052_095,
+                "funding_pct": -0.238931,
+            }
+        ],
+    }
+    rankings = {
+        "top_setup_id": "funding_squeeze",
+        "rankings": [
+            {"setup_id": "funding_squeeze", "allocation_hint": "normal", "evidence_expectancy": 0.45, "rank_score": 4.7},
+            {"setup_id": "exhaustion_fade", "allocation_hint": "reduced", "evidence_expectancy": -0.2, "rank_reasons": ["non_positive_evidence_expectancy"]},
+        ],
+    }
+
+    candidates = feeder.build_candidates(market, setup_rankings=rankings)
+
+    assert candidates[0]["setup_id"] == "funding_squeeze"
+    assert candidates[0]["side"] == "LONG"
+    assert candidates[0]["setup_routing"]["setup_bonus"] > 0
+    assert candidates[0]["can_place_live_orders"] is False
+
+def test_paper_brain_prefers_tradeable_setup_over_higher_raw_score():
+    candidates = [
+        {"symbol": "AAAUSDT", "side": "LONG", "setup_id": "exhaustion_fade", "score": 9.5},
+        {"symbol": "BBBUSDT", "side": "LONG", "setup_id": "funding_squeeze", "score": 7.2},
+    ]
+    rankings = [
+        {"setup_id": "exhaustion_fade", "allocation_hint": "reduced", "evidence_expectancy": -0.2, "rank_reasons": ["non_positive_evidence_expectancy"], "rank_score": -4.0, "paper_only_min_score_adjustment": 1.0},
+        {"setup_id": "funding_squeeze", "allocation_hint": "normal", "evidence_expectancy": 0.3, "rank_reasons": ["positive_rank"], "rank_score": 4.0},
+    ]
+
+    chosen = brain.choose_candidate(candidates, rankings)
+
+    assert chosen["setup_id"] == "funding_squeeze"
 
 def test_candidate_feeder_run_once_writes_candidates(monkeypatch, tmp_path: Path):
     memory = tmp_path / "agent_memory"

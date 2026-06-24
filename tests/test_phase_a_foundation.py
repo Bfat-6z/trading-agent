@@ -109,6 +109,23 @@ def test_lifecycle_close_snapshot_is_checked_against_close_time_not_open_time():
     assert report["invalid_events_count"] == 0
     assert report["learning_allowed"] is True
 
+def test_lifecycle_ignores_events_before_account_reset_window():
+    rows = [
+        paper_open("old", "2026-06-20T00:00:00+00:00"),
+        paper_open("new", "2026-06-21T00:00:00+00:00"),
+        paper_close("new", "2026-06-21T00:00:00+00:00", "2026-06-21T00:03:00+00:00"),
+    ]
+
+    report = tlv.validate_trade_events(
+        rows,
+        min_open_ts="2026-06-21T00:00:00+00:00",
+        now=datetime(2026, 6, 21, 0, 10, tzinfo=timezone.utc),
+    )
+
+    assert report["ignored_events"] == 1
+    assert report["stale_open_trades"] == []
+    assert report["learning_allowed"] is True
+
 def test_lifecycle_detects_close_snapshot_after_close_time():
     rows = [paper_open("t1"), paper_close("t1")]
     rows[1]["market_snapshot_ts"] = "2026-06-21T00:03:05+00:00"
