@@ -7,8 +7,9 @@ live orders and never edit strategy code.
 from __future__ import annotations
 
 import hashlib
+import argparse
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from agent_data_contracts import SCHEMA_VERSION
 from atomic_state import append_jsonl_once, read_jsonl, write_json_atomic
@@ -23,6 +24,7 @@ PATCHES_REVERTED = MEMORY_DIR / "skill_patches_reverted.jsonl"
 PATCH_REVIEWS = MEMORY_DIR / "skill_patch_reviews.jsonl"
 SKILL_FORGE_LATEST = MEMORY_DIR / "skill_forge_latest.json"
 SKILL_PATCH_INTEGRATION_LATEST = MEMORY_DIR / "skill_patch_integration_latest.json"
+POST_TRADE_REVIEWS = MEMORY_DIR / "post_trade_reviews.jsonl"
 
 ALLOWED_PATCH_TYPES = {
     "regime_filter",
@@ -34,6 +36,13 @@ ALLOWED_PATCH_TYPES = {
     "setup_split_by_regime",
     "leverage_cap_by_setup",
     "min_score_adjustment_by_setup",
+}
+TIGHTENING_PATCH_TYPES = {
+    "min_score_adjustment_by_setup",
+    "setup_retirement",
+    "symbol_blacklist",
+    "symbol_graylist",
+    "leverage_cap_by_setup",
 }
 
 
@@ -48,6 +57,13 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 def evidence_ids(evidence: dict[str, Any]) -> list[str]:
     ids: list[str] = []
     for key in ("evidence_ids", "data_ids", "post_trade_review_ids", "counterfactual_ids", "shadow_ids"):
@@ -57,6 +73,60 @@ def evidence_ids(evidence: dict[str, Any]) -> list[str]:
         elif isinstance(value, str) and value:
             ids.append(value)
     return sorted(set(ids))
+
+
+def review_setup_id(row: dict[str, Any]) -> str:
+    source = row.get("source_trade") if isinstance(row.get("source_trade"), dict) else {}
+    return str(source.get("setup_id") or row.get("setup_id") or "")
+
+
+def review_net(row: dict[str, Any]) -> float:
+    source = row.get("source_trade") if isinstance(row.get("source_trade"), dict) else {}
+    costs = row.get("costs") if isinstance(row.get("costs"), dict) else {}
+    return safe_float(source.get("net"), safe_float(costs.get("net")))
+
+
+def build_review_patch_candidates(reviews: list[dict[str, Any]], min_sample: int = 30) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in reviews:
+        setup_id = review_setup_id(row)
+        if not setup_id:
+            continue
+        buckets.setdefault(setup_id, []).append(row)
+    candidates: list[dict[str, Any]] = []
+    for setup_id, rows in sorted(buckets.items()):
+        sample_size = len(rows)
+        if sample_size < min_sample:
+            continue
+        net = sum(review_net(row) for row in rows)
+        expectancy = net / sample_size if sample_size else 0.0
+        bad_loss_count = sum(1 for row in rows if row.get("classification") == "bad_loss")
+        tp_too_far_count = sum(1 for row in rows if row.get("classification") == "tp_too_far")
+        bad_loss_rate = bad_loss_count / sample_size if sample_size else 0.0
+        evidence_review_ids = [str(row.get("review_id")) for row in rows[-30:] if row.get("review_id")]
+        if expectancy < 0 and bad_loss_rate >= 0.35 and evidence_review_ids:
+            candidates.append(
+                {
+                    "patch": {
+                        "setup_id": setup_id,
+                        "patch_type": "min_score_adjustment_by_setup",
+                        "min_score_delta": 1.0,
+                        "invalidation": "recent paper reviews show negative expectancy and repeated bad_loss outcomes",
+                        "rollback_criteria": "20 future paper closes have positive expectancy and bad_loss_rate below 0.25",
+                    },
+                    "evidence": {
+                        "source": "post_trade_reviews",
+                        "sample_size": sample_size,
+                        "expectancy": round(expectancy, 8),
+                        "net": round(net, 8),
+                        "bad_loss_rate": round(bad_loss_rate, 4),
+                        "tp_too_far_count": tp_too_far_count,
+                        "post_trade_review_ids": evidence_review_ids,
+                    },
+                    "reason": "negative_expectancy_bad_loss_cluster",
+                }
+            )
+    return candidates
 
 
 def validate_patch(patch: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
@@ -76,8 +146,10 @@ def validate_patch(patch: dict[str, Any], evidence: dict[str, Any]) -> dict[str,
     ids = evidence_ids(evidence)
     if not ids:
         errors.append("missing_evidence_ids")
-    if safe_float(evidence.get("expectancy")) < 0:
+    if safe_float(evidence.get("expectancy")) < 0 and patch_type not in TIGHTENING_PATCH_TYPES:
         errors.append("negative_expectancy")
+    elif safe_float(evidence.get("expectancy")) < 0:
+        warnings.append("negative_expectancy_tightening_only")
     if int(evidence.get("sample_size") or 0) < 20:
         warnings.append("under_sampled_paper_shadow_only")
     lifecycle = ["proposed"]
@@ -268,3 +340,70 @@ def apply_paper_shadow_patches(
     if latest_path is not None:
         write_latest(pending_path=pending_path, output_path=latest_path, applied_path=applied_path)
     return payload
+
+
+def run_once(
+    *,
+    reviews_path: Path = POST_TRADE_REVIEWS,
+    pending_path: Path = PATCHES_PENDING,
+    review_path: Path = PATCH_REVIEWS,
+    latest_path: Path = SKILL_FORGE_LATEST,
+    integration_output_path: Path = SKILL_PATCH_INTEGRATION_LATEST,
+    applied_path: Path = PATCHES_APPLIED,
+    min_sample: int = 30,
+    apply: bool = False,
+) -> dict[str, Any]:
+    reviews = read_jsonl(reviews_path)
+    candidates = build_review_patch_candidates(reviews, min_sample=min_sample)
+    reviews_out: list[dict[str, Any]] = []
+    for candidate in candidates:
+        reviews_out.append(
+            propose_skill_patch(
+                candidate["patch"],
+                candidate["evidence"],
+                pending_path=pending_path,
+                review_path=review_path,
+                latest_path=latest_path,
+            )
+        )
+    integration = None
+    if apply:
+        integration = apply_paper_shadow_patches(
+            pending_path=pending_path,
+            output_path=integration_output_path,
+            applied_path=applied_path,
+            latest_path=latest_path,
+        )
+    latest = write_latest(pending_path=pending_path, review_path=review_path, output_path=latest_path, applied_path=applied_path)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": utc_now(),
+        "candidate_count": len(candidates),
+        "reviewed_count": len(reviews_out),
+        "accepted_count": sum(1 for row in reviews_out if row.get("ok")),
+        "apply": bool(apply),
+        "integration": integration,
+        "latest": latest,
+        "can_place_live_orders": False,
+        "can_loosen_risk": False,
+    }
+    return payload
+
+
+def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run deterministic paper-only skill forge")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--min-sample", type=int, default=30)
+    return parser.parse_args(list(argv) if argv is not None else None)
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = parse_args(argv)
+    result = run_once(min_sample=args.min_sample, apply=bool(args.apply))
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

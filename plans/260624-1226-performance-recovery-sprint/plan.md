@@ -856,6 +856,37 @@ Runtime note:
 - Current real skill forge state has `pending_count=0`, `review_count=0`, `applied_count=0`.
 - This is correct; no fake patch was promoted. Next Phase 4 step is to generate candidate patches from real post-trade/counterfactual/shadow evidence.
 
+### 2026-06-24 Phase 4 Evidence-To-Patch Loop Active
+
+Added the first deterministic evidence-to-patch loop:
+
+- `skill_forge_agent.run_once()` now reads real `post_trade_reviews.jsonl`, groups reviews by setup, and proposes paper-only patches only when sample size and negative outcome evidence are sufficient.
+- Negative expectancy is still blocked for non-tightening patches, but allowed for tightening-only patch types such as `min_score_adjustment_by_setup`, `setup_retirement`, and symbol gray/blacklist patches.
+- `autonomous_paper_trading_brain` now enforces `paper_only_min_score_adjustment` metadata:
+  - if a setup patch requires a higher score and a candidate is below the adjusted threshold, the decision records `skill_patch_min_score_block` and does not open paper.
+- Real runtime skill forge pass:
+  - `candidate_count=1`
+  - `accepted_count=1`
+  - setup: `exhaustion_fade`
+  - patch: `min_score_adjustment_by_setup`
+  - evidence: 469 post-trade reviews, expectancy `-0.10279748`, bad loss rate `0.4904`
+  - action: paper-only min score delta `+1.0`
+  - applied lifecycle: `proposed -> schema_valid -> evidence_checked -> paper_only_applied`
+- Runtime integration latest confirms:
+  - `applied_count=1`
+  - `can_place_live_orders=false`
+  - `can_loosen_risk=false`
+- Dashboard API returned `200` after application.
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile skill_forge_agent.py autonomous_paper_trading_brain.py autonomous_paper_trading_loop.py setup_ranker.py capital_allocation_policy.py tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py
+venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_process_supervisor.py tests\test_agent_status_dashboard.py -q
+```
+
+Result: `122 passed`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

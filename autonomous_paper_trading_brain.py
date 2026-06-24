@@ -5,8 +5,8 @@ fetch markets, place exchange orders, or enable live execution.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from math import floor
+from pathlib import Path
 from typing import Any
 
 from agent_data_contracts import SCHEMA_VERSION
@@ -26,11 +26,13 @@ BRAIN_HISTORY = MEMORY_DIR / "paper_trading_brain_history.jsonl"
 PAPER_RISK_STATE = MEMORY_DIR / "paper_risk_state.json"
 MAX_PAPER_MARGIN_FRACTION = 0.25
 
+
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
     except Exception:
         return default
+
 
 def stop_distance_fraction(side: str, entry: Any, sl: Any) -> float:
     entry_f = safe_float(entry)
@@ -43,6 +45,7 @@ def stop_distance_fraction(side: str, entry: Any, sl: Any) -> float:
     if side_up == "SHORT":
         return max(0.0, (sl_f - entry_f) / entry_f)
     return 0.0
+
 
 def futures_margin_from_risk_budget(candidate: dict[str, Any], allocation: dict[str, Any], account: dict[str, Any]) -> float:
     """Convert risk budget at SL into Binance-futures-style isolated margin."""
@@ -63,6 +66,20 @@ def choose_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     eligible = [row for row in candidates if row.get("symbol") and row.get("side") and row.get("setup_id")]
     eligible.sort(key=lambda row: float(row.get("score") or row.get("setup_score") or 0.0), reverse=True)
     return eligible[0] if eligible else None
+
+
+def paper_only_patch_errors(candidate: dict[str, Any], rankings: list[dict[str, Any]]) -> list[str]:
+    setup_id = str(candidate.get("setup_id") or "")
+    row = next((item for item in rankings if str(item.get("setup_id")) == setup_id), {})
+    errors: list[str] = []
+    if row.get("paper_only_retired"):
+        errors.append("setup_paper_only_retired")
+    min_delta = safe_float(row.get("paper_only_min_score_adjustment"))
+    if min_delta > 0:
+        candidate_score = safe_float(candidate.get("score") or candidate.get("setup_score"))
+        if candidate_score < 8.0 + min_delta:
+            errors.append("skill_patch_min_score_block")
+    return errors
 
 
 def decide_paper_action(candidates: list[dict[str, Any]], setup_stats: list[dict[str, Any]], account: dict[str, Any], exploration_allowed: bool = False) -> dict[str, Any]:
@@ -91,6 +108,7 @@ def decide_paper_action(candidates: list[dict[str, Any]], setup_stats: list[dict
         errors.extend(preflight.get("errors") or [])
     if dont_do.get("blocked"):
         errors.append("dont_do_match")
+    errors.extend(paper_only_patch_errors(candidate, rankings))
     if not allocation.get("allowed"):
         errors.extend(allocation.get("errors") or [])
     if not risk.get("can_open_paper"):

@@ -103,6 +103,55 @@ def test_valid_skill_patch_starts_paper_shadow_only(tmp_path: Path):
     assert review["lifecycle"] == ["proposed", "schema_valid", "evidence_checked"]
 
 
+def test_skill_forge_builds_patch_candidate_from_bad_review_cluster():
+    reviews = []
+    for idx in range(35):
+        reviews.append(
+            {
+                "review_id": f"r{idx}",
+                "classification": "bad_loss" if idx < 20 else "good_win",
+                "source_trade": {"setup_id": "exhaustion_fade", "net": "-0.1" if idx < 20 else "0.02"},
+            }
+        )
+
+    candidates = sfa.build_review_patch_candidates(reviews, min_sample=30)
+
+    assert candidates
+    assert candidates[0]["patch"]["setup_id"] == "exhaustion_fade"
+    assert candidates[0]["patch"]["patch_type"] == "min_score_adjustment_by_setup"
+    assert candidates[0]["evidence"]["sample_size"] == 35
+    assert candidates[0]["evidence"]["post_trade_review_ids"]
+
+
+def test_skill_forge_run_once_proposes_from_reviews(tmp_path: Path):
+    reviews_path = tmp_path / "reviews_source.jsonl"
+    for idx in range(35):
+        sfa.append_jsonl_once(
+            reviews_path,
+            {
+                "review_id": f"r{idx}",
+                "classification": "bad_loss" if idx < 20 else "good_win",
+                "source_trade": {"setup_id": "exhaustion_fade", "net": "-0.1" if idx < 20 else "0.02"},
+            },
+            "review_id",
+        )
+
+    result = sfa.run_once(
+        reviews_path=reviews_path,
+        pending_path=tmp_path / "pending.jsonl",
+        review_path=tmp_path / "reviews.jsonl",
+        latest_path=tmp_path / "latest.json",
+        applied_path=tmp_path / "applied.jsonl",
+        integration_output_path=tmp_path / "integration.json",
+        min_sample=30,
+        apply=False,
+    )
+
+    assert result["candidate_count"] == 1
+    assert result["accepted_count"] == 1
+    assert result["can_place_live_orders"] is False
+
+
 def test_skill_forge_applies_patch_as_paper_only_lifecycle(monkeypatch, tmp_path: Path):
     pending = tmp_path / "pending.jsonl"
     applied = tmp_path / "applied.jsonl"

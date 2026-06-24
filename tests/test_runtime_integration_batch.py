@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import agent_work_queue as awq
+import autonomous_paper_trading_brain as brain
 import autonomous_paper_trading_loop as loop
 import inner_critic
 import dont_do_memory as ddm
@@ -47,6 +48,12 @@ def test_autonomous_paper_loop_once_is_paper_only(monkeypatch, tmp_path: Path):
 
     assert result["can_place_live_orders"] is False
     assert result["decision"]["can_place_live_orders"] is False
+
+def test_paper_brain_blocks_candidate_below_skill_patch_min_score():
+    candidate = {"symbol": "BTCUSDT", "side": "LONG", "setup_id": "s1", "score": 8.0}
+    rankings = [{"setup_id": "s1", "paper_only_min_score_adjustment": 1.0}]
+
+    assert brain.paper_only_patch_errors(candidate, rankings) == ["skill_patch_min_score_block"]
     assert loop.HEARTBEAT_PATH.exists()
 
 def test_inner_critic_uses_dont_do_shadow_only(monkeypatch, tmp_path: Path):
