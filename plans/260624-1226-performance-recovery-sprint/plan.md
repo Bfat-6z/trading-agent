@@ -657,6 +657,143 @@ Runtime:
 - Current historical reviews still have `primary_failure_reason=unknown` because they were created before this schema.
 - New reviews from this point forward will contain the richer fields.
 
+### 2026-06-24 Phase 3 Audit Completion
+
+Closed the remaining Phase 3 review gaps:
+
+- Added deterministic context extraction for trade, position, signal, market, microstructure, orderbook, and derivatives fields.
+- Added exact review classes:
+  - `spread_slippage_issue`
+  - `thin_liquidity`
+  - `crowded_trade`
+  - `regime_mismatch`
+  - `early_entry`
+  - `late_entry`
+  - `news_conflict` from embedded trade/news context
+- Added microstructure evidence to each new review:
+  - spread bps
+  - slippage bps
+  - fee-to-margin
+  - funding rate / funding pct
+  - open interest delta
+  - quote volume
+  - depth
+  - liquidity score
+- Added review quality coverage to `post_trade_learning_latest.json`:
+  - MFE/MAE coverage
+  - R-multiple coverage
+  - cost coverage
+  - counterfactual attachment coverage
+- Dashboard Learning tab now includes a `Post-trade review` panel with:
+  - review quality coverage
+  - failure reason counts
+  - class counts
+  - recent review rows
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile post_trade_learning_agent.py agent_status_dashboard.py tests\test_phase_b_objective_learning.py tests\test_agent_status_dashboard.py
+venv\Scripts\python.exe -m pytest tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py tests\test_agent_status_dashboard.py tests\test_agent_process_supervisor.py -q
+git diff --check
+```
+
+Result: `72 passed`.
+
+Runtime smoke:
+
+- Refreshed `post_trade_learning_latest.json`.
+- Dashboard API returned `200`.
+- Dashboard payload exposed:
+  - `mfe_mae_coverage_pct=1.0`
+  - `r_multiple_coverage_pct=1.0`
+  - `cost_coverage_pct=0.0477`
+  - `counterfactual_attach_pct=0.0`
+
+Audit caveat:
+
+- Historical review rows still have low cost coverage and zero counterfactual attachment because they were generated before Phase 2/3 schema upgrades.
+- New closes will carry the richer schema; counterfactual attachment will rise only after new closes produce complete replay rows with usable candle coverage.
+
+### 2026-06-24 Phase 5 Fresh Shadow Window Partial Complete
+
+Implemented the first shadow repair step without changing live or paper execution:
+
+- `shadow_trade_evaluator.aggregate_performance()` now preserves the old all-time `overall` metrics and adds a separate `fresh_window`.
+- Fresh window starts from the June 24 reset boundary and reports:
+  - row count
+  - selected assumption hash
+  - closed/win/loss/net/expectancy/PF
+  - confidence
+  - API error count
+  - unresolved and ambiguous counts
+  - segments and candidates scoped to the fresh rows
+- Markdown shadow reports now include a `Fresh Window` section so future audits do not accidentally read old 2026-06-20 shadow batches as current edge.
+- Dashboard compact API exposes `shadow_performance.fresh_window`.
+- Overview UI now shows `Shadow fresh` separately from all-time shadow WR/expectancy.
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile shadow_trade_evaluator.py agent_status_dashboard.py tests\test_shadow_trade_evaluator.py tests\test_agent_status_dashboard.py
+venv\Scripts\python.exe -m pytest tests\test_shadow_trade_evaluator.py tests\test_agent_status_dashboard.py tests\test_agent_process_supervisor.py -q
+venv\Scripts\python.exe -m pytest tests\test_shadow_trade_evaluator.py tests\test_agent_status_dashboard.py tests\test_agent_process_supervisor.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py -q
+```
+
+Results:
+
+- Focused shadow/dashboard/supervisor: `52 passed`.
+- Expanded regression: `84 passed`.
+
+Runtime smoke:
+
+- Refreshed `shadow_performance_latest.json` from existing `shadow_closes.jsonl`.
+- Restarted dashboard and deduped dashboard process via supervisor.
+- Dashboard API returned `200`.
+- Supervisor status showed `duplicate_count=0` for dashboard after cleanup.
+- Current fresh window:
+  - `row_count=0`
+  - `closed=0`
+  - `api_error_count=0`
+  - `unresolved_count=0`
+
+Audit caveat:
+
+- Fresh shadow is now separated, but there are not yet fresh closes after the reset boundary. This is correct and safer than pretending old shadow closes are current evidence.
+- Remaining Phase 5 work is to run/evaluate fresh shadow candidates continuously.
+
+### 2026-06-24 Phase 5 Persistent Backoff Complete
+
+Added persistent API backoff for shadow candle fetching:
+
+- `shadow_trade_evaluator.py` now writes `state/shadow_evaluator_rate_limit.json` when Binance kline fetch returns 418/429.
+- Future evaluator runs honor the backoff window and do not call the fetcher until `backoff_until`.
+- Backoff rows are recorded as `api_error` with explicit `rate_limited_backoff_until ...` detail instead of hammering the API again.
+- CLI supports `--rate-limit-cooldown-seconds` with default `900`.
+- Tests cover:
+  - recording backoff after 429
+  - skipping fetch calls while backoff is active
+  - fresh-window aggregation
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile shadow_trade_evaluator.py tests\test_shadow_trade_evaluator.py
+venv\Scripts\python.exe -m pytest tests\test_shadow_trade_evaluator.py -q
+venv\Scripts\python.exe -m pytest tests\test_shadow_trade_evaluator.py tests\test_agent_status_dashboard.py tests\test_agent_process_supervisor.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py -q
+```
+
+Results:
+
+- Shadow evaluator focused: `14 passed`.
+- Expanded regression: `86 passed`.
+
+Runtime audit:
+
+- Dashboard API returned `200`.
+- Supervisor dashboard duplicate was detected after restart/testing and cleaned via `agent_process_supervisor.ensure_agent()`.
+- Final supervisor status showed dashboard `duplicate_count=0`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

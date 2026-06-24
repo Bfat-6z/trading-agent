@@ -58,6 +58,108 @@ def r_multiple(side: str, entry: float, exit_price: float, sl: float) -> float:
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
+
+def context_value(trade: dict[str, Any], *keys: str) -> Any:
+    """Read fields from the trade or common nested context snapshots."""
+    containers: list[dict[str, Any]] = [trade]
+    for container_key in ("position", "candidate", "signal", "market_snapshot", "market", "microstructure", "orderbook", "derivatives"):
+        nested = trade.get(container_key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    for container in containers:
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def context_bool(trade: dict[str, Any], *keys: str) -> bool:
+    value = context_value(trade, *keys)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def normalize_regime(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("primary_regime") or value.get("regime") or value.get("name")
+    return str(value or "").strip().lower()
+
+
+def spread_bps(trade: dict[str, Any]) -> float:
+    explicit = context_value(trade, "spread_bps", "bid_ask_spread_bps")
+    if explicit not in (None, ""):
+        return safe_float(explicit)
+    spread_pct = context_value(trade, "spread_pct")
+    return safe_float(spread_pct) * 10_000 if spread_pct not in (None, "") else 0.0
+
+
+def slippage_bps(trade: dict[str, Any], costs: dict[str, Any]) -> float:
+    explicit = context_value(trade, "slippage_bps")
+    if explicit not in (None, ""):
+        return abs(safe_float(explicit))
+    entry = safe_float(trade.get("entry"))
+    slip = abs(safe_float(costs.get("slippage")))
+    return (slip / entry) * 10_000 if entry > 0 and slip > 0 else 0.0
+
+
+def microstructure_assessment(trade: dict[str, Any], costs: dict[str, Any]) -> dict[str, Any]:
+    margin = abs(safe_float(trade.get("margin")))
+    fees = safe_float(costs.get("fees"))
+    funding_pct = safe_float(context_value(trade, "funding_pct"))
+    funding_rate = safe_float(context_value(trade, "funding_rate"))
+    oi_delta = safe_float(context_value(trade, "open_interest_delta", "oi_delta", "oi_change_pct"))
+    quote_volume = safe_float(context_value(trade, "quote_volume", "quote_volume_usd", "volume_usd"))
+    depth_usd = safe_float(context_value(trade, "depth_usd", "book_depth_usd", "liquidity_usd"))
+    liquidity_score = context_value(trade, "liquidity_score")
+    spread = spread_bps(trade)
+    slip = slippage_bps(trade, costs)
+    fee_ratio = fees / margin if margin else 0.0
+    thin_liquidity = (
+        context_bool(trade, "thin_liquidity", "liquidity_warning")
+        or (liquidity_score not in (None, "") and safe_float(liquidity_score) <= 0.25)
+        or (0 < quote_volume < 500_000)
+        or (0 < depth_usd < 20_000)
+    )
+    crowded_trade = (
+        context_bool(trade, "crowded_trade", "crowding_warning")
+        or abs(funding_rate) >= 0.001
+        or abs(funding_pct) >= 0.10
+        or abs(oi_delta) >= 0.15
+    )
+    spread_slippage_issue = (
+        context_bool(trade, "spread_slippage_issue")
+        or spread >= 20.0
+        or slip >= 10.0
+        or fee_ratio >= 0.03
+    )
+    return {
+        "spread_bps": round(spread, 4),
+        "slippage_bps": round(slip, 4),
+        "fee_to_margin_pct": round(fee_ratio, 6),
+        "funding_pct": round(funding_pct, 6),
+        "funding_rate": round(funding_rate, 8),
+        "open_interest_delta": round(oi_delta, 6),
+        "quote_volume": round(quote_volume, 4),
+        "depth_usd": round(depth_usd, 4),
+        "liquidity_score": safe_float(liquidity_score) if liquidity_score not in (None, "") else None,
+        "spread_slippage_issue": spread_slippage_issue,
+        "thin_liquidity": thin_liquidity,
+        "crowded_trade": crowded_trade,
+    }
+
+
+def regime_mismatch(trade: dict[str, Any]) -> bool:
+    if context_bool(trade, "regime_mismatch"):
+        return True
+    expected = normalize_regime(context_value(trade, "setup_expected_regime", "expected_regime", "required_regime"))
+    actual = normalize_regime(context_value(trade, "market_regime", "regime", "primary_regime"))
+    return bool(expected and actual and expected != actual)
+
+
 def cost_breakdown(trade: dict[str, Any]) -> dict[str, Any]:
     entry_fee = safe_float(trade.get("entry_fee"))
     exit_fee = safe_float(trade.get("exit_fee"))
@@ -104,10 +206,17 @@ def primary_failure_reason(
     counterfactual: dict[str, Any],
 ) -> str:
     reason = str(trade.get("reason") or trade.get("close_reason") or "")
-    if classification == "news_conflict":
-        return "news_conflict"
-    if classification == "stop_too_tight":
-        return "stop_too_tight"
+    if classification in {
+        "news_conflict",
+        "spread_slippage_issue",
+        "thin_liquidity",
+        "crowded_trade",
+        "regime_mismatch",
+        "stop_too_tight",
+        "late_entry",
+        "early_entry",
+    }:
+        return classification
     if reason == "liquidation":
         return "liquidation"
     if counterfactual.get("conclusion") == "parameter_improvement_candidate":
@@ -143,13 +252,56 @@ def detect_stop_too_tight(trade: dict[str, Any], candles_after_close: list[dict[
     return False
 
 
-def classify_trade(trade: dict[str, Any], process_quality: float, mfe: float, stop_too_tight: bool, news_conflict: bool) -> str:
+def timing_class_from_counterfactual(trade: dict[str, Any], counterfactual: dict[str, Any]) -> str | None:
+    explicit = str(context_value(trade, "timing_issue", "entry_timing_issue") or counterfactual.get("timing_class") or "")
+    if explicit in {"late_entry", "early_entry"}:
+        return explicit
+    conclusion = str(counterfactual.get("conclusion") or "")
+    if conclusion == "entry_too_late":
+        return "late_entry"
+    if conclusion == "entry_too_early":
+        return "early_entry"
+    best = counterfactual.get("best_variant") if isinstance(counterfactual.get("best_variant"), dict) else {}
+    base = counterfactual.get("base_variant") if isinstance(counterfactual.get("base_variant"), dict) else {}
+    best_variant = str(best.get("variant") or "")
+    best_net = safe_float(best.get("net"))
+    base_net = safe_float(base.get("net"), safe_float(trade.get("net")))
+    actual_net = safe_float(trade.get("net"), base_net)
+    if best_net <= max(base_net, actual_net):
+        return None
+    if best_variant == "entry_plus_1":
+        return "early_entry"
+    if best_variant == "entry_minus_1":
+        return "late_entry"
+    return None
+
+
+def classify_trade(
+    trade: dict[str, Any],
+    process_quality: float,
+    mfe: float,
+    stop_too_tight: bool,
+    news_conflict: bool,
+    microstructure: dict[str, Any],
+    has_regime_mismatch: bool,
+    timing_class: str | None,
+) -> str:
     net = safe_float(trade.get("net"), safe_float(trade.get("gross")))
     reason = str(trade.get("reason") or trade.get("close_reason") or "")
     if news_conflict:
         return "news_conflict"
+    if microstructure.get("spread_slippage_issue"):
+        return "spread_slippage_issue"
+    if microstructure.get("thin_liquidity"):
+        return "thin_liquidity"
+    if microstructure.get("crowded_trade"):
+        return "crowded_trade"
+    if has_regime_mismatch:
+        return "regime_mismatch"
     if stop_too_tight:
         return "stop_too_tight"
+    if timing_class:
+        return timing_class
     if net > 0 and process_quality < 0.55:
         return "bad_win"
     if net > 0:
@@ -175,12 +327,20 @@ def review_closed_trade(
     sl = safe_float(trade.get("sl") or trade.get("stop"))
     mae, mfe = mae_mfe(side, entry, candles)
     process_quality = safe_float((setup_score or {}).get("score"), 0.5)
-    high_risk_news = bool((news_snapshot or {}).get("high_risk_before_entry"))
+    high_risk_news = bool((news_snapshot or {}).get("high_risk_before_entry")) or context_bool(
+        trade,
+        "high_risk_before_entry",
+        "news_conflict",
+        "news_risk_high",
+    )
     stop_tight = detect_stop_too_tight(trade, candles)
-    classification = classify_trade(trade, process_quality, mfe, stop_tight, high_risk_news)
     r_value = r_multiple(side, entry, exit_price, sl)
     costs = cost_breakdown(trade)
     counterfactual = latest_counterfactual_for(trade_id)
+    microstructure = microstructure_assessment(trade, costs)
+    has_regime_mismatch = regime_mismatch(trade)
+    timing_class = timing_class_from_counterfactual(trade, counterfactual)
+    classification = classify_trade(trade, process_quality, mfe, stop_tight, high_risk_news, microstructure, has_regime_mismatch, timing_class)
     setup_score_value = setup_validity_score(trade, setup_score, process_quality)
     duration = seconds_between(trade.get("open_ts") or trade.get("entry_ts"), trade.get("close_ts"))
     review = {
@@ -198,21 +358,31 @@ def review_closed_trade(
         "setup_validity_score": setup_score_value,
         "outcome_quality_score": round(clamp(0.5 + (r_value / 2.0) - min(0.25, safe_float(costs.get("fee_to_margin_pct")))), 4),
         "costs": costs,
+        "microstructure": microstructure,
         "counterfactual": {
             "replay_id": counterfactual.get("replay_id"),
             "status": counterfactual.get("status"),
             "conclusion": counterfactual.get("conclusion") or counterfactual.get("reason"),
             "best_variant": counterfactual.get("best_variant"),
         } if counterfactual else {},
-        "market_regime": trade.get("market_regime") or trade.get("regime"),
+        "market_regime": context_value(trade, "market_regime", "regime", "primary_regime"),
         "data_quality": {
             "candle_count": len(candles),
             "has_counterfactual": bool(counterfactual),
+            "has_mfe_mae": bool(candles),
+            "has_r_multiple": bool(entry > 0 and sl > 0),
+            "has_costs": True,
             "trade_data_quality": trade.get("data_quality"),
         },
         "flags": {
             "stop_too_tight": stop_tight,
             "news_conflict": high_risk_news,
+            "spread_slippage_issue": bool(microstructure.get("spread_slippage_issue")),
+            "thin_liquidity": bool(microstructure.get("thin_liquidity")),
+            "crowded_trade": bool(microstructure.get("crowded_trade")),
+            "regime_mismatch": has_regime_mismatch,
+            "late_entry": classification == "late_entry",
+            "early_entry": classification == "early_entry",
             "liquidation": str(trade.get("reason")) == "liquidation",
             "fee_drag_high": safe_float(costs.get("fee_to_margin_pct")) >= 0.01,
             "funding_drag": safe_float(costs.get("funding_payment")) < 0,
@@ -239,6 +409,10 @@ def summarize_reviews(rows: list[dict[str, Any]]) -> dict[str, Any]:
     process_scores = []
     outcome_scores = []
     setup_scores = []
+    mfe_mae_count = 0
+    r_multiple_count = 0
+    cost_count = 0
+    counterfactual_count = 0
     for row in rows:
         klass = str(row.get("classification") or "unknown")
         by_class[klass] = by_class.get(klass, 0) + 1
@@ -250,8 +424,18 @@ def summarize_reviews(rows: list[dict[str, Any]]) -> dict[str, Any]:
             outcome_scores.append(safe_float(row.get("outcome_quality_score")))
         if "setup_validity_score" in row:
             setup_scores.append(safe_float(row.get("setup_validity_score")))
+        if "mae" in row and "mfe" in row:
+            mfe_mae_count += 1
+        if "r_multiple" in row:
+            r_multiple_count += 1
+        if isinstance(row.get("costs"), dict):
+            cost_count += 1
+        if isinstance(row.get("counterfactual"), dict) and row.get("counterfactual", {}).get("replay_id"):
+            counterfactual_count += 1
     def avg(values: list[float]) -> float | None:
         return round(sum(values) / len(values), 4) if values else None
+    def pct(count: int) -> float:
+        return round(count / len(rows), 4) if rows else 0.0
     return {
         "schema_version": SCHEMA_VERSION,
         "updated_at": utc_now(),
@@ -265,6 +449,12 @@ def summarize_reviews(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "process": len(process_scores),
             "outcome": len(outcome_scores),
             "setup_validity": len(setup_scores),
+        },
+        "review_quality": {
+            "mfe_mae_coverage_pct": pct(mfe_mae_count),
+            "r_multiple_coverage_pct": pct(r_multiple_count),
+            "cost_coverage_pct": pct(cost_count),
+            "counterfactual_attach_pct": pct(counterfactual_count),
         },
     }
 

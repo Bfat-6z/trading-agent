@@ -171,6 +171,12 @@ def test_compact_shadow_performance_keeps_shadow_separate_and_quality_visible():
             "assumption_hash": "abc",
             "metric_mode": "closed_only",
             "overall": {"trades": 3, "closed": 2, "wins": 1, "losses": 1, "win_rate": 0.5, "net": 0.04, "expectancy": 0.02, "profit_factor": 1.4},
+            "fresh_window": {
+                "start_ts": "2026-06-24T00:00:00+00:00",
+                "row_count": 1,
+                "overall": {"closed": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net": 0.03, "expectancy": 0.03, "profit_factor": 999.0},
+                "data_quality": {"confidence": "low", "api_error_count": 0, "unresolved_count": 0, "ambiguous_count": 0},
+            },
             "data_quality": {"confidence": "low", "unresolved_count": 1, "ambiguous_count": 1, "skipped_count": 0, "mixed_assumptions": False},
             "segments": {"by_symbol": [{"key": "BTCUSDT", "closed": 2, "expectancy": 0.02, "net": 0.04}]},
             "kill_candidates": [{"group": "by_side", "key": "LONG", "closed": 20, "expectancy": -0.01}],
@@ -180,6 +186,8 @@ def test_compact_shadow_performance_keeps_shadow_separate_and_quality_visible():
     assert compact["closed"] == 2
     assert compact["under_sampled"] is True
     assert compact["data_quality"]["ambiguous_count"] == 1
+    assert compact["fresh_window"]["closed"] == 1
+    assert compact["fresh_window"]["expectancy"] == 0.03
     assert compact["top_segments"][0]["key"] == "BTCUSDT"
     assert compact["kill_candidates"][0]["key"] == "LONG"
 
@@ -367,11 +375,16 @@ def test_html_is_single_page_dashboard():
     assert "External Live Monitors" in dash.HTML
     assert "Shadow Performance" in dash.HTML
     assert "Shadow / would-trade only" in dash.HTML
+    assert "Shadow fresh" in dash.HTML
     assert "Self Improvement" in dash.HTML
     assert "Starting equity" in dash.HTML
     assert "Heartbeat" in dash.HTML
     assert "Promotion board" in dash.HTML
     assert "Ops học máy" in dash.HTML
+    assert "Post-trade review" in dash.HTML
+    assert "Review lệnh" in dash.HTML
+    assert "renderPostTradeLearning" in dash.HTML
+    assert "Counterfactual attach" in dash.HTML
     assert "Counterfactual replay" in dash.HTML
     assert "renderCounterfactualLearning" in dash.HTML
     assert "window.open" not in dash.HTML

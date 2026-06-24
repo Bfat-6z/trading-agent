@@ -30,10 +30,12 @@ SCALP_JSONL = STATE_DIR / "scalp_autotrader.jsonl"
 SHADOW_CLOSE_JSONL = MEMORY_DIR / "shadow_closes.jsonl"
 SHADOW_PERFORMANCE_JSON = MEMORY_DIR / "shadow_performance_latest.json"
 KLINE_CACHE_DIR = STATE_DIR / "market_data_cache" / "klines"
+RATE_LIMIT_STATE_JSON = STATE_DIR / "shadow_evaluator_rate_limit.json"
 
 SCHEMA_VERSION = 1
 BINANCE_USDM_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 MAX_BINANCE_LIMIT = 1500
+DEFAULT_FRESH_WINDOW_START = "2026-06-24T00:00:00+00:00"
 
 
 class MarketDataError(RuntimeError):
@@ -134,6 +136,17 @@ def ts_ms(value: object) -> int | None:
     return int(parsed.timestamp() * 1000)
 
 
+def row_event_ms(row: dict) -> int | None:
+    return ts_ms(row.get("entry_ts") or row.get("close_ts") or row.get("ts") or row.get("created_at"))
+
+
+def rows_since(rows: list[dict], start_ts: str | None) -> list[dict]:
+    start_ms = ts_ms(start_ts)
+    if start_ms is None:
+        return list(rows)
+    return [row for row in rows if (row_event_ms(row) or 0) >= start_ms]
+
+
 def ms_iso(value: int | None) -> str | None:
     if value is None:
         return None
@@ -161,6 +174,16 @@ def write_json_atomic(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+def read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def append_jsonl(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
@@ -172,6 +195,43 @@ def append_jsonl(path: Path, rows: list[dict]) -> None:
 
 def existing_close_ids(path: Path) -> set[str]:
     return {str(row.get("close_id")) for row in read_jsonl(path) if row.get("close_id")}
+
+
+def rate_limit_backoff(path: Path = RATE_LIMIT_STATE_JSON, now: float | None = None) -> dict:
+    payload = read_json(path)
+    now = time.time() if now is None else now
+    until_epoch = safe_float(payload.get("backoff_until_epoch"))
+    if until_epoch > now:
+        return {
+            "active": True,
+            "backoff_until_epoch": until_epoch,
+            "backoff_until": payload.get("backoff_until"),
+            "reason": payload.get("reason") or "rate_limited",
+            "last_status_code": payload.get("last_status_code"),
+        }
+    return {"active": False}
+
+
+def record_rate_limit_backoff(
+    error: str,
+    status_code: int | None,
+    cooldown_seconds: int,
+    path: Path = RATE_LIMIT_STATE_JSON,
+    now: float | None = None,
+) -> dict:
+    now = time.time() if now is None else now
+    until_epoch = now + max(60, int(cooldown_seconds))
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": utc_now(),
+        "reason": str(error)[:240],
+        "last_status_code": status_code,
+        "cooldown_seconds": max(60, int(cooldown_seconds)),
+        "backoff_until_epoch": until_epoch,
+        "backoff_until": datetime.fromtimestamp(until_epoch, tz=timezone.utc).isoformat(timespec="seconds"),
+    }
+    write_json_atomic(path, payload)
+    return payload
 
 
 def read_shadow_opens(paths: list[Path]) -> tuple[list[dict], dict]:
@@ -591,7 +651,7 @@ def segment_rows(rows: list[dict], key_func: Callable[[dict], str]) -> list[dict
     return result
 
 
-def aggregate_performance(rows: list[dict], run_id: str | None = None) -> dict:
+def aggregate_window(rows: list[dict], run_id: str | None = None) -> dict:
     assumption_counts = Counter(str(row.get("assumption_hash") or "unknown") for row in rows)
     selected_hash = assumption_counts.most_common(1)[0][0] if assumption_counts else "none"
     selected = [row for row in rows if str(row.get("assumption_hash") or "unknown") == selected_hash]
@@ -637,9 +697,29 @@ def aggregate_performance(rows: list[dict], run_id: str | None = None) -> dict:
     }
 
 
+def aggregate_performance(rows: list[dict], run_id: str | None = None, fresh_start_ts: str | None = DEFAULT_FRESH_WINDOW_START) -> dict:
+    performance = aggregate_window(rows, run_id)
+    fresh_rows = rows_since(rows, fresh_start_ts)
+    fresh = aggregate_window(fresh_rows, run_id)
+    performance["fresh_window"] = {
+        "start_ts": fresh_start_ts,
+        "row_count": len(fresh_rows),
+        "assumption_hash": fresh.get("assumption_hash"),
+        "overall": fresh.get("overall") or {},
+        "segments": fresh.get("segments") or {},
+        "data_quality": fresh.get("data_quality") or {},
+        "kill_candidates": fresh.get("kill_candidates") or [],
+        "promotion_candidates": fresh.get("promotion_candidates") or [],
+    }
+    return performance
+
+
 def render_markdown_report(performance: dict) -> str:
     overall = performance.get("overall") or {}
     dq = performance.get("data_quality") or {}
+    fresh = performance.get("fresh_window") if isinstance(performance.get("fresh_window"), dict) else {}
+    fresh_overall = fresh.get("overall") if isinstance(fresh.get("overall"), dict) else {}
+    fresh_dq = fresh.get("data_quality") if isinstance(fresh.get("data_quality"), dict) else {}
     lines = [
         "# Shadow Performance Report",
         "",
@@ -652,6 +732,11 @@ def render_markdown_report(performance: dict) -> str:
         f"- closed={overall.get('closed', 0)} wins={overall.get('wins', 0)} losses={overall.get('losses', 0)} win_rate={overall.get('win_rate', 0)}",
         f"- net={overall.get('net', 0):+.8f} expectancy={overall.get('expectancy', 0):+.8f} profit_factor={overall.get('profit_factor', 0)} max_drawdown={overall.get('max_drawdown', 0)}",
         f"- unresolved={dq.get('unresolved_count', 0)} ambiguous={dq.get('ambiguous_count', 0)} skipped={dq.get('skipped_count', 0)} api_errors={dq.get('api_error_count', 0)} confidence={dq.get('confidence')}",
+        "",
+        "## Fresh Window",
+        "",
+        f"- start={fresh.get('start_ts')} rows={fresh.get('row_count', 0)} closed={fresh_overall.get('closed', 0)} confidence={fresh_dq.get('confidence', 'low')}",
+        f"- net={fresh_overall.get('net', 0):+.8f} expectancy={fresh_overall.get('expectancy', 0):+.8f} profit_factor={fresh_overall.get('profit_factor', 0)} api_errors={fresh_dq.get('api_error_count', 0)} unresolved={fresh_dq.get('unresolved_count', 0)}",
         "",
         "## Top Segments",
         "",
@@ -694,9 +779,16 @@ def evaluate_many(
     run_id: str,
     fetcher: Callable[[str, int, int, str], list[dict]],
     max_trades: int | None = None,
+    backoff_path: Path | None = None,
+    rate_limit_cooldown_seconds: int = 900,
 ) -> list[dict]:
     rows: list[dict] = []
     selected_shadows = shadows[: max_trades or len(shadows)]
+    if backoff_path is not None:
+        backoff = rate_limit_backoff(backoff_path)
+        if backoff.get("active"):
+            error = f"rate_limited_backoff_until {backoff.get('backoff_until')}"
+            return [malformed_close(shadow, run_id, assumptions, "api_error", error) for shadow in selected_shadows]
     rate_limit_error: str | None = None
     for shadow in selected_shadows:
         if rate_limit_error:
@@ -716,6 +808,8 @@ def evaluate_many(
             rows.append(malformed_close(shadow, run_id, assumptions, "api_error", error))
             if exc.rate_limited:
                 rate_limit_error = error
+                if backoff_path is not None:
+                    record_rate_limit_backoff(error, exc.status_code, rate_limit_cooldown_seconds, backoff_path)
             continue
         except Exception:
             rows.append(malformed_close(shadow, run_id, assumptions, "api_error", "unknown_fetch_error"))
@@ -741,6 +835,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-entry-partial", action="store_true")
     parser.add_argument("--allow-incomplete-candle", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--rate-limit-cooldown-seconds", type=int, default=900)
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -764,7 +859,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     def live_fetcher(symbol: str, start_ms: int, end_ms: int, interval: str) -> list[dict]:
         return fetch_klines(symbol, start_ms, end_ms, interval, use_cache=not args.no_cache)
 
-    rows = evaluate_many(shadows, assumptions, run_id, live_fetcher, args.max_trades)
+    rows = evaluate_many(
+        shadows,
+        assumptions,
+        run_id,
+        live_fetcher,
+        args.max_trades,
+        backoff_path=RATE_LIMIT_STATE_JSON,
+        rate_limit_cooldown_seconds=args.rate_limit_cooldown_seconds,
+    )
     output = Path(args.output)
     existing = existing_close_ids(output)
     unique_rows = [row for row in rows if row.get("close_id") not in existing]

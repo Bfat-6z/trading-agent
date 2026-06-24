@@ -169,10 +169,93 @@ def test_post_trade_learning_records_costs_failure_and_counterfactual(tmp_path: 
     assert review["flags"]["fee_drag_high"] is True
     assert review["flags"]["funding_drag"] is True
 
+def test_post_trade_learning_classifies_microstructure_and_context_failures(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(ptl, "COUNTERFACTUAL_REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    base = {
+        "side": "LONG",
+        "entry": "100",
+        "exit": "99",
+        "sl": "99",
+        "tp": "102",
+        "gross": "-1",
+        "net": "-1",
+        "margin": "5",
+        "reason": "manual",
+        "setup_id": "exhaustion_fade",
+        "close_ts": "2026-06-21T00:02:00+00:00",
+    }
+
+    spread_review = ptl.review_closed_trade({**base, "trade_id": "spread_1", "spread_bps": 45}, candles(), setup_score={"score": 0.7}, append=False)
+    thin_review = ptl.review_closed_trade({**base, "trade_id": "thin_1", "quote_volume": 100_000}, candles(), setup_score={"score": 0.7}, append=False)
+    crowded_review = ptl.review_closed_trade({**base, "trade_id": "crowded_1", "funding_pct": 0.24, "open_interest_delta": 0.22}, candles(), setup_score={"score": 0.7}, append=False)
+    regime_review = ptl.review_closed_trade({**base, "trade_id": "regime_1", "market_regime": "risk_off", "setup_expected_regime": "risk_on"}, candles(), setup_score={"score": 0.7}, append=False)
+
+    assert spread_review["classification"] == "spread_slippage_issue"
+    assert spread_review["flags"]["spread_slippage_issue"] is True
+    assert thin_review["classification"] == "thin_liquidity"
+    assert thin_review["flags"]["thin_liquidity"] is True
+    assert crowded_review["classification"] == "crowded_trade"
+    assert crowded_review["flags"]["crowded_trade"] is True
+    assert regime_review["classification"] == "regime_mismatch"
+    assert regime_review["flags"]["regime_mismatch"] is True
+
+def test_post_trade_learning_uses_counterfactual_for_entry_timing(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(ptl, "COUNTERFACTUAL_REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    ptl.COUNTERFACTUAL_REPLAYS_JSONL.write_text(
+        json.dumps(
+            {
+                "signal_id": "timing_1",
+                "replay_id": "cf_timing",
+                "status": "complete",
+                "conclusion": "parameter_improvement_candidate",
+                "best_variant": {"variant": "entry_plus_1", "net": 0.4},
+                "base_variant": {"variant": "sl1_tp1", "net": -0.2},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    trade = {"trade_id": "timing_1", "side": "LONG", "entry": "100", "exit": "99", "sl": "99", "tp": "102", "net": "-1", "reason": "manual", "close_ts": "2026-06-21T00:02:00+00:00"}
+
+    review = ptl.review_closed_trade(trade, candles(), setup_score={"score": 0.7}, append=False)
+
+    assert review["classification"] == "early_entry"
+    assert review["primary_failure_reason"] == "early_entry"
+    assert review["flags"]["early_entry"] is True
+
+    ptl.COUNTERFACTUAL_REPLAYS_JSONL.write_text(
+        json.dumps(
+            {
+                "signal_id": "timing_2",
+                "replay_id": "cf_timing_late",
+                "status": "complete",
+                "conclusion": "parameter_improvement_candidate",
+                "best_variant": {"variant": "entry_minus_1", "net": 0.3},
+                "base_variant": {"variant": "sl1_tp1", "net": -0.2},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    late_trade = {**trade, "trade_id": "timing_2"}
+    late_review = ptl.review_closed_trade(late_trade, candles(), setup_score={"score": 0.7}, append=False)
+
+    assert late_review["classification"] == "late_entry"
+    assert late_review["flags"]["late_entry"] is True
+
+def test_post_trade_learning_reads_news_context_from_trade_row(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(ptl, "COUNTERFACTUAL_REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    trade = {"trade_id": "news_1", "side": "LONG", "entry": "100", "exit": "99", "sl": "99", "tp": "102", "net": "-1", "news_conflict": True, "market": {"primary_regime": "risk_off"}, "close_ts": "2026-06-21T00:02:00+00:00"}
+
+    review = ptl.review_closed_trade(trade, candles(), setup_score={"score": 0.7}, append=False)
+
+    assert review["classification"] == "news_conflict"
+    assert review["market_regime"] == "risk_off"
+
 def test_post_trade_learning_summary_includes_failure_and_quality_scores():
     summary = ptl.summarize_reviews(
         [
-            {"classification": "bad_loss", "primary_failure_reason": "adverse_move_to_stop", "process_quality_score": 0.6, "outcome_quality_score": 0.1, "setup_validity_score": 0.7},
+            {"classification": "bad_loss", "primary_failure_reason": "adverse_move_to_stop", "process_quality_score": 0.6, "outcome_quality_score": 0.1, "setup_validity_score": 0.7, "mae": -0.01, "mfe": 0.02, "r_multiple": -1, "costs": {"fees": 0.1}, "counterfactual": {"replay_id": "cf1"}},
             {"classification": "good_win", "primary_failure_reason": "no_failure_profit", "process_quality_score": 0.8, "outcome_quality_score": 0.9, "setup_validity_score": 0.8},
         ]
     )
@@ -180,6 +263,8 @@ def test_post_trade_learning_summary_includes_failure_and_quality_scores():
     assert summary["by_primary_failure_reason"]["adverse_move_to_stop"] == 1
     assert summary["avg_process_quality_score"] == 0.7
     assert summary["avg_outcome_quality_score"] == 0.5
+    assert summary["review_quality"]["mfe_mae_coverage_pct"] == 0.5
+    assert summary["review_quality"]["counterfactual_attach_pct"] == 0.5
 
 def test_counterfactual_blocked_winner_is_evidence_only(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")

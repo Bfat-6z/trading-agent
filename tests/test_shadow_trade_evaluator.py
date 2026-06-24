@@ -145,6 +145,21 @@ def test_aggregate_performance_separates_data_quality():
     assert perf["data_quality"]["selected_rows"] == 3
 
 
+def test_aggregate_performance_adds_fresh_window():
+    old_row = ev.evaluate_against_candles(_shadow("LONG"), [_candle(ENTRY_MS, 102, 100, 102)], _assumptions(), "run")
+    fresh_shadow = _shadow("SHORT", stop="101", take_profit="98")
+    fresh_shadow["ts"] = "2026-06-24T01:00:00+00:00"
+    fresh_ms = ev.ts_ms(fresh_shadow["ts"])
+    fresh_row = ev.evaluate_against_candles(fresh_shadow, [_candle(fresh_ms, 101, 99, 101)], _assumptions(), "run")
+
+    perf = ev.aggregate_performance([old_row, fresh_row], "run", fresh_start_ts="2026-06-24T00:00:00+00:00")
+
+    assert perf["overall"]["closed"] == 2
+    assert perf["fresh_window"]["row_count"] == 1
+    assert perf["fresh_window"]["overall"]["closed"] == 1
+    assert perf["fresh_window"]["data_quality"]["selected_rows"] == 1
+
+
 def test_evaluate_many_stops_fetching_after_rate_limit():
     shadows = [_shadow("LONG"), _shadow("SHORT", stop="101", take_profit="98")]
     calls = []
@@ -158,6 +173,37 @@ def test_evaluate_many_stops_fetching_after_rate_limit():
     assert len(calls) == 1
     assert [row["reason"] for row in rows] == ["api_error", "api_error"]
     assert rows[1]["data_quality"]["error"] == "http_418 rate limited"
+
+
+def test_evaluate_many_persists_rate_limit_backoff(tmp_path: Path):
+    shadows = [_shadow("LONG")]
+    backoff_path = tmp_path / "rate_limit.json"
+
+    def fetcher(symbol, start_ms, end_ms, interval):
+        raise ev.MarketDataError("http_429 too many requests", 429)
+
+    rows = ev.evaluate_many(shadows, _assumptions(), "run", fetcher, backoff_path=backoff_path, rate_limit_cooldown_seconds=60)
+
+    assert rows[0]["reason"] == "api_error"
+    assert backoff_path.exists()
+    assert ev.rate_limit_backoff(backoff_path)["active"] is True
+
+
+def test_evaluate_many_honors_existing_rate_limit_backoff(tmp_path: Path):
+    shadows = [_shadow("LONG"), _shadow("SHORT", stop="101", take_profit="98")]
+    backoff_path = tmp_path / "rate_limit.json"
+    ev.record_rate_limit_backoff("http_418", 418, 600, backoff_path)
+    calls = []
+
+    def fetcher(symbol, start_ms, end_ms, interval):
+        calls.append(symbol)
+        return []
+
+    rows = ev.evaluate_many(shadows, _assumptions(), "run", fetcher, backoff_path=backoff_path)
+
+    assert calls == []
+    assert [row["reason"] for row in rows] == ["api_error", "api_error"]
+    assert "rate_limited_backoff_until" in rows[0]["data_quality"]["error"]
 
 
 def test_module_does_not_import_live_trading_client():
