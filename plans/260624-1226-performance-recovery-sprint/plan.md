@@ -1004,6 +1004,68 @@ Results:
 - Dashboard API: `200`.
 - Supervisor duplicate count: `0`.
 
+### 2026-06-24 Phase 8 Daily Exam Improvement Proof Active
+
+Upgraded the daily exam and dashboard so the agent cannot get a high learning grade just because background modules are running:
+
+- `daily_exam_agent.py` now reads objective learning proof:
+  - post-trade review quality
+  - counterfactual coverage
+  - walk-forward validation status
+  - promotion blockers
+  - fresh shadow performance when available
+- Added `performance_improvement` to the daily exam rubric.
+- Daily quality score is capped when objective performance proof is weak, even if data freshness/risk discipline are good.
+- `score_edge_quality()` now prefers the fresh shadow window over old all-time shadow metrics.
+- Dashboard Learning tab now includes `Bằng chứng cải thiện` showing:
+  - performance improvement score
+  - edge/evidence scores
+  - counterfactual coverage
+  - review cost coverage
+  - walk-forward running/passed counts
+  - promotion blockers
+
+Runtime exam after upgrade:
+
+- Daily exam quality: `64.13`
+- `performance_improvement`: `0.0602`
+- `edge_quality`: `0.369`
+- `counterfactual coverage`: still weak
+- Walk-forward: `running`, not passed
+
+This is the intended behavior: the agent is not allowed to grade itself as strongly improving while the objective proof is still weak.
+
+Audit hardening after independent review:
+
+- `performance_improvement` now penalizes stale counterfactual and walk-forward payloads.
+- Counterfactual coverage only scores if replay and complete counts exist.
+- Walk-forward credit now validates latest rows, not only summary counts:
+  - status must be `passed`
+  - no errors
+  - test trades must meet `min_test_trades`
+  - expectancy after fees must be positive
+  - profit factor must be at least `1.05`
+  - no live-order permission flag
+- Low-confidence shadow evidence is discounted.
+- Unsafe promotion or walk-forward payloads with `can_place_live_orders=true` are penalized even though the exam output still forces paper-only.
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile daily_exam_agent.py agent_status_dashboard.py tests\test_runtime_integration_batch.py tests\test_agent_status_dashboard.py
+venv\Scripts\python.exe -m pytest tests\test_runtime_integration_batch.py tests\test_agent_status_dashboard.py -q
+venv\Scripts\python.exe daily_exam_agent.py --once --force --max-log-lines 1500
+venv\Scripts\python.exe agent_status_dashboard.py --once
+venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py tests\test_candidate_feeder_and_promotion_loop.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_process_supervisor.py tests\test_agent_status_dashboard.py tests\test_phase_f_autonomy_promotion.py -q
+```
+
+Results after audit hardening:
+
+- Focused tests: `40 passed`.
+- Expanded regression: `151 passed`.
+- Dashboard API: `200`.
+- Supervisor duplicate count: `0`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

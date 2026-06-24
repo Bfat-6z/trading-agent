@@ -33,6 +33,10 @@ SELF_IMPROVEMENT = MEMORY_DIR / "self_improvement_latest.json"
 COGNITIVE_LATEST = MEMORY_DIR / "cognitive_state_latest.json"
 LIVE_READINESS = MEMORY_DIR / "live_readiness_latest.json"
 SELF_MODEL = MEMORY_DIR / "self_model_latest.json"
+POST_TRADE_LEARNING = MEMORY_DIR / "post_trade_learning_latest.json"
+COUNTERFACTUAL_LATEST = MEMORY_DIR / "counterfactual_latest.json"
+WALK_FORWARD_LATEST = MEMORY_DIR / "walk_forward_latest.json"
+PROMOTION_BOARD = MEMORY_DIR / "promotion_board_latest.json"
 
 LATEST_JSON = MEMORY_DIR / "daily_exam_latest.json"
 HISTORY_JSONL = MEMORY_DIR / "daily_exam_history.jsonl"
@@ -136,6 +140,10 @@ def load_inputs(max_log_lines: int = 1500) -> dict:
         "cognitive": read_json(COGNITIVE_LATEST),
         "live_readiness": read_json(LIVE_READINESS),
         "self_model": read_json(SELF_MODEL),
+        "post_trade": read_json(POST_TRADE_LEARNING),
+        "counterfactual": read_json(COUNTERFACTUAL_LATEST),
+        "walk_forward": read_json(WALK_FORWARD_LATEST),
+        "promotion": read_json(PROMOTION_BOARD),
         "setups": skill_summary(library).get("skills") or [],
         "paper": summarize_paper(read_jsonl_tail(SCALP_LOG, max_log_lines)),
         "previous_exam": read_json(LATEST_JSON),
@@ -194,7 +202,8 @@ def score_evidence_coverage(inputs: dict) -> dict:
     }
 
 def score_edge_quality(inputs: dict) -> dict:
-    shadow = inputs["shadow"].get("overall") or {}
+    fresh = inputs["shadow"].get("fresh_window") if isinstance(inputs["shadow"].get("fresh_window"), dict) else {}
+    shadow = (fresh.get("overall") if isinstance(fresh.get("overall"), dict) and fresh.get("overall") else None) or inputs["shadow"].get("overall") or {}
     paper = inputs["paper"]
     shadow_wr = safe_float(shadow.get("win_rate"))
     shadow_exp = safe_float(shadow.get("expectancy"))
@@ -211,6 +220,7 @@ def score_edge_quality(inputs: dict) -> dict:
         "shadow_expectancy": shadow_exp,
         "shadow_profit_factor": shadow_pf,
         "paper_win_rate": paper_wr,
+        "shadow_source": "fresh_window" if fresh.get("overall") else "overall",
     }
 
 def score_learning_progress(inputs: dict) -> dict:
@@ -230,22 +240,134 @@ def score_learning_progress(inputs: dict) -> dict:
         "previous_quality_score": previous_score,
     }
 
+def freshness_factor(payload: dict, max_hours: float = 24.0) -> float:
+    ts = payload.get("updated_at") or payload.get("ts") or payload.get("evaluated_at")
+    hours = age_hours(ts)
+    if hours is None:
+        return 0.5
+    if hours <= max_hours:
+        return 1.0
+    if hours <= max_hours * 3:
+        return 0.5
+    return 0.0
+
+def walk_forward_proof_score(walk_forward: dict) -> dict:
+    rows = walk_forward.get("rows") if isinstance(walk_forward.get("rows"), list) else []
+    valid_passes = []
+    unsafe = bool(walk_forward.get("can_place_live_orders"))
+    for row in rows:
+        metrics = row.get("test_metrics") if isinstance(row.get("test_metrics"), dict) else {}
+        if row.get("can_place_live_orders"):
+            unsafe = True
+        if row.get("status") != "passed":
+            continue
+        if row.get("errors"):
+            continue
+        if int(metrics.get("trades") or 0) < int(row.get("min_test_trades") or 20):
+            continue
+        if safe_float(metrics.get("expectancy_after_fees")) <= 0:
+            continue
+        if safe_float(metrics.get("profit_factor")) < 1.05:
+            continue
+        valid_passes.append(row)
+    by_status = walk_forward.get("by_status") if isinstance(walk_forward.get("by_status"), dict) else {}
+    running = int(by_status.get("running") or 0)
+    failed = int(by_status.get("failed") or 0)
+    score = 1.0 if valid_passes and failed == 0 and running == 0 and not unsafe else 0.45 if running > 0 and failed == 0 and not unsafe else 0.0
+    return {
+        "score": score,
+        "valid_pass_count": len(valid_passes),
+        "running": running,
+        "failed": failed,
+        "unsafe_live_permission": unsafe,
+    }
+
+def score_performance_improvement(inputs: dict) -> dict:
+    paper = inputs["paper"]
+    shadow_fresh = inputs["shadow"].get("fresh_window") if isinstance(inputs["shadow"].get("fresh_window"), dict) else {}
+    shadow = (shadow_fresh.get("overall") if isinstance(shadow_fresh.get("overall"), dict) else {}) or inputs["shadow"].get("overall") or {}
+    shadow_quality = shadow_fresh.get("data_quality") if isinstance(shadow_fresh.get("data_quality"), dict) else inputs["shadow"].get("data_quality") or {}
+    post_trade = inputs.get("post_trade") or {}
+    review_quality = post_trade.get("review_quality") if isinstance(post_trade.get("review_quality"), dict) else {}
+    counterfactual = inputs.get("counterfactual") or {}
+    walk_forward = inputs.get("walk_forward") or {}
+    promotion = inputs.get("promotion") or {}
+    paper_closes = int(paper.get("closes") or 0)
+    paper_expectancy = safe_float(paper.get("net")) / paper_closes if paper_closes else 0.0
+    shadow_closed = int(shadow.get("closed") or 0)
+    shadow_expectancy = safe_float(shadow.get("expectancy"))
+    shadow_pf = safe_float(shadow.get("profit_factor"))
+    coverage = safe_float(counterfactual.get("coverage_pct"))
+    replay_count = int(counterfactual.get("replay_count") or 0)
+    complete_count = int(counterfactual.get("complete_count") or 0)
+    review_cost_coverage = safe_float(review_quality.get("cost_coverage_pct"))
+    review_r_coverage = safe_float(review_quality.get("r_multiple_coverage_pct"))
+    wf_proof = walk_forward_proof_score(walk_forward)
+    wf_failed = wf_proof["failed"]
+    wf_running = wf_proof["running"]
+    wf_passed = wf_proof["valid_pass_count"]
+    shadow_confidence = str(shadow_quality.get("confidence") or "unknown").lower()
+    shadow_quality_multiplier = 1.0 if shadow_confidence in {"high", "medium"} else 0.45
+    counterfactual_freshness = freshness_factor(counterfactual, 24)
+    walk_forward_freshness = freshness_factor(walk_forward, 24)
+    promotion_unsafe = bool(promotion.get("can_place_live_orders"))
+    paper_score = 1.0 if paper_closes >= 25 and paper_expectancy > 0 else 0.45 if paper_closes >= 10 else 0.15
+    shadow_score = (1.0 if shadow_closed >= 100 and shadow_expectancy > 0 and shadow_pf >= 1.15 else 0.45 if shadow_closed >= 20 else 0.15) * shadow_quality_multiplier
+    replay_score = (clamp(coverage / 0.8) if coverage and replay_count and complete_count else 0.0) * counterfactual_freshness
+    review_score = clamp((review_cost_coverage + review_r_coverage) / 2)
+    walk_score = wf_proof["score"] * walk_forward_freshness
+    blocker_penalty = 0.2 if promotion.get("failures") else 0.0
+    unsafe_penalty = 0.35 if promotion_unsafe or wf_proof["unsafe_live_permission"] else 0.0
+    score = clamp(paper_score * 0.2 + shadow_score * 0.25 + replay_score * 0.2 + review_score * 0.2 + walk_score * 0.15 - blocker_penalty)
+    score = clamp(score - unsafe_penalty)
+    return {
+        "score": round(score, 4),
+        "paper_closes": paper_closes,
+        "paper_expectancy": round(paper_expectancy, 8),
+        "shadow_source": "fresh_window" if shadow_fresh.get("overall") else "overall",
+        "shadow_closed": shadow_closed,
+        "shadow_expectancy": shadow_expectancy,
+        "shadow_profit_factor": shadow_pf,
+        "shadow_confidence": shadow_confidence,
+        "counterfactual_coverage_pct": coverage,
+        "counterfactual_replay_count": replay_count,
+        "counterfactual_complete_count": complete_count,
+        "counterfactual_freshness_factor": counterfactual_freshness,
+        "review_cost_coverage_pct": review_cost_coverage,
+        "review_r_coverage_pct": review_r_coverage,
+        "walk_forward_running": wf_running,
+        "walk_forward_passed": wf_passed,
+        "walk_forward_failed": wf_failed,
+        "walk_forward_freshness_factor": walk_forward_freshness,
+        "walk_forward_unsafe_live_permission": wf_proof["unsafe_live_permission"],
+        "promotion_unsafe_live_permission": promotion_unsafe,
+        "promotion_failures": promotion.get("failures") if isinstance(promotion.get("failures"), list) else [],
+    }
+
 def quality_rubric(inputs: dict) -> dict:
     scores = {
         "data_freshness": score_data_freshness(inputs),
         "risk_discipline": score_risk_discipline(inputs),
         "evidence_coverage": score_evidence_coverage(inputs),
         "edge_quality": score_edge_quality(inputs),
+        "performance_improvement": score_performance_improvement(inputs),
         "learning_progress": score_learning_progress(inputs),
     }
     weights = {
-        "data_freshness": 0.2,
-        "risk_discipline": 0.25,
-        "evidence_coverage": 0.2,
-        "edge_quality": 0.2,
-        "learning_progress": 0.15,
+        "data_freshness": 0.15,
+        "risk_discipline": 0.2,
+        "evidence_coverage": 0.15,
+        "edge_quality": 0.17,
+        "performance_improvement": 0.2,
+        "learning_progress": 0.13,
     }
     quality = sum(scores[key]["score"] * weight for key, weight in weights.items())
+    if scores["risk_discipline"]["score"] < 0.8:
+        quality = min(quality, 0.75)
+    if scores["edge_quality"]["score"] < 0.35:
+        quality = min(quality, 0.7)
+    if scores["performance_improvement"]["score"] < 0.35:
+        quality = min(quality, 0.65)
     return {"quality_score": round(quality * 100, 2), "scores": scores, "weights": weights}
 
 def grade_letter(score: float) -> str:
@@ -421,6 +543,8 @@ def learning_targets(inputs: dict, rubric: dict, grade: dict) -> list[str]:
         targets.append("Collect more closed Shadow/Paper samples, especially by setup_id.")
     if scores["edge_quality"]["score"] < 0.55:
         targets.append("Do not promote; study why shadow expectancy/profit factor is weak.")
+    if scores["performance_improvement"]["score"] < 0.55:
+        targets.append("Improve objective proof: counterfactual coverage, review quality, fresh shadow edge, or walk-forward pass.")
     if scores["risk_discipline"]["score"] < 0.85:
         targets.append("Keep Risk gate strict and block automatic loosening.")
     if not grade["passed"]:

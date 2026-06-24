@@ -254,6 +254,85 @@ def test_daily_exam_prioritizes_self_model_gaps(monkeypatch, tmp_path: Path):
 
     assert dea.choose_exam_type(inputs, "2026-06-21") == "risk_gate_review"
 
+def test_daily_exam_scores_objective_performance_improvement():
+    inputs = {
+        "paper": {"closes": 30, "net": 6.0, "win_rate": 0.55},
+        "shadow": {
+            "fresh_window": {
+                "overall": {"closed": 120, "expectancy": 0.02, "profit_factor": 1.3},
+                "data_quality": {"confidence": "medium"},
+            }
+        },
+        "post_trade": {"review_quality": {"cost_coverage_pct": 0.9, "r_multiple_coverage_pct": 0.85}},
+        "counterfactual": {"updated_at": dea.utc_now(), "coverage_pct": 0.82, "replay_count": 100, "complete_count": 82},
+        "walk_forward": {
+            "updated_at": dea.utc_now(),
+            "by_status": {"passed": 1},
+            "rows": [{"status": "passed", "min_test_trades": 20, "test_metrics": {"trades": 24, "expectancy_after_fees": 0.03, "profit_factor": 1.2}, "errors": [], "can_place_live_orders": False}],
+            "can_place_live_orders": False,
+        },
+        "promotion": {"failures": []},
+    }
+
+    result = dea.score_performance_improvement(inputs)
+
+    assert result["score"] > 0.8
+    assert result["shadow_source"] == "fresh_window"
+    assert result["walk_forward_passed"] == 1
+
+def test_daily_exam_rejects_stale_low_quality_or_unsafe_performance_proof():
+    stale_ts = "2026-01-01T00:00:00+00:00"
+    inputs = {
+        "paper": {"closes": 30, "net": 6.0, "win_rate": 0.55},
+        "shadow": {
+            "fresh_window": {
+                "overall": {"closed": 120, "expectancy": 0.05, "profit_factor": 2.0},
+                "data_quality": {"confidence": "low", "api_error_count": 20},
+            }
+        },
+        "post_trade": {"review_quality": {"cost_coverage_pct": 0.9, "r_multiple_coverage_pct": 0.85}},
+        "counterfactual": {"updated_at": stale_ts, "coverage_pct": 1.0, "replay_count": 100, "complete_count": 100},
+        "walk_forward": {
+            "updated_at": stale_ts,
+            "by_status": {"passed": 1},
+            "rows": [{"status": "passed", "min_test_trades": 20, "test_metrics": {"trades": 3, "expectancy_after_fees": -0.01, "profit_factor": 0.8}, "errors": [], "can_place_live_orders": True}],
+            "can_place_live_orders": True,
+        },
+        "promotion": {"failures": [], "can_place_live_orders": True},
+    }
+
+    result = dea.score_performance_improvement(inputs)
+
+    assert result["score"] < 0.5
+    assert result["walk_forward_passed"] == 0
+    assert result["walk_forward_unsafe_live_permission"] is True
+    assert result["promotion_unsafe_live_permission"] is True
+
+def test_daily_exam_quality_is_capped_when_performance_proof_is_weak():
+    fresh_ts = dea.utc_now()
+    inputs = {
+        "market": {"ts": fresh_ts},
+        "news": {"ts": fresh_ts},
+        "cognitive": {"ts": fresh_ts, "reasoning_trace": {"thought_quality_score": 0.9}},
+        "self_improvement": {"ts": fresh_ts, "overall_learning_score": 0.9, "guardrail_proposal": {"can_loosen": False, "can_trade_live": False}},
+        "bias": {"min_signal_score": 8, "risk_posture": "defensive"},
+        "live_readiness": {"mode": "paper"},
+        "shadow": {"overall": {"closed": 500, "win_rate": 0.6, "expectancy": -0.02, "profit_factor": 0.8}},
+        "paper": {"closes": 5, "net": -1.0, "win_rate": 0.2},
+        "setups": [{"trades": 50}],
+        "post_trade": {"review_quality": {"cost_coverage_pct": 0.0, "r_multiple_coverage_pct": 0.0}},
+        "counterfactual": {"coverage_pct": 0.0},
+        "walk_forward": {"by_status": {"running": 1}},
+        "promotion": {"failures": ["walk_forward_validation_running"]},
+        "self_model": {},
+        "previous_exam": {},
+    }
+
+    rubric = dea.quality_rubric(inputs)
+
+    assert rubric["scores"]["performance_improvement"]["score"] < 0.35
+    assert rubric["quality_score"] <= 65
+
 def test_llm_council_run_role_uses_router_and_sanitizer(tmp_path: Path):
     def fake_call(system: str, user: str, model: str) -> str:
         return '{"summary":"ok","data_ids":["d1"],"recommendation":"paper test only","risk_proposal":{"can_place_live_orders":true}}'

@@ -304,7 +304,7 @@ def test_load_dashboard_status_from_fake_state(tmp_path: Path, monkeypatch):
     write_json(memory / "news_latest.json", {"ts": "now", "macro_risk_score": 0.1, "source_health": [{"source": "fake", "status": "ok", "count": 1}]})
     write_json(memory / "shadow_performance_latest.json", {"overall": {"closed": 2, "wins": 1, "losses": 1, "win_rate": 0.5, "net": 0.02}, "data_quality": {"confidence": "low"}})
     write_json(memory / "self_improvement_latest.json", {"ts": "now", "overall_learning_score": 0.42, "readiness": "not_ready", "blindspots": [{"type": "negative_shadow_edge"}], "learning_curriculum": [{"task": "Freeze promotion"}], "guardrail_proposal": {"can_loosen": False, "can_trade_live": False}})
-    write_json(memory / "daily_exam_latest.json", {"ts": "now", "local_date": "2026-06-21", "exam_type": "risk_gate_review", "quality_score": 62.5, "quality_grade": "D", "exam_score": 85, "passed": True, "rubric": {"scores": {"risk_discipline": {"score": 0.9}}}, "contract": {"paper_only": True}})
+    write_json(memory / "daily_exam_latest.json", {"ts": "now", "local_date": "2026-06-21", "exam_type": "risk_gate_review", "quality_score": 62.5, "quality_grade": "D", "exam_score": 85, "passed": True, "rubric": {"scores": {"risk_discipline": {"score": 0.9}, "performance_improvement": {"score": 0.25}}}, "contract": {"paper_only": True}})
     write_json(memory / "llm_reasoning_latest.json", {"ts": "now", "status": "ok", "provider": {"provider": "9router", "deep_model": "gpt-5.5", "quick_model": "gpt-5.5"}, "reasoning": {"summary": "gom thêm mẫu", "critical_blindspots": ["negative_shadow_edge"], "risk_proposal": {"can_place_live_orders": False, "can_loosen_risk": False}}})
     write_json(memory / "promotion_board_latest.json", {"evaluated_at": "now", "state": "paper_learning", "passed": False, "failures": ["insufficient_paper_trades"], "requirements": {"paper_trades": 300}, "metrics": {"paper_trades": 2}, "can_place_live_orders": False})
     write_json(memory / "walk_forward_latest.json", {"updated_at": "now", "experiment_count": 1, "by_status": {"running": 1}, "rows": [{"patch_id": "p1", "setup_id": "fade", "status": "running", "test_metrics": {"trades": 3, "expectancy_after_fees": 0.01, "profit_factor": 1.2}, "errors": ["insufficient_future_trades"]}], "can_place_live_orders": False})
@@ -333,6 +333,7 @@ def test_load_dashboard_status_from_fake_state(tmp_path: Path, monkeypatch):
     assert status["daily_exam"]["exam_type"] == "risk_gate_review"
     assert status["daily_exam"]["quality_score"] == 62.5
     assert status["daily_exam"]["passed"] is True
+    assert status["daily_exam"]["score_snapshot"]["performance_improvement"] == 0.25
     assert status["llm_reasoning"]["status"] == "ok"
     assert status["llm_reasoning"]["provider"] == "9router"
     assert status["llm_reasoning"]["deep_model"] == "gpt-5.5"
@@ -396,4 +397,6 @@ def test_html_is_single_page_dashboard():
     assert "renderCounterfactualLearning" in dash.HTML
     assert "Walk-forward validation" in dash.HTML
     assert "renderWalkForwardLearning" in dash.HTML
+    assert "Bằng chứng cải thiện" in dash.HTML
+    assert "renderImprovementProof" in dash.HTML
     assert "window.open" not in dash.HTML
