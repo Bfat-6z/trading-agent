@@ -59,6 +59,14 @@ def test_counterfactual_replay_agent_is_supervised_for_objective_learning():
     assert agent.heartbeat_file.name == "counterfactual_replay_agent_heartbeat.json"
     assert agent.max_heartbeat_age_seconds == 900
 
+def test_shadow_trade_evaluator_loop_is_supervised_for_fresh_shadow_learning():
+    agent = next(spec for spec in aps.specs() if spec.name == "shadow_trade_evaluator_loop")
+
+    assert agent.script == "shadow_trade_evaluator_loop.py"
+    assert agent.args == ("--interval-seconds", "600", "--max-age-hours", "24", "--max-trades", "100")
+    assert agent.heartbeat_file.name == "shadow_trade_evaluator_loop_heartbeat.json"
+    assert agent.max_heartbeat_age_seconds == 1800
+
 def test_stale_detects_old_heartbeat(tmp_path: Path):
     heartbeat = tmp_path / "hb.json"
     old = (datetime.now(timezone.utc) - timedelta(seconds=500)).isoformat(timespec="seconds")

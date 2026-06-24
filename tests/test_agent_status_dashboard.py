@@ -123,6 +123,7 @@ def test_paper_runtime_status_includes_objective_learning_loops():
         {"name": "autonomous_paper_trading_loop", "state": "ok", "running": True},
         {"name": "paper_execution_lifecycle_loop", "state": "ok", "running": True},
         {"name": "counterfactual_replay_agent", "state": "stale", "running": True},
+        {"name": "shadow_trade_evaluator_loop", "state": "ok", "running": True},
         {"name": "promotion_evaluator_loop", "state": "ok", "running": True},
     ]
 
@@ -130,6 +131,7 @@ def test_paper_runtime_status_includes_objective_learning_loops():
 
     assert runtime["state"] == "degraded"
     assert "counterfactual_replay_agent" in runtime["tracked"]
+    assert "shadow_trade_evaluator_loop" in runtime["tracked"]
 
 
 def test_compact_beliefs_sorts_by_confidence():
@@ -204,6 +206,7 @@ def test_default_dashboard_tracks_all_core_agent_heartbeats():
         "self_improvement_agent",
         "daily_exam_agent",
         "counterfactual_replay_agent",
+        "shadow_trade_evaluator_loop",
         "promotion_evaluator_loop",
     }
 

@@ -46,6 +46,7 @@ HEARTBEAT_FILES = {
     "paper_execution_lifecycle_loop": STATE_DIR / "paper_execution_lifecycle_loop_heartbeat.json",
     "microstructure_observer_loop": STATE_DIR / "microstructure_observer_loop_heartbeat.json",
     "counterfactual_replay_agent": STATE_DIR / "counterfactual_replay_agent_heartbeat.json",
+    "shadow_trade_evaluator_loop": STATE_DIR / "shadow_trade_evaluator_loop_heartbeat.json",
     "promotion_evaluator_loop": STATE_DIR / "promotion_evaluator_loop_heartbeat.json",
     "self_model": STATE_DIR / "self_model_heartbeat.json",
 }
@@ -63,6 +64,7 @@ HEARTBEAT_FRESH_LIMITS = {
     "paper_execution_lifecycle_loop": 120,
     "microstructure_observer_loop": 180,
     "counterfactual_replay_agent": 900,
+    "shadow_trade_evaluator_loop": 1800,
     "promotion_evaluator_loop": 600,
     "self_model": 900,
     "self_improvement_agent": 28800,
@@ -665,6 +667,7 @@ def paper_runtime_status(heartbeats: list[dict]) -> dict:
         lookup.get("autonomous_paper_trading_loop"),
         lookup.get("paper_execution_lifecycle_loop"),
         lookup.get("counterfactual_replay_agent"),
+        lookup.get("shadow_trade_evaluator_loop"),
         lookup.get("promotion_evaluator_loop"),
     ]
     tracked = [row for row in tracked if row]

@@ -794,6 +794,34 @@ Runtime audit:
 - Supervisor dashboard duplicate was detected after restart/testing and cleaned via `agent_process_supervisor.ensure_agent()`.
 - Final supervisor status showed dashboard `duplicate_count=0`.
 
+### 2026-06-24 Phase 5 Fresh Shadow Loop Active
+
+Implemented supervised fresh shadow evaluation:
+
+- Created `shadow_trade_evaluator_loop.py` with daemon/`--once` mode, PID, heartbeat, latest JSON, and history JSONL.
+- Supervisor now manages `shadow_trade_evaluator_loop` every 600 seconds with a 30-minute stale threshold.
+- Dashboard heartbeat and paper-learning runtime now track the shadow loop alongside counterfactual and promotion loops.
+- The loop evaluates only recent shadow opens, skips terminal shadow outcomes, and retries non-terminal `api_error` / unresolved rows.
+- Shadow performance accounting now collapses retried rows by `close_id` and uses the latest row, so a temporary API error does not permanently double-count or block a later closed result.
+- Runtime smoke:
+  - `shadow_trade_evaluator_loop.py --once --max-trades 5 --max-age-hours 24`
+  - result: `status=ok evaluated=5 new_rows=5`
+  - supervisor status: `shadow_trade_evaluator_loop` running, duplicate count `0`
+  - dashboard API returned `200` and paper runtime tracks 6 loops including `shadow_trade_evaluator_loop`
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile shadow_trade_evaluator_loop.py shadow_trade_evaluator.py agent_process_supervisor.py agent_status_dashboard.py tests\test_shadow_trade_evaluator_loop.py tests\test_shadow_trade_evaluator.py tests\test_agent_process_supervisor.py tests\test_agent_status_dashboard.py
+venv\Scripts\python.exe -m pytest tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_process_supervisor.py tests\test_agent_status_dashboard.py -q
+venv\Scripts\python.exe -m pytest tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_status_dashboard.py tests\test_agent_process_supervisor.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py -q
+```
+
+Results:
+
+- Focused shadow/supervisor/dashboard: `59 passed`.
+- Expanded regression: `91 passed`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

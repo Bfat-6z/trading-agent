@@ -160,6 +160,17 @@ def test_aggregate_performance_adds_fresh_window():
     assert perf["fresh_window"]["data_quality"]["selected_rows"] == 1
 
 
+def test_aggregate_performance_uses_latest_row_for_retried_close_id():
+    shadow = _shadow("LONG")
+    api_error = ev.malformed_close(shadow, "run1", _assumptions(), "api_error", "temporary")
+    closed = ev.evaluate_against_candles(shadow, [_candle(ENTRY_MS, 102, 100, 102)], _assumptions(), "run2")
+
+    perf = ev.aggregate_performance([api_error, closed], "run2")
+
+    assert perf["overall"]["closed"] == 1
+    assert perf["data_quality"]["api_error_count"] == 0
+    assert perf["data_quality"]["selected_rows"] == 1
+
 def test_evaluate_many_stops_fetching_after_rate_limit():
     shadows = [_shadow("LONG"), _shadow("SHORT", stop="101", take_profit="98")]
     calls = []

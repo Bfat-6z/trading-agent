@@ -147,6 +147,22 @@ def rows_since(rows: list[dict], start_ts: str | None) -> list[dict]:
     return [row for row in rows if (row_event_ms(row) or 0) >= start_ms]
 
 
+def latest_by_close_id(rows: list[dict]) -> list[dict]:
+    """Keep the newest row for each close_id while preserving first-seen order."""
+    ordered_ids: list[str] = []
+    latest: dict[str, dict] = {}
+    passthrough: list[dict] = []
+    for row in rows:
+        close_id_value = row.get("close_id")
+        if not close_id_value:
+            passthrough.append(row)
+            continue
+        key = str(close_id_value)
+        if key not in latest:
+            ordered_ids.append(key)
+        latest[key] = row
+    return passthrough + [latest[key] for key in ordered_ids]
+
 def ms_iso(value: int | None) -> str | None:
     if value is None:
         return None
@@ -698,8 +714,9 @@ def aggregate_window(rows: list[dict], run_id: str | None = None) -> dict:
 
 
 def aggregate_performance(rows: list[dict], run_id: str | None = None, fresh_start_ts: str | None = DEFAULT_FRESH_WINDOW_START) -> dict:
-    performance = aggregate_window(rows, run_id)
-    fresh_rows = rows_since(rows, fresh_start_ts)
+    latest_rows = latest_by_close_id(rows)
+    performance = aggregate_window(latest_rows, run_id)
+    fresh_rows = rows_since(latest_rows, fresh_start_ts)
     fresh = aggregate_window(fresh_rows, run_id)
     performance["fresh_window"] = {
         "start_ts": fresh_start_ts,
