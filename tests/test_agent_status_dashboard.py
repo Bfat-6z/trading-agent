@@ -123,6 +123,8 @@ def test_paper_runtime_status_includes_objective_learning_loops():
         {"name": "autonomous_paper_trading_loop", "state": "ok", "running": True},
         {"name": "paper_execution_lifecycle_loop", "state": "ok", "running": True},
         {"name": "counterfactual_replay_agent", "state": "stale", "running": True},
+        {"name": "learning_exam_benchmark", "state": "ok", "running": True},
+        {"name": "test_result_memory_agent", "state": "ok", "running": True},
         {"name": "shadow_trade_evaluator_loop", "state": "ok", "running": True},
         {"name": "promotion_evaluator_loop", "state": "ok", "running": True},
     ]
@@ -131,6 +133,8 @@ def test_paper_runtime_status_includes_objective_learning_loops():
 
     assert runtime["state"] == "degraded"
     assert "counterfactual_replay_agent" in runtime["tracked"]
+    assert "learning_exam_benchmark" in runtime["tracked"]
+    assert "test_result_memory_agent" in runtime["tracked"]
     assert "shadow_trade_evaluator_loop" in runtime["tracked"]
 
 
@@ -206,6 +210,8 @@ def test_default_dashboard_tracks_all_core_agent_heartbeats():
         "self_improvement_agent",
         "daily_exam_agent",
         "counterfactual_replay_agent",
+        "learning_exam_benchmark",
+        "test_result_memory_agent",
         "shadow_trade_evaluator_loop",
         "promotion_evaluator_loop",
     }
@@ -309,6 +315,8 @@ def test_load_dashboard_status_from_fake_state(tmp_path: Path, monkeypatch):
     write_json(memory / "promotion_board_latest.json", {"evaluated_at": "now", "state": "paper_learning", "passed": False, "failures": ["insufficient_paper_trades"], "requirements": {"paper_trades": 300}, "metrics": {"paper_trades": 2}, "can_place_live_orders": False})
     write_json(memory / "walk_forward_latest.json", {"updated_at": "now", "experiment_count": 1, "by_status": {"running": 1}, "rows": [{"patch_id": "p1", "setup_id": "fade", "status": "running", "test_metrics": {"trades": 3, "expectancy_after_fees": 0.01, "profit_factor": 1.2}, "errors": ["insufficient_future_trades"]}], "can_place_live_orders": False})
     write_json(memory / "model_usage_latest.json", {"call_count": 3, "input_tokens_est": 100, "output_tokens_est": 50, "cost_usd_est": 0, "can_place_live_orders": False})
+    write_json(memory / "learning_exam_benchmark_latest.json", {"score": 1.0, "scenario_count": 5, "failed_count": 0, "can_place_live_orders": False})
+    write_json(memory / "test_result_memory_latest.json", {"lesson_count": 2, "high_severity_count": 1, "known_gaps": ["counterfactual_coverage_low"], "can_place_live_orders": False})
     write_json(state / "paper_account.json", {"equity": "100.0", "starting_equity": "100.0", "open_positions": [{"symbol": "BTCUSDT", "margin": "5", "notional": "50"}]})
     write_json(state / "market_observer_heartbeat.json", {"ts": dash.utc_now(), "pid": 123, "status": "ok"})
     (state / "scalp_autotrader.jsonl").write_text('{"event":"paper_close","net":"0.1"}\n', encoding="utf-8")
@@ -344,6 +352,8 @@ def test_load_dashboard_status_from_fake_state(tmp_path: Path, monkeypatch):
     assert status["ops"]["experiments"]["running"] == 1
     assert status["ops"]["experiments"]["can_place_live_orders"] is False
     assert status["ops"]["model_usage"]["call_count"] == 3
+    assert status["ops"]["learning_benchmark"]["scenario_count"] == 5
+    assert status["ops"]["test_result_memory"]["lesson_count"] == 2
 
 
 def test_html_is_single_page_dashboard():

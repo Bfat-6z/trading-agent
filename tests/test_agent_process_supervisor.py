@@ -67,6 +67,17 @@ def test_shadow_trade_evaluator_loop_is_supervised_for_fresh_shadow_learning():
     assert agent.heartbeat_file.name == "shadow_trade_evaluator_loop_heartbeat.json"
     assert agent.max_heartbeat_age_seconds == 1800
 
+def test_learning_exam_and_test_result_memory_agents_are_supervised():
+    benchmark = next(spec for spec in aps.specs() if spec.name == "learning_exam_benchmark")
+    memory = next(spec for spec in aps.specs() if spec.name == "test_result_memory_agent")
+
+    assert benchmark.script == "learning_exam_benchmark.py"
+    assert benchmark.heartbeat_file.name == "learning_exam_benchmark_heartbeat.json"
+    assert benchmark.max_heartbeat_age_seconds == 4500
+    assert memory.script == "test_result_memory_agent.py"
+    assert memory.heartbeat_file.name == "test_result_memory_agent_heartbeat.json"
+    assert memory.max_heartbeat_age_seconds == 2700
+
 def test_stale_detects_old_heartbeat(tmp_path: Path):
     heartbeat = tmp_path / "hb.json"
     old = (datetime.now(timezone.utc) - timedelta(seconds=500)).isoformat(timespec="seconds")

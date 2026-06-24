@@ -88,6 +88,22 @@ def test_self_model_records_known_gaps(monkeypatch, tmp_path: Path):
     assert model["can_trade_live"] is False
     assert "no_post_trade_reviews_yet" in model["known_gaps"]
 
+def test_self_model_consumes_test_result_memory_curriculum(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    monkeypatch.setattr(self_model, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(self_model, "MEMORY_DIR", memory)
+    monkeypatch.setattr(self_model, "SELF_MODEL_LATEST", memory / "self_model_latest.json")
+    memory.mkdir()
+    atomic_state.write_json_atomic(memory / "test_result_memory_latest.json", {"lesson_count": 2, "known_gaps": ["counterfactual_coverage_low"], "curriculum": [{"priority": "high", "task": "raise replay coverage", "action": "run replay", "source": "counterfactual"}]})
+    atomic_state.write_json_atomic(memory / "learning_exam_benchmark_latest.json", {"score": 0.8, "scenario_count": 5})
+
+    model = self_model.build_self_model()
+
+    assert "counterfactual_coverage_low" in model["known_gaps"]
+    assert model["current_state"]["learning_benchmark_score"] == 0.8
+    assert model["experience_counters"]["test_result_lessons"] == 2
+    assert any(item.get("task") == "raise replay coverage" for item in model["curriculum"])
+
 
 def test_data_hygiene_detects_bad_jsonl(tmp_path: Path):
     bad = tmp_path / "bad.jsonl"

@@ -60,6 +60,8 @@ def build_self_model() -> dict[str, Any]:
     memory = read_json(MEMORY_DIR / "memory_consolidation_latest.json", default={})
     self_improvement = read_json(MEMORY_DIR / "self_improvement_latest.json", default={})
     promotion = read_json(MEMORY_DIR / "promotion_board_latest.json", default={})
+    test_memory = read_json(MEMORY_DIR / "test_result_memory_latest.json", default={})
+    benchmark = read_json(MEMORY_DIR / "learning_exam_benchmark_latest.json", default={})
     sources = read_json(STATE_DIR / "data_sources_latest.json", default={})
 
     episodes_count = count_jsonl(MEMORY_DIR / "episodes.jsonl")
@@ -78,6 +80,9 @@ def build_self_model() -> dict[str, Any]:
         gaps.append("no_promoted_memories_yet")
     if not sources.get("sources"):
         gaps.append("source_registry_not_initialized")
+    for gap in test_memory.get("known_gaps") if isinstance(test_memory.get("known_gaps"), list) else []:
+        if gap and gap not in gaps:
+            gaps.append(str(gap))
 
     review_queue = skill_review_queue(skills)
     curriculum: list[dict[str, Any]] = []
@@ -89,6 +94,9 @@ def build_self_model() -> dict[str, Any]:
         curriculum.append({"priority": "medium", "task": "wait for repeated evidence before promoting durable memory"})
     if review_queue:
         curriculum.append({"priority": "medium", "task": "review stale or weak setup skills", "items": review_queue[:5]})
+    for item in test_memory.get("curriculum") if isinstance(test_memory.get("curriculum"), list) else []:
+        if isinstance(item, dict):
+            curriculum.append({**item, "source": item.get("source") or "test_result_memory"})
 
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -109,6 +117,8 @@ def build_self_model() -> dict[str, Any]:
             "last_paper_action": (paper_loop.get("decision") or {}).get("action") or paper_loop.get("action"),
             "dream_high_risk_count": (dream.get("bias_patch") or {}).get("high_risk_count"),
             "self_improvement_readiness": self_improvement.get("readiness"),
+            "learning_benchmark_score": benchmark.get("score"),
+            "test_memory_lessons": test_memory.get("lesson_count"),
         },
         "experience_counters": {
             "episodes": episodes_count,
@@ -116,6 +126,8 @@ def build_self_model() -> dict[str, Any]:
             "counterfactual_replays": int(counterfactual.get("replay_count") or replay_count),
             "promoted_memories": promoted_count,
             "skill_review_items": len(review_queue),
+            "test_result_lessons": int(test_memory.get("lesson_count") or 0),
+            "learning_benchmark_scenarios": int(benchmark.get("scenario_count") or 0),
         },
         "known_gaps": gaps,
         "skill_review_queue": review_queue,
