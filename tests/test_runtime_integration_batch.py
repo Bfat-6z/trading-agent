@@ -54,6 +54,25 @@ def test_paper_brain_blocks_candidate_below_skill_patch_min_score():
     rankings = [{"setup_id": "s1", "paper_only_min_score_adjustment": 1.0}]
 
     assert brain.paper_only_patch_errors(candidate, rankings) == ["skill_patch_min_score_block"]
+
+def test_paper_brain_does_not_add_invalid_margin_when_allocation_blocks(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(brain, "BRAIN_LATEST", tmp_path / "brain.json")
+    monkeypatch.setattr(brain, "BRAIN_HISTORY", tmp_path / "brain.jsonl")
+    monkeypatch.setattr(brain, "PAPER_RISK_STATE", tmp_path / "risk.json")
+    monkeypatch.setattr(brain, "run_preflight", lambda *args, **kwargs: {"allowed": True, "errors": []})
+    monkeypatch.setattr(brain, "evaluate_candidate", lambda candidate: {"blocked": False})
+    monkeypatch.setattr(brain, "rank_setups", lambda rows: {"rankings": [{"setup_id": "s1", "evidence_expectancy": -0.1, "expectancy": -0.1, "allocation_hint": "reduced", "risk_multiplier": 0.35}]})
+
+    result = brain.decide_paper_action(
+        [{"symbol": "BTCUSDT", "side": "LONG", "setup_id": "s1", "entry": 100, "sl": 99, "tp": 102, "score": 9}],
+        [{"setup_id": "s1"}],
+        {"equity": "100", "cash": "100"},
+    )
+
+    assert result["action"] == "skip"
+    assert "non_positive_expectancy" in result["errors"]
+    assert "invalid_margin" not in result["errors"]
+    assert result["risk_decision"]["reason"] == "allocation_blocked"
     assert loop.HEARTBEAT_PATH.exists()
 
 def test_inner_critic_uses_dont_do_shadow_only(monkeypatch, tmp_path: Path):

@@ -22,6 +22,7 @@ from live_permission_firewall import evaluate_live_permission
 from paper_portfolio_manager import load_account
 from runtime_config import load_runtime_config
 from setup_skill_library import load_library
+from setup_ranker import build_setup_evidence_rows
 from timebase import utc_now
 
 ROOT = Path(__file__).resolve().parent
@@ -48,14 +49,7 @@ def write_latest(row: dict[str, Any]) -> dict[str, Any]:
 
 def setup_stats_from_library() -> list[dict[str, Any]]:
     library = load_library()
-    skills = library.get("skills") if isinstance(library.get("skills"), dict) else {}
-    rows: list[dict[str, Any]] = []
-    for setup_id, skill in skills.items():
-        if not isinstance(skill, dict):
-            continue
-        stats = skill.get("stats") if isinstance(skill.get("stats"), dict) else {}
-        rows.append({"setup_id": setup_id, **stats, "metadata": skill.get("metadata") if isinstance(skill.get("metadata"), dict) else {}})
-    return rows
+    return build_setup_evidence_rows(library)
 
 def normalize_candidates(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
@@ -113,7 +107,10 @@ def run_once(worker_id: str = "autonomous_paper_trading_loop") -> dict[str, Any]
     if not batch:
         batch = {**load_file_candidate_batch(), "source": "file"}
     candidates = normalize_candidates(batch)
-    setup_stats = batch.get("setup_stats") if isinstance(batch.get("setup_stats"), list) else setup_stats_from_library()
+    setup_stats = setup_stats_from_library()
+    if isinstance(batch.get("setup_stats"), list):
+        stale_lookup = {str(row.get("setup_id")): row for row in batch["setup_stats"] if isinstance(row, dict)}
+        setup_stats = [{**stale_lookup.get(str(row.get("setup_id")), {}), **row} for row in setup_stats]
     config = load_runtime_config()
     exploration_allowed = bool(config.get("feature_flags", {}).get("paper_exploration")) or any(bool(row.get("exploration_allowed")) for row in candidates)
     decision = decide_paper_action(candidates, setup_stats, account, exploration_allowed=exploration_allowed)

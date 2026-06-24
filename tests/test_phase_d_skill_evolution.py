@@ -41,6 +41,29 @@ def test_setup_ranker_penalizes_high_winrate_bad_expectancy(tmp_path: Path):
     assert result["top_setup_id"] == "lower_wr_good_exp"
 
 
+def test_setup_ranker_fuses_review_and_counterfactual_evidence(tmp_path: Path):
+    library = {"skills": {"weak": {"setup_id": "weak", "stats": {"trades": 50, "win_rate": 0.6, "expectancy": 0.02}, "metadata": {}}}}
+    reviews = [
+        {"review_id": f"r{i}", "classification": "bad_loss", "source_trade": {"trade_id": f"t{i}", "setup_id": "weak", "net": "-0.2"}}
+        for i in range(30)
+    ]
+    replays = [
+        {"signal_id": f"t{i}", "status": "complete", "conclusion": "parameter_improvement_candidate"}
+        for i in range(12)
+    ]
+    rows = setup_ranker.build_setup_evidence_rows(library, reviews=reviews, replays=replays, shadow_rows=[])
+
+    result = setup_ranker.rank_setups(rows, output_path=tmp_path / "rankings.json")
+    ranked = result["rankings"][0]
+
+    assert ranked["setup_id"] == "weak"
+    assert ranked["review_sample"] == 30
+    assert ranked["bad_loss_rate"] == 1.0
+    assert ranked["parameter_instability_rate"] == 1.0
+    assert ranked["allocation_hint"] == "reduced"
+    assert "bad_loss_cluster" in ranked["rank_reasons"]
+
+
 def test_allocation_blocks_undersampled_without_exploration(tmp_path: Path):
     rankings = [{"setup_id": "new_setup", "under_sampled": True, "expectancy": 0.02, "rank_score": 0.9}]
 
@@ -59,6 +82,17 @@ def test_allocation_allows_tiny_exploration_for_undersampled(tmp_path: Path):
     assert result["tier"] == "exploration_paper"
     assert result["max_loss_usdt"] == 1.5
     assert result["can_trade_live"] is False
+
+
+def test_allocation_uses_reduced_hint_multiplier(tmp_path: Path):
+    rankings = [{"setup_id": "weak", "under_sampled": False, "evidence_expectancy": 0.02, "expectancy": 0.02, "rank_score": 0.4, "allocation_hint": "reduced", "risk_multiplier": 0.35, "rank_reasons": ["bad_loss_cluster"]}]
+
+    result = cap.allocate_capital("weak", rankings, {"equity": "100"}, output_path=tmp_path / "alloc.json")
+
+    assert result["allowed"] is True
+    assert result["tier"] == "reduced_paper"
+    assert result["max_loss_usdt"] == 0.35
+    assert result["rank_reasons"] == ["bad_loss_cluster"]
 
 
 def test_skill_forge_rejects_patch_missing_invalidation(tmp_path: Path):

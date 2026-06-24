@@ -94,7 +94,10 @@ def decide_paper_action(candidates: list[dict[str, Any]], setup_stats: list[dict
     rankings = rank_setups(setup_stats)["rankings"]
     allocation = allocate_capital(str(candidate.get("setup_id")), rankings, account, exploration_allowed=exploration_allowed)
     requested_margin = futures_margin_from_risk_budget(candidate, allocation, account)
-    risk = evaluate_paper_order(candidate.get("symbol"), candidate.get("side"), candidate.get("entry"), candidate.get("sl"), candidate.get("tp"), requested_margin=requested_margin, requested_leverage=candidate.get("leverage", 1), setup_id=str(candidate.get("setup_id")), account=account)
+    if allocation.get("allowed"):
+        risk = evaluate_paper_order(candidate.get("symbol"), candidate.get("side"), candidate.get("entry"), candidate.get("sl"), candidate.get("tp"), requested_margin=requested_margin, requested_leverage=candidate.get("leverage", 1), setup_id=str(candidate.get("setup_id")), account=account)
+    else:
+        risk = {"schema_version": SCHEMA_VERSION, "evaluated_at": utc_now(), "can_open_paper": False, "reason": "allocation_blocked", "errors": [], "setup_id": str(candidate.get("setup_id")), "symbol": candidate.get("symbol"), "side": candidate.get("side")}
     risk["paper_sizing"] = {
         "method": "risk_budget_to_isolated_margin",
         "risk_budget_usdt": allocation.get("max_loss_usdt"),

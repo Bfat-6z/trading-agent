@@ -887,6 +887,63 @@ venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\te
 
 Result: `122 passed`.
 
+### 2026-06-24 Phase 6 Evidence-Weighted Allocation Active
+
+Implemented the first evidence-weighted setup ranking and paper allocation pass:
+
+- `setup_ranker.py` now builds setup evidence rows from:
+  - setup skill library stats and metadata
+  - post-trade review clusters
+  - counterfactual replay results mapped by trade/signal id
+  - setup-level shadow closes when setup ids exist
+- Ranking now includes:
+  - `evidence_expectancy`
+  - `review_sample`
+  - `bad_loss_rate`
+  - `parameter_instability_rate`
+  - `shadow_setup_expectancy`
+  - `allocation_hint`
+  - `risk_multiplier`
+  - `rank_reasons`
+- `autonomous_paper_trading_loop` now always merges current evidence rows from the setup library/ranker with any stale batch stats, so queued candidates cannot bypass fresh skill patch metadata.
+- `capital_allocation_policy` now reads `allocation_hint` and `risk_multiplier`.
+  - retired setup remains blocked
+  - non-positive evidence expectancy remains blocked
+  - reduced tier can downsize risk when positive but weak
+  - exploration still only bypasses under-sampled status, not hard risk blockers
+- `autonomous_paper_trading_brain` no longer creates a noisy `invalid_margin` risk error when allocation already blocked a candidate.
+
+Runtime smoke after restart:
+
+- Restarted `autonomous_paper_trading_loop` to load the new evidence ranker path.
+- Latest paper decision:
+  - candidate: `exhaustion_fade` `LABUSDT` SHORT, score `8.08`
+  - action: `skip`
+  - allocation tier: `shadow_only`
+  - allocation errors: `non_positive_expectancy`
+  - rank reasons:
+    - `non_positive_evidence_expectancy`
+    - `bad_loss_cluster`
+    - `counterfactual_parameter_instability`
+  - decision errors:
+    - `non_positive_expectancy`
+    - `skill_patch_min_score_block`
+  - `can_place_live_orders=false`
+- Dashboard API returned `200`.
+- Supervisor status:
+  - duplicate count `0`
+  - `autonomous_paper_trading_loop` running
+  - `shadow_trade_evaluator_loop` running
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile setup_ranker.py capital_allocation_policy.py autonomous_paper_trading_loop.py autonomous_paper_trading_brain.py tests\test_phase_d_skill_evolution.py tests\test_candidate_feeder_and_promotion_loop.py tests\test_runtime_integration_batch.py
+venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py tests\test_candidate_feeder_and_promotion_loop.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_process_supervisor.py tests\test_agent_status_dashboard.py -q
+```
+
+Result: `131 passed`.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

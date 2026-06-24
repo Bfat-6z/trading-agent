@@ -308,6 +308,7 @@ def test_counterfactual_run_once_appends_unresolved_for_paper_close_without_cand
     monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
     monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
     monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    monkeypatch.setattr(cf, "PAPER_BRAIN_HISTORY_JSONL", tmp_path / "paper_brain_history.jsonl")
 
     row = {
         "event": "paper_close",

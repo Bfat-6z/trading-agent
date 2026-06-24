@@ -34,19 +34,29 @@ def allocate_capital(setup_id: str, rankings: list[dict[str, Any]], account: dic
         under_sampled = bool(row.get("under_sampled"))
         if under_sampled and not exploration_allowed:
             errors.append("setup_under_sampled")
-        if safe_float(row.get("expectancy")) <= 0:
+        evidence_expectancy = safe_float(row.get("evidence_expectancy"), safe_float(row.get("expectancy")))
+        if evidence_expectancy <= 0:
             errors.append("non_positive_expectancy")
         if not errors and under_sampled and exploration_allowed:
             tier = "exploration_paper"
             risk_fraction = 0.015
         elif not errors:
             rank_score = safe_float(row.get("rank_score"))
-            tier = "normal_paper" if rank_score >= 0.6 else "tiny_paper"
-            risk_fraction = 0.02 if tier == "normal_paper" else 0.0075
-    if errors == ["setup_under_sampled"] and exploration_allowed and row and safe_float(row.get("expectancy")) >= 0:
+            hint = str(row.get("allocation_hint") or "")
+            multiplier = max(0.0, min(1.0, safe_float(row.get("risk_multiplier"), 1.0)))
+            if hint == "skip":
+                errors.append("allocation_hint_skip")
+            elif hint == "reduced":
+                tier = "reduced_paper"
+                risk_fraction = 0.01 * multiplier
+            else:
+                tier = "normal_paper" if rank_score >= 1.0 and hint == "normal" else "tiny_paper"
+                base = 0.02 if tier == "normal_paper" else 0.0075
+                risk_fraction = base * (multiplier or 1.0)
+    if errors == ["setup_under_sampled"] and exploration_allowed and row and safe_float(row.get("evidence_expectancy"), safe_float(row.get("expectancy"))) >= 0:
         tier = "exploration_paper"
         risk_fraction = 0.015
         errors = []
-    payload = {"schema_version": SCHEMA_VERSION, "allocated_at": utc_now(), "setup_id": setup_id, "allowed": not errors, "tier": tier, "risk_fraction": risk_fraction, "max_loss_usdt": round(equity * risk_fraction, 6), "errors": errors, "can_trade_live": False}
+    payload = {"schema_version": SCHEMA_VERSION, "allocated_at": utc_now(), "setup_id": setup_id, "allowed": not errors, "tier": tier, "risk_fraction": round(risk_fraction, 6), "max_loss_usdt": round(equity * risk_fraction, 6), "errors": errors, "rank_reasons": (row or {}).get("rank_reasons", []), "allocation_hint": (row or {}).get("allocation_hint"), "can_trade_live": False}
     write_json_atomic(output_path, payload)
     return payload

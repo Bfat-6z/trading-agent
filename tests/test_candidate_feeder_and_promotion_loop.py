@@ -66,6 +66,47 @@ def test_paper_loop_allows_candidate_marked_exploration(monkeypatch, tmp_path: P
     assert result["exploration_allowed"] is True
     assert result["decision"]["exploration_allowed"] is True
 
+def test_paper_loop_merges_batch_stats_without_losing_evidence(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(paper_loop, "MEMORY_DIR", memory)
+    monkeypatch.setattr(paper_loop, "LATEST_PATH", memory / "loop.json")
+    monkeypatch.setattr(paper_loop, "HISTORY_PATH", memory / "loop.jsonl")
+    monkeypatch.setattr(paper_loop, "HEARTBEAT_PATH", tmp_path / "loop_heartbeat.json")
+    monkeypatch.setattr(paper_loop, "kill_switch_active", lambda: False)
+    monkeypatch.setattr(paper_loop, "evaluate_live_permission", lambda request: {"allowed": True})
+    monkeypatch.setattr(paper_loop, "evaluate_circuit_breakers", lambda metrics: {"allowed": True})
+    monkeypatch.setattr(paper_loop, "load_account", lambda: {"equity": "100", "cash": "100"})
+    monkeypatch.setattr(paper_loop, "load_runtime_config", lambda: {"feature_flags": {"paper_exploration": True}})
+    monkeypatch.setattr(
+        paper_loop,
+        "load_queue_candidate_batch",
+        lambda worker_id: (
+            {
+                "candidates": [{"symbol": "ABCUSDT", "side": "SHORT", "setup_id": "exhaustion_fade", "entry": 10, "sl": 11, "tp": 9, "score": 8}],
+                "setup_stats": [{"setup_id": "exhaustion_fade", "expectancy": 0.1}],
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        paper_loop,
+        "setup_stats_from_library",
+        lambda: [{"setup_id": "exhaustion_fade", "evidence_expectancy": -0.2, "metadata": {"paper_only_min_score_adjustment": 1.0}}],
+    )
+    captured = {}
+    def fake_decide(candidates, setup_stats, account, exploration_allowed=False):
+        captured["setup_stats"] = setup_stats
+        return {"action": "skip", "can_place_live_orders": False}
+    monkeypatch.setattr(paper_loop, "decide_paper_action", fake_decide)
+
+    paper_loop.run_once()
+
+    row = captured["setup_stats"][0]
+    assert row["expectancy"] == 0.1
+    assert row["evidence_expectancy"] == -0.2
+    assert row["metadata"]["paper_only_min_score_adjustment"] == 1.0
+
 def test_promotion_evaluator_loop_writes_latest(monkeypatch, tmp_path: Path):
     memory = tmp_path / "agent_memory"
     memory.mkdir()
