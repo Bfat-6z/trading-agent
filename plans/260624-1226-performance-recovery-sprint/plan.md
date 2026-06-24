@@ -822,6 +822,40 @@ Results:
 - Focused shadow/supervisor/dashboard: `59 passed`.
 - Expanded regression: `91 passed`.
 
+### 2026-06-24 Phase 4 Skill Forge Gate Upgrade
+
+Upgraded the skill patch forge so patches cannot change paper behavior without deterministic evidence gates:
+
+- `skill_forge_agent.py` now enforces allowed patch types, invalidation, rollback criteria, non-negative expectancy, and evidence ids.
+- Patch reviews now expose lifecycle:
+  - `proposed`
+  - `schema_valid`
+  - `evidence_checked`
+  - `paper_only_applied`
+- Pending patch status remains `paper_shadow_only` for compatibility, but lifecycle carries the stricter state machine.
+- Applying patches re-validates pending rows, so old malformed pending patches cannot slip through after a schema upgrade.
+- Applied patches write `skill_patches_applied.jsonl` and update setup-skill metadata only; they do not edit code and do not enable live execution.
+- Setup ranking and allocation now honor paper-only metadata:
+  - `paper_only_retired` strongly penalizes ranking.
+  - allocation blocks `setup_paper_only_retired` even when exploration is enabled.
+  - leverage cap and min-score adjustment metadata are exposed to downstream allocation logic.
+- Fixed test isolation so skill forge tests no longer write fake pending/applied patches into runtime state.
+- Cleaned generated test artifact `p1` from `state/agent_memory` and refreshed `skill_forge_latest.json`.
+
+Verification:
+
+```powershell
+venv\Scripts\python.exe -m py_compile skill_forge_agent.py setup_ranker.py capital_allocation_policy.py autonomous_paper_trading_loop.py tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py
+venv\Scripts\python.exe -m pytest tests\test_phase_d_skill_evolution.py tests\test_runtime_integration_batch.py tests\test_agent_status_dashboard.py tests\test_phase_b_objective_learning.py tests\test_paper_execution_lifecycle_loop.py tests\test_shadow_trade_evaluator.py tests\test_shadow_trade_evaluator_loop.py tests\test_agent_process_supervisor.py -q
+```
+
+Result: `119 passed`.
+
+Runtime note:
+
+- Current real skill forge state has `pending_count=0`, `review_count=0`, `applied_count=0`.
+- This is correct; no fake patch was promoted. Next Phase 4 step is to generate candidate patches from real post-trade/counterfactual/shadow evidence.
+
 ## Quality Gates After Each Phase
 
 Every phase must pass:

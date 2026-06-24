@@ -29,6 +29,8 @@ def allocate_capital(setup_id: str, rankings: list[dict[str, Any]], account: dic
     if not row:
         errors.append("setup_not_ranked")
     else:
+        if row.get("paper_only_retired"):
+            errors.append("setup_paper_only_retired")
         under_sampled = bool(row.get("under_sampled"))
         if under_sampled and not exploration_allowed:
             errors.append("setup_under_sampled")
@@ -41,7 +43,7 @@ def allocate_capital(setup_id: str, rankings: list[dict[str, Any]], account: dic
             rank_score = safe_float(row.get("rank_score"))
             tier = "normal_paper" if rank_score >= 0.6 else "tiny_paper"
             risk_fraction = 0.02 if tier == "normal_paper" else 0.0075
-    if errors and exploration_allowed and row and safe_float(row.get("expectancy")) >= 0:
+    if errors == ["setup_under_sampled"] and exploration_allowed and row and safe_float(row.get("expectancy")) >= 0:
         tier = "exploration_paper"
         risk_fraction = 0.015
         errors = []

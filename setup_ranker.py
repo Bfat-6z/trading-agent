@@ -25,13 +25,25 @@ def rank_setup(row: dict[str, Any]) -> dict[str, Any]:
     profit_factor = safe_float(row.get("profit_factor"))
     win_rate = safe_float(row.get("win_rate"))
     max_drawdown = safe_float(row.get("max_drawdown"))
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     confidence = min(1.0, trades / 50)
     score = expectancy * 10 + min(profit_factor, 3.0) * 0.2 + win_rate * 0.2 + confidence * 0.25 - max_drawdown * 0.5
     if trades < 20:
         score -= 0.5
     if expectancy <= 0:
         score -= 1.0
-    return {**row, "rank_score": round(score, 6), "sample_confidence": round(confidence, 4), "under_sampled": trades < 20}
+    paper_only_retired = bool(metadata.get("paper_only_retired"))
+    if paper_only_retired:
+        score -= 100.0
+    return {
+        **row,
+        "rank_score": round(score, 6),
+        "sample_confidence": round(confidence, 4),
+        "under_sampled": trades < 20,
+        "paper_only_retired": paper_only_retired,
+        "paper_only_leverage_cap": metadata.get("paper_only_leverage_cap"),
+        "paper_only_min_score_adjustment": metadata.get("paper_only_min_score_adjustment"),
+    }
 
 
 def rank_setups(rows: list[dict[str, Any]], output_path: Path = RANKINGS_LATEST) -> dict[str, Any]:

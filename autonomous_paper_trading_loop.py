@@ -54,7 +54,7 @@ def setup_stats_from_library() -> list[dict[str, Any]]:
         if not isinstance(skill, dict):
             continue
         stats = skill.get("stats") if isinstance(skill.get("stats"), dict) else {}
-        rows.append({"setup_id": setup_id, **stats})
+        rows.append({"setup_id": setup_id, **stats, "metadata": skill.get("metadata") if isinstance(skill.get("metadata"), dict) else {}})
     return rows
 
 def normalize_candidates(payload: dict[str, Any] | None) -> list[dict[str, Any]]:

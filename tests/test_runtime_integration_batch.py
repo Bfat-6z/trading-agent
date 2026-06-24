@@ -73,17 +73,34 @@ def test_llm_reasoning_quality_gate_forces_no_live():
 def test_skill_forge_applies_paper_shadow_patch_metadata(monkeypatch, tmp_path: Path):
     pending = tmp_path / "pending.jsonl"
     output = tmp_path / "integration.json"
+    applied = tmp_path / "applied.jsonl"
+    latest = tmp_path / "latest.json"
     library = {"skills": {"s1": {"setup_id": "s1", "metadata": {}}}, "history": []}
     saved = {}
     monkeypatch.setattr(sfa, "load_library", lambda: library)
     monkeypatch.setattr(sfa, "save_library", lambda payload: saved.setdefault("library", payload) or payload)
-    sfa.append_jsonl_once(pending, {"patch_id": "p1", "setup_id": "s1", "patch_type": "tighten", "invalidation": "bad spread", "status": "paper_shadow_only", "evidence": {"sample_size": 30}}, "patch_id")
+    sfa.append_jsonl_once(
+        pending,
+        {
+            "patch_id": "p1",
+            "setup_id": "s1",
+            "patch_type": "regime_filter",
+            "invalidation": "bad spread",
+            "rollback_criteria": "future paper expectancy <= 0",
+            "status": "paper_shadow_only",
+            "lifecycle": ["proposed", "schema_valid", "evidence_checked"],
+            "evidence_ids": ["review_1"],
+            "evidence": {"sample_size": 30, "evidence_ids": ["review_1"]},
+        },
+        "patch_id",
+    )
 
-    result = sfa.apply_paper_shadow_patches(pending_path=pending, output_path=output)
+    result = sfa.apply_paper_shadow_patches(pending_path=pending, output_path=output, applied_path=applied, latest_path=latest)
 
     assert result["applied_count"] == 1
     patch = saved["library"]["skills"]["s1"]["metadata"]["paper_shadow_patches"][0]
     assert patch["live_enabled"] is False
+    assert patch["status"] == "paper_only_applied"
 
 def test_paper_portfolio_open_and_close_lifecycle(monkeypatch, tmp_path: Path):
     account_path = tmp_path / "paper_account.json"
