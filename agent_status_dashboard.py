@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
+import re
+import sqlite3
 import socketserver
 import subprocess
 import time
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,12 +28,29 @@ from urllib.parse import parse_qs, urlparse
 
 from decision_explainer import explain_decision
 from agent_work_queue import queue_summary
+from data_trust import prepare_llm_egress, sanitize_external_text
 from learning_dashboard_data import load_phase_b_learning
 from market_learner import valid_paper_close, valid_paper_open
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 MEMORY_DIR = STATE_DIR / "agent_memory"
+FEATURE_STORE_DIR = STATE_DIR / "feature_store"
+EVENT_STORE_DB = STATE_DIR / "agent_state.db"
+DASHBOARD_BUILD_ID = "neurocore-dashboard-v1"
+DASHBOARD_PAYLOAD_BUDGET_BYTES = 450_000
+LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+PAPER_ONLY_DISCLAIMER_VI = (
+    "Dashboard nghiên cứu mô phỏng (paper-only). Không phải lời khuyên tài chính, không phải broker/adviser, "
+    "không bảo đảm lợi nhuận. Futures có rủi ro liquidation."
+)
+DASHBOARD_RUNTIME = {
+    "host": "127.0.0.1",
+    "port": 8090,
+    "build_id": DASHBOARD_BUILD_ID,
+    "token_required": False,
+}
+PORT_REGISTRY_PATH = STATE_DIR / "dashboard_port_registry_latest.json"
 
 HEARTBEAT_FILES = {
     "agent_process_supervisor": STATE_DIR / "agent_process_supervisor_heartbeat.json",
@@ -45,6 +66,7 @@ HEARTBEAT_FILES = {
     "autonomous_paper_trading_loop": STATE_DIR / "autonomous_paper_trading_loop_heartbeat.json",
     "paper_execution_lifecycle_loop": STATE_DIR / "paper_execution_lifecycle_loop_heartbeat.json",
     "microstructure_observer_loop": STATE_DIR / "microstructure_observer_loop_heartbeat.json",
+    "whale_flow_observer": STATE_DIR / "whale_flow_observer_heartbeat.json",
     "counterfactual_replay_agent": STATE_DIR / "counterfactual_replay_agent_heartbeat.json",
     "learning_exam_benchmark": STATE_DIR / "learning_exam_benchmark_heartbeat.json",
     "test_result_memory_agent": STATE_DIR / "test_result_memory_agent_heartbeat.json",
@@ -65,6 +87,7 @@ HEARTBEAT_FRESH_LIMITS = {
     "autonomous_paper_trading_loop": 180,
     "paper_execution_lifecycle_loop": 120,
     "microstructure_observer_loop": 180,
+    "whale_flow_observer": 600,
     "counterfactual_replay_agent": 900,
     "learning_exam_benchmark": 4500,
     "test_result_memory_agent": 2700,
@@ -85,12 +108,16 @@ LOG_FILES = {
     "paper_lifecycle": MEMORY_DIR / "paper_trades.jsonl",
 }
 
+def stable_hash(value: object, prefix: str = "hash") -> str:
+    raw = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":"))
+    return f"{prefix}_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
 LIVE_MONITORS = {
     "unified_monitor": {
         "script": "unified_monitor.py",
         "role": "external_live_sl_tp_monitor",
         "agent_controls": False,
-        "can_submit_reduce_only_orders": True,
+        "can_submit_reduce_only_orders": False,
     }
 }
 
@@ -141,6 +168,92 @@ def human_age(seconds: float | None) -> str:
         return f"{seconds / 60:.1f}m"
     return f"{seconds / 3600:.1f}h"
 
+def payload_size_bytes(payload: object) -> int:
+    try:
+        return len(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True, default=str).encode("utf-8"))
+    except Exception:
+        return 0
+
+def strip_host_port(value: str | None) -> str:
+    host = str(value or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("[") and "]" in host:
+        return host[: host.index("]") + 1]
+    if host.count(":") == 1 and host.rsplit(":", 1)[1].isdigit():
+        return host.rsplit(":", 1)[0]
+    return host
+
+def is_local_dashboard_host(host: str | None) -> bool:
+    normalized = strip_host_port(host)
+    return normalized in LOCAL_DASHBOARD_HOSTS
+
+def dashboard_token_strong_enough(token: str | None) -> bool:
+    text = str(token or "").strip()
+    if len(text) < 24:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("test", "token", "secret", "password", "changeme", "example")):
+        return False
+    if re.fullmatch(r"[A-Fa-f0-9]{64,}", text):
+        return True
+    classes = sum(
+        [
+            any(ch.islower() for ch in text),
+            any(ch.isupper() for ch in text),
+            any(ch.isdigit() for ch in text),
+            any(not ch.isalnum() for ch in text),
+        ]
+    )
+    return len(set(text)) >= 10 and classes >= 3
+
+def validate_dashboard_bind(host: str, token: str | None = None) -> dict:
+    local = is_local_dashboard_host(host)
+    token_text = str(token or "").strip()
+    has_token = bool(token_text)
+    errors = []
+    if not local and not has_token:
+        errors.append("non_local_bind_requires_dashboard_token")
+    if not local and has_token and not dashboard_token_strong_enough(token_text):
+        errors.append("dashboard_token_too_weak")
+    return {
+        "ok": not errors,
+        "bind_host": host,
+        "local_bind": local,
+        "token_required": not local,
+        "token_configured": has_token,
+        "host_allowlist": sorted(LOCAL_DASHBOARD_HOSTS),
+        "cors": "deny_by_default",
+        "cache_control": "no-store",
+        "errors": errors,
+        "build_id": DASHBOARD_BUILD_ID,
+        "disclaimer": PAPER_ONLY_DISCLAIMER_VI,
+    }
+
+def freshness(path: Path, ttl_seconds: int, *, as_of: str | None = None) -> dict:
+    payload = read_json(path)
+    ts = as_of or payload.get("updated_at") or payload.get("ts") or payload.get("checked_at") or payload.get("evaluated_at")
+    age = age_seconds(ts) if ts else file_mtime_age(path)
+    exists = path.exists()
+    if not exists:
+        state = "missing"
+    elif age is None:
+        state = "unknown"
+    elif age <= ttl_seconds:
+        state = "fresh"
+    else:
+        state = "stale"
+    return {
+        "path": str(path),
+        "exists": exists,
+        "as_of": ts,
+        "age_seconds": round(age, 3) if age is not None else None,
+        "age": human_age(age),
+        "ttl_seconds": int(ttl_seconds),
+        "state": state,
+        "source_watermark": ts or (datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds") if exists else None),
+    }
+
 
 def read_json(path: Path) -> dict:
     if not path.exists():
@@ -150,6 +263,110 @@ def read_json(path: Path) -> dict:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+def dashboard_server_identity(host: str, port: int, *, token_required: bool) -> dict:
+    return {
+        "schema_version": 1,
+        "updated_at": utc_now(),
+        "owner": "agent_status_dashboard",
+        "host": host,
+        "port": int(port),
+        "pid": os.getpid(),
+        "build_id": DASHBOARD_BUILD_ID,
+        "server_identity": f"agent_status_dashboard:{DASHBOARD_BUILD_ID}:{host}:{int(port)}",
+        "token_scope": "required" if token_required else "local_only",
+        "cache_control": "no-store",
+    }
+
+def ensure_dashboard_probe_secret() -> str:
+    secret = str(DASHBOARD_RUNTIME.get("probe_secret") or "")
+    if not secret:
+        secret = hashlib.sha256(os.urandom(32)).hexdigest()
+        DASHBOARD_RUNTIME["probe_secret"] = secret
+    return secret
+
+def dashboard_identity_signature(identity: dict, secret: str | None = None) -> str:
+    material = "|".join(str(identity.get(key) or "") for key in ("owner", "server_identity", "build_id", "host", "port", "pid", "token_scope"))
+    key = str(secret or ensure_dashboard_probe_secret()).encode("utf-8")
+    digest = hmac.new(key, material.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"hmac-sha256:{digest}"
+
+def write_dashboard_port_registry(host: str, port: int, *, token_required: bool, path: Path = PORT_REGISTRY_PATH) -> dict:
+    payload = dashboard_server_identity(host, port, token_required=token_required)
+    payload["probe_secret_hash"] = hashlib.sha256(ensure_dashboard_probe_secret().encode("utf-8")).hexdigest()
+    write_json_atomic(path, payload)
+    return payload
+
+def verify_dashboard_probe_identity(registry: dict, headers: dict, payload: dict | None = None, probe_secret: str | None = None) -> dict:
+    payload = payload or {}
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else payload
+    expected_build = registry.get("build_id")
+    observed_build = headers.get("X-Dashboard-Build-Id") or headers.get("x-dashboard-build-id")
+    observed_identity_header = headers.get("X-Dashboard-Server-Identity") or headers.get("x-dashboard-server-identity")
+    observed_signature = headers.get("X-Dashboard-Identity-Signature") or headers.get("x-dashboard-identity-signature") or payload.get("identity_signature")
+    errors = []
+    if registry.get("owner") != "agent_status_dashboard":
+        errors.append("wrong_registry_owner")
+    if not expected_build or observed_build != expected_build:
+        errors.append("wrong_build_id")
+    for key in ("owner", "host", "port", "pid", "server_identity", "token_scope"):
+        if registry.get(key) != identity.get(key):
+            errors.append(f"wrong_{key}")
+    if not registry.get("server_identity") or not identity.get("server_identity"):
+        errors.append("missing_server_identity")
+    if not observed_identity_header:
+        errors.append("missing_server_identity_header")
+    elif observed_identity_header != registry.get("server_identity"):
+        errors.append("wrong_server_identity_header")
+    secret = str(probe_secret or DASHBOARD_RUNTIME.get("probe_secret") or "")
+    if not secret:
+        errors.append("missing_probe_secret")
+    else:
+        expected_secret_hash = registry.get("probe_secret_hash")
+        if expected_secret_hash and hashlib.sha256(secret.encode("utf-8")).hexdigest() != expected_secret_hash:
+            errors.append("wrong_probe_secret")
+        expected_signature = dashboard_identity_signature(identity, secret)
+        if not observed_signature:
+            errors.append("missing_identity_signature")
+        elif not hmac.compare_digest(str(observed_signature), expected_signature):
+            errors.append("wrong_identity_signature")
+    return {"ok": not errors, "errors": sorted(set(errors)), "expected_build_id": expected_build, "observed_build_id": observed_build}
+
+def build_healthz_payload(status_builder=None) -> dict:
+    builder = status_builder or load_dashboard_status
+    identity = dashboard_server_identity(str(DASHBOARD_RUNTIME.get("host") or "127.0.0.1"), int(DASHBOARD_RUNTIME.get("port") or 8090), token_required=bool(DASHBOARD_RUNTIME.get("token_required")))
+    signature = dashboard_identity_signature(identity)
+    try:
+        payload = builder()
+        status = "ok" if isinstance(payload, dict) else "critical"
+        return {
+            "ok": status == "ok",
+            "status": status,
+            "build_id": DASHBOARD_BUILD_ID,
+            "identity": identity,
+            "identity_signature": signature,
+            "checked_at": utc_now(),
+            "payload_bytes": payload_size_bytes(payload),
+            "paper_only": True,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "critical",
+            "build_id": DASHBOARD_BUILD_ID,
+            "identity": identity,
+            "identity_signature": signature,
+            "checked_at": utc_now(),
+            "error": "status_builder_failed",
+            "error_type": type(exc).__name__,
+            "paper_only": True,
+        }
 
 
 def read_jsonl_tail(path: Path, max_lines: int = 300) -> list[dict]:
@@ -166,11 +383,67 @@ def read_jsonl_tail(path: Path, max_lines: int = 300) -> list[dict]:
     return rows
 
 
+def paper_row_ts(row: dict) -> datetime | None:
+    for key in ("close_ts", "open_ts", "ts"):
+        parsed = parse_ts(row.get(key))
+        if parsed:
+            return parsed
+    position = row.get("position") if isinstance(row.get("position"), dict) else {}
+    for key in ("closed_at", "opened_at"):
+        parsed = parse_ts(position.get(key))
+        if parsed:
+            return parsed
+    return None
+
+def filter_paper_rows_since_account_reset(rows: list[dict], account: dict) -> list[dict]:
+    reset_ts = parse_ts(account.get("created_at"))
+    if not reset_ts:
+        return rows
+    return [
+        row
+        for row in rows
+        if (paper_row_ts(row) or datetime.min.replace(tzinfo=timezone.utc)) >= reset_ts
+    ]
+
+def read_jsonl_since(path: Path, since: datetime | None) -> list[dict]:
+    if not path.exists():
+        return []
+    if since is None:
+        return read_jsonl_tail(path, 500)
+    rows_reversed: list[dict] = []
+    for line in reversed(path.read_text(encoding="utf-8", errors="ignore").splitlines()):
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        ts = paper_row_ts(payload)
+        if ts and ts < since:
+            break
+        if not ts or ts >= since:
+            rows_reversed.append(payload)
+    return list(reversed(rows_reversed))
+
 def tail_text(path: Path, lines: int = 120) -> str:
     if not path.exists():
         return "(file not found)"
+    line_count = min(300, max(1, int(lines)))
     data = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(data[-max(1, lines):])
+    safe_lines = []
+    for line in data[-line_count:]:
+        try:
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                safe = prepare_llm_egress(payload, "dashboard_log")["payload"]
+                safe_lines.append(json.dumps(safe, ensure_ascii=True, sort_keys=True))
+                continue
+        except Exception:
+            pass
+        fallback = sanitize_external_text(line, max_chars=2000)["text"]
+        safe = prepare_llm_egress({"line": fallback}, "dashboard_log")["payload"]
+        safe_lines.append(str((safe if isinstance(safe, dict) else {}).get("line", fallback)))
+    return "\n".join(safe_lines)
 
 
 def file_mtime_age(path: Path) -> float | None:
@@ -270,8 +543,8 @@ def live_monitor_status() -> list[dict]:
                 "process_count": len(processes),
                 "pids": [row["pid"] for row in processes],
                 "role": config["role"],
-                "agent_controls": bool(config["agent_controls"]),
-                "can_submit_reduce_only_orders": bool(config["can_submit_reduce_only_orders"]),
+                "agent_controls": False,
+                "can_submit_reduce_only_orders": False,
                 "processes": processes,
             }
         )
@@ -311,8 +584,20 @@ def heartbeat_status(name: str, path: Path) -> dict:
         "heartbeat_pid": heartbeat_pid,
         "running": running,
         "status": payload.get("status"),
-        "payload": payload,
+        "payload": compact_heartbeat_payload(payload),
     }
+
+def compact_heartbeat_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    keep = {
+        key: payload.get(key)
+        for key in ("ts", "updated_at", "checked_at", "pid", "status", "state", "mode", "waiting_for", "last_error", "error")
+        if key in payload
+    }
+    keep["payload_hash"] = stable_hash(payload, "heartbeat")
+    keep["payload_keys"] = sorted(str(key) for key in payload.keys())[:24]
+    return keep
 
 
 def summarize_paper(rows: list[dict]) -> dict:
@@ -335,10 +620,10 @@ def summarize_paper(rows: list[dict]) -> dict:
         "net": round(net, 8),
         "win_rate": round(wins / trades, 4) if trades else 0.0,
         "risk_blocks": sum(1 for row in rows if row.get("event") in {"risk_block", "memory_bias_filter"}),
-        "latest_open": latest_open,
-        "latest_close": latest_close,
+        "latest_open": compact_trade_row(latest_open or {}) if latest_open else None,
+        "latest_close": compact_trade_row(latest_close or {}) if latest_close else None,
         "inferred_position_open": inferred_open,
-        "latest_events": rows[-20:],
+        "latest_events": [compact_trade_row(row) for row in rows[-20:]],
     }
 
 def summarize_paper_account(account: dict) -> dict:
@@ -370,6 +655,59 @@ def trade_r_multiple(row: dict) -> float | None:
         return None
     return net / risk_amount
 
+def paper_trade_notional(row: dict) -> float:
+    position = row.get("position") if isinstance(row.get("position"), dict) else {}
+    direct = safe_float(row.get("notional"))
+    if direct > 0:
+        return direct
+    nested = safe_float(position.get("notional"))
+    if nested > 0:
+        return nested
+    margin = safe_float(row.get("margin") or position.get("margin"))
+    leverage = safe_float(row.get("leverage") or position.get("leverage"))
+    if margin > 0 and leverage > 0:
+        return margin * leverage
+    entry = safe_float(row.get("entry") or position.get("entry"))
+    qty = safe_float(row.get("qty") or position.get("qty"))
+    if entry > 0 and qty > 0:
+        return entry * qty
+    return 0.0
+
+def compact_trade_row(row: dict) -> dict:
+    if not isinstance(row, dict):
+        return {}
+    position = row.get("position") if isinstance(row.get("position"), dict) else {}
+    nested_chart = position.get("chart_evidence") if isinstance(position.get("chart_evidence"), dict) else {}
+    return {
+        "event": row.get("event"),
+        "trade_id": row.get("trade_id") or row.get("paper_trade_id") or row.get("close_id"),
+        "paper_trade_id": row.get("paper_trade_id") or position.get("paper_trade_id"),
+        "candidate_id": row.get("candidate_id") or position.get("candidate_id"),
+        "ts": row.get("ts"),
+        "open_ts": row.get("open_ts") or position.get("opened_at"),
+        "close_ts": row.get("close_ts") or row.get("closed_at"),
+        "symbol": row.get("symbol") or position.get("symbol"),
+        "side": row.get("side") or position.get("side"),
+        "setup_id": row.get("setup_id") or position.get("setup_id"),
+        "reason": row.get("reason") or row.get("block_reason"),
+        "net": row.get("net"),
+        "entry": row.get("entry") or position.get("entry"),
+        "exit": row.get("exit") or row.get("fill_price"),
+        "qty": row.get("qty") or position.get("qty"),
+        "margin": row.get("margin") or position.get("margin"),
+        "leverage": row.get("leverage") or position.get("leverage"),
+        "notional": row.get("notional") or position.get("notional") or paper_trade_notional(row),
+        "fee": row.get("fee") or row.get("fees"),
+        "funding_payment": row.get("funding_payment"),
+        "slippage": row.get("slippage"),
+        "r_multiple": row.get("r_multiple"),
+        "chart_score_id": row.get("chart_score_id") or position.get("chart_score_id"),
+        "chart_risk_plan_id": row.get("chart_risk_plan_id") or position.get("chart_risk_plan_id"),
+        "chart_snapshot_ids": row.get("chart_snapshot_ids") or position.get("chart_snapshot_ids"),
+        "chart_evidence_status": row.get("chart_evidence_status") or nested_chart.get("status"),
+        "chart_learning_eligible": row.get("chart_learning_eligible") if row.get("chart_learning_eligible") is not None else nested_chart.get("chart_learning_eligible"),
+    }
+
 def update_trade_bucket(store: dict[str, dict], key: object, row: dict, net: float) -> None:
     bucket_key = str(key or "unknown")
     bucket = store.setdefault(
@@ -378,7 +716,7 @@ def update_trade_bucket(store: dict[str, dict], key: object, row: dict, net: flo
     )
     bucket["trades"] += 1
     bucket["net"] += net
-    bucket["notional_sum"] += safe_float(row.get("notional"))
+    bucket["notional_sum"] += paper_trade_notional(row)
     bucket["fees"] += safe_float(row.get("fee") or row.get("fees"))
     bucket["last_ts"] = str(row.get("close_ts") or row.get("ts") or bucket.get("last_ts") or "")
     if net > 0:
@@ -387,6 +725,11 @@ def update_trade_bucket(store: dict[str, dict], key: object, row: dict, net: flo
     elif net < 0:
         bucket["losses"] += 1
         bucket["loss_sum"] += net
+
+def bounded_profit_factor(win_sum: float, loss_sum: float) -> float | None:
+    if loss_sum < 0:
+        return round(win_sum / abs(loss_sum), 4)
+    return None
 
 def finalize_trade_buckets(store: dict[str, dict], limit: int = 10) -> list[dict]:
     rows: list[dict] = []
@@ -405,7 +748,7 @@ def finalize_trade_buckets(store: dict[str, dict], limit: int = 10) -> list[dict
                 "win_rate": round(wins / trades, 4) if trades else 0.0,
                 "net": round(safe_float(bucket.get("net")), 8),
                 "expectancy": round(safe_float(bucket.get("net")) / trades, 8) if trades else 0.0,
-                "profit_factor": round(win_sum / abs(loss_sum), 4) if loss_sum < 0 else (999.0 if win_sum > 0 else 0.0),
+                "profit_factor": bounded_profit_factor(win_sum, loss_sum),
                 "avg_notional": round(safe_float(bucket.get("notional_sum")) / trades, 8) if trades else 0.0,
                 "fees": round(safe_float(bucket.get("fees")), 8),
                 "last_ts": bucket.get("last_ts") or "",
@@ -492,6 +835,7 @@ def summarize_paper_report(rows: list[dict], account: dict, _closes_override: li
     max_win_streak = 0
     max_loss_streak = 0
     total_fees = 0.0
+    total_funding = 0.0
     total_notional = 0.0
     r_values: list[float] = []
     by_symbol: dict[str, dict] = {}
@@ -500,12 +844,14 @@ def summarize_paper_report(rows: list[dict], account: dict, _closes_override: li
     by_reason: dict[str, dict] = {}
     by_day: dict[str, dict] = {}
     pnl_buckets: dict[str, dict] = {}
+    chart_evidence = {"with_chart": 0, "learning_eligible": 0, "degraded": 0, "diagnostic_only": 0, "missing_required": 0}
     curve = [{"index": 0, "ts": account.get("created_at"), "equity": round(equity, 8), "net": 0.0, "label": "start"}]
 
     for index, row in enumerate(closes, start=1):
         net = safe_float(row.get("net"))
         total_fees += safe_float(row.get("fee") or row.get("fees"))
-        total_notional += safe_float(row.get("notional"))
+        total_funding += safe_float(row.get("funding_payment"))
+        total_notional += paper_trade_notional(row)
         if row.get("r_multiple") is not None:
             r_values.append(safe_float(row.get("r_multiple")))
         equity += net
@@ -527,6 +873,19 @@ def summarize_paper_report(rows: list[dict], account: dict, _closes_override: li
         update_trade_bucket(by_setup, row.get("setup_id"), row, net)
         update_trade_bucket(by_side, row.get("side"), row, net)
         update_trade_bucket(by_reason, row.get("reason"), row, net)
+        nested_chart = row.get("chart_evidence") if isinstance(row.get("chart_evidence"), dict) else {}
+        ids = row.get("chart_snapshot_ids") if isinstance(row.get("chart_snapshot_ids"), dict) else {}
+        has_chart = bool(row.get("chart_score_id") or row.get("chart_risk_plan_id") or row.get("chart_intelligence_id") or ids)
+        if has_chart:
+            chart_evidence["with_chart"] += 1
+            if row.get("chart_learning_eligible") or nested_chart.get("chart_learning_eligible"):
+                chart_evidence["learning_eligible"] += 1
+            if row.get("diagnostic_only"):
+                chart_evidence["diagnostic_only"] += 1
+            if str(row.get("chart_evidence_status") or nested_chart.get("status") or "") in {"degraded", "partial", "quarantined"}:
+                chart_evidence["degraded"] += 1
+            if not ids:
+                chart_evidence["missing_required"] += 1
         close_dt = parse_ts(row.get("close_ts") or row.get("ts"))
         day_key = close_dt.date().isoformat() if close_dt else "unknown"
         update_trade_bucket(by_day, day_key, row, net)
@@ -554,7 +913,7 @@ def summarize_paper_report(rows: list[dict], account: dict, _closes_override: li
     recent_wins = sum(1 for row in recent if safe_float(row.get("net")) > 0)
     expectancy = net_total / closed if closed else 0.0
     recent_expectancy = recent_net / len(recent) if recent else 0.0
-    profit_factor = round(win_sum / abs(loss_sum), 4) if loss_sum < 0 else (999.0 if win_sum > 0 else 0.0)
+    profit_factor = bounded_profit_factor(win_sum, loss_sum)
     equity_values = [safe_float(row.get("equity")) for row in curve]
     equity_high = max(equity_values) if equity_values else starting_equity
     equity_low = min(equity_values) if equity_values else starting_equity
@@ -620,14 +979,15 @@ def summarize_paper_report(rows: list[dict], account: dict, _closes_override: li
         "payoff_ratio": round((win_sum / wins) / abs(loss_sum / losses), 4) if wins and losses and loss_sum < 0 else 0.0,
         "avg_r": round(sum(r_values) / len(r_values), 4) if r_values else None,
         "total_fees": round(total_fees, 8),
+        "total_funding_payment": round(total_funding, 8),
         "fee_drag_pct": round(total_fees / abs(net_total), 4) if net_total else 0.0,
         "avg_notional": round(total_notional / closed, 8) if closed else 0.0,
         "current_streak": current_streak,
         "current_streak_side": current_streak_side,
         "max_win_streak": max_win_streak,
         "max_loss_streak": max_loss_streak,
-        "best_trade": best_trade,
-        "worst_trade": worst_trade,
+        "best_trade": compact_trade_row(best_trade),
+        "worst_trade": compact_trade_row(worst_trade),
         "open_position_count": open_summary["open_position_count"],
         "open_margin": open_summary["open_margin"],
         "open_notional": open_summary["open_notional"],
@@ -642,9 +1002,10 @@ def summarize_paper_report(rows: list[dict], account: dict, _closes_override: li
             "by_day": finalize_trade_buckets(by_day, limit=14),
         },
         "pnl_histogram": histogram,
+        "chart_evidence": chart_evidence,
         "progress_state": progress_state,
         "curve": curve[-160:],
-        "recent_closes": closes[-40:],
+        "recent_closes": [compact_trade_row(row) for row in closes[-40:]],
     }
 
 def read_pid_file(path: Path) -> int | None:
@@ -654,9 +1015,12 @@ def read_pid_file(path: Path) -> int | None:
         return None
 
 def process_status() -> dict:
+    supervisor_pid = read_pid_file(STATE_DIR / "agent_process_supervisor.pid")
     watchdog_pid = read_pid_file(STATE_DIR / "scalp_watchdog.pid")
     child_pid = read_pid_file(STATE_DIR / "scalp_autotrader.pid")
     return {
+        "supervisor_pid": supervisor_pid,
+        "supervisor_running": pid_running(supervisor_pid),
         "watchdog_pid": watchdog_pid,
         "watchdog_running": pid_running(watchdog_pid),
         "child_pid": child_pid,
@@ -780,8 +1144,8 @@ def compact_news(news: dict) -> dict:
         "source_health": (news.get("source_health") if isinstance(news.get("source_health"), list) else [])[:12],
         "symbol_impacts": news.get("symbol_impacts") if isinstance(news.get("symbol_impacts"), dict) else {},
         "risk_contract": news.get("risk_contract") or "tighten_only",
-        "can_place_orders": bool(news.get("can_place_orders")),
-        "can_loosen_risk": bool(news.get("can_loosen_risk")),
+        "can_place_orders": False,
+        "can_loosen_risk": False,
     }
 
 def compact_shadow_performance(performance: dict) -> dict:
@@ -798,7 +1162,7 @@ def compact_shadow_performance(performance: dict) -> dict:
             continue
         for row in rows[:8]:
             if isinstance(row, dict):
-                item = {"group": group, **row}
+                item = compact_shadow_segment({"group": group, **row})
                 top_segments.append(item)
                 worst_segments.append(item)
     top_segments.sort(key=lambda row: (safe_float(row.get("expectancy")), safe_float(row.get("net"))), reverse=True)
@@ -817,7 +1181,7 @@ def compact_shadow_performance(performance: dict) -> dict:
         "win_rate": safe_float(overall.get("win_rate")),
         "net": safe_float(overall.get("net")),
         "expectancy": safe_float(overall.get("expectancy")),
-        "profit_factor": safe_float(overall.get("profit_factor")),
+        "profit_factor": dashboard_profit_factor(overall.get("profit_factor")),
         "max_drawdown": safe_float(overall.get("max_drawdown")),
         "under_sampled": closed < 50,
         "data_quality": {
@@ -838,7 +1202,7 @@ def compact_shadow_performance(performance: dict) -> dict:
             "win_rate": safe_float(fresh_overall.get("win_rate")),
             "net": safe_float(fresh_overall.get("net")),
             "expectancy": safe_float(fresh_overall.get("expectancy")),
-            "profit_factor": safe_float(fresh_overall.get("profit_factor")),
+            "profit_factor": dashboard_profit_factor(fresh_overall.get("profit_factor")),
             "confidence": fresh_quality.get("confidence") or fresh_overall.get("confidence") or "low",
             "api_error_count": int(fresh_quality.get("api_error_count", fresh_overall.get("api_error_count", 0)) or 0),
             "unresolved_count": int(fresh_quality.get("unresolved_count", fresh_overall.get("unresolved_count", 0)) or 0),
@@ -846,8 +1210,22 @@ def compact_shadow_performance(performance: dict) -> dict:
         },
         "top_segments": top_segments[:12],
         "worst_segments": worst_segments[:12],
-        "kill_candidates": (performance.get("kill_candidates") if isinstance(performance.get("kill_candidates"), list) else [])[:12],
-        "promotion_candidates": (performance.get("promotion_candidates") if isinstance(performance.get("promotion_candidates"), list) else [])[:12],
+        "kill_candidates": [compact_shadow_segment(row) for row in (performance.get("kill_candidates") if isinstance(performance.get("kill_candidates"), list) else [])[:12]],
+        "promotion_candidates": [compact_shadow_segment(row) for row in (performance.get("promotion_candidates") if isinstance(performance.get("promotion_candidates"), list) else [])[:12]],
+    }
+
+def compact_shadow_segment(row: dict) -> dict:
+    return {
+        "group": row.get("group"),
+        "key": row.get("key"),
+        "closed": int(row.get("closed", row.get("trades", 0)) or 0),
+        "trades": int(row.get("trades", row.get("closed", 0)) or 0),
+        "wins": int(row.get("wins", 0) or 0),
+        "losses": int(row.get("losses", 0) or 0),
+        "win_rate": safe_float(row.get("win_rate")),
+        "net": safe_float(row.get("net")),
+        "expectancy": safe_float(row.get("expectancy")),
+        "profit_factor": dashboard_profit_factor(row.get("profit_factor")),
     }
 
 def compact_self_improvement(payload: dict) -> dict:
@@ -858,7 +1236,7 @@ def compact_self_improvement(payload: dict) -> dict:
         "readiness": payload.get("readiness") or "unknown",
         "blindspots": (payload.get("blindspots") if isinstance(payload.get("blindspots"), list) else [])[:10],
         "learning_curriculum": (payload.get("learning_curriculum") if isinstance(payload.get("learning_curriculum"), list) else [])[:10],
-        "guardrail_proposal": payload.get("guardrail_proposal") if isinstance(payload.get("guardrail_proposal"), dict) else {},
+        "guardrail_proposal": hard_mask_live_flags(payload.get("guardrail_proposal") if isinstance(payload.get("guardrail_proposal"), dict) else {}),
         "score_snapshot": {key: safe_float(value.get("score") if isinstance(value, dict) else 0) for key, value in scores.items()},
     }
 
@@ -880,7 +1258,7 @@ def compact_daily_exam(payload: dict) -> dict:
         "learning_targets": (payload.get("learning_targets") if isinstance(payload.get("learning_targets"), list) else [])[:8],
         "checks": (grade.get("checks") if isinstance(grade.get("checks"), list) else [])[:8],
         "score_snapshot": {key: safe_float(value.get("score") if isinstance(value, dict) else 0) for key, value in scores.items()},
-        "contract": payload.get("contract") if isinstance(payload.get("contract"), dict) else {"paper_only": True},
+        "contract": hard_mask_live_flags(payload.get("contract") if isinstance(payload.get("contract"), dict) else {"paper_only": True}),
     }
 
 def compact_llm_reasoning(payload: dict) -> dict:
@@ -899,11 +1277,152 @@ def compact_llm_reasoning(payload: dict) -> dict:
         "hypotheses": (reasoning.get("hypotheses") if isinstance(reasoning.get("hypotheses"), list) else [])[:8],
         "experiments": (reasoning.get("paper_shadow_experiments") if isinstance(reasoning.get("paper_shadow_experiments"), list) else [])[:8],
         "curriculum": (reasoning.get("curriculum") if isinstance(reasoning.get("curriculum"), list) else [])[:8],
-        "risk_proposal": risk,
-        "can_place_live_orders": bool(risk.get("can_place_live_orders")),
-        "can_loosen_risk": bool(risk.get("can_loosen_risk")),
+        "risk_proposal": hard_mask_live_flags(risk),
+        "can_place_live_orders": False,
+        "can_loosen_risk": False,
         "error": payload.get("error") or reasoning.get("error"),
     }
+
+def hard_mask_live_flags(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    masked = dict(payload)
+    false_keys = {
+        "can_place_orders",
+        "can_place_live_orders",
+        "canplaceliveorders",
+        "can_submit_orders",
+        "can_submit_live_orders",
+        "cansubmitliveorders",
+        "can_submit_reduce_only_orders",
+        "can_trade_live",
+        "cantradelive",
+        "can_loosen",
+        "can_loosen_risk",
+        "live_eligible",
+        "liveeligible",
+        "live_permission",
+        "livepermission",
+        "live_execution_enabled",
+        "liveexecutionenabled",
+        "passed",
+    }
+    for key in (
+        "can_place_orders",
+        "can_place_live_orders",
+        "can_submit_orders",
+        "can_submit_reduce_only_orders",
+        "can_trade_live",
+        "can_loosen",
+        "can_loosen_risk",
+        "live_eligible",
+    ):
+        if key in masked:
+            masked[key] = False
+    for key in list(masked.keys()):
+        normalized = re.sub(r"[^a-z0-9]+", "_", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower()).strip("_")
+        if normalized in false_keys or normalized.replace("_", "") in false_keys:
+            masked[key] = False
+    masked["paper_only"] = True
+    masked["live_permission"] = False
+    return masked
+
+def dashboard_key_forms(key: object) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "_", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower()).strip("_")
+    return {normalized, normalized.replace("_", "")}
+
+LIVE_READINESS_KEY_FORMS = {
+    "readiness",
+    "ready_for_live",
+    "readyforlive",
+    "live_readiness",
+    "livereadiness",
+}
+LIVE_READINESS_VALUE_FORMS = LIVE_READINESS_KEY_FORMS - {"readiness"}
+DASHBOARD_LIVE_VALUE_FORMS = {"live", "real", "prod", "production", "mainnet"}
+
+def _is_live_readiness_marker(value: object) -> bool:
+    forms = dashboard_key_forms(value)
+    return bool(forms & LIVE_READINESS_VALUE_FORMS)
+
+def _is_dashboard_live_value_marker(value: object) -> bool:
+    forms = dashboard_key_forms(value)
+    return bool(forms & DASHBOARD_LIVE_VALUE_FORMS)
+
+def _scrub_compact_live_readiness(value):
+    if isinstance(value, dict):
+        scrubbed = {}
+        for key, item in value.items():
+            if dashboard_key_forms(key) & LIVE_READINESS_KEY_FORMS:
+                continue
+            scrubbed[key] = _scrub_compact_live_readiness(item)
+        return scrubbed
+    if isinstance(value, list):
+        return [_scrub_compact_live_readiness(item) for item in value]
+    if isinstance(value, str) and _is_live_readiness_marker(value):
+        return "paper_only"
+    return value
+
+def mask_dashboard_live_surfaces(value):
+    if isinstance(value, dict):
+        masked = {}
+        for key, item in value.items():
+            key_forms = dashboard_key_forms(key)
+            if key_forms & {
+                "can_place_orders",
+                "can_place_live_orders",
+                "canplaceliveorders",
+                "can_submit_orders",
+                "can_submit_live_orders",
+                "cansubmitliveorders",
+                "can_submit_reduce_only_orders",
+                "can_trade_live",
+                "cantradelive",
+                "can_loosen",
+                "can_loosen_risk",
+                "live_eligible",
+                "liveeligible",
+                "live_permission",
+                "livepermission",
+                "live_execution_enabled",
+                "liveexecutionenabled",
+                "permission",
+            }:
+                masked[key] = False
+            elif key_forms & (LIVE_READINESS_KEY_FORMS - {"readiness"}):
+                masked[key] = False
+            elif key_forms & {"readiness"} and isinstance(item, str) and _is_live_readiness_marker(item):
+                masked[key] = "paper_only"
+            elif key_forms & {"live_mode", "livemode", "mode", "environment", "account_scope", "accountscope", "execution_mode", "executionmode", "trade_mode", "trademode"} and isinstance(item, str) and item.strip().lower() in {"live", "real", "prod", "production", "mainnet", "ready_for_live"}:
+                masked[key] = "paper"
+            elif any(form.endswith("mode") for form in key_forms) and isinstance(item, str) and item.strip().lower() in {"live", "ready_for_live"}:
+                masked[key] = "paper"
+            elif key == "paper_only":
+                masked[key] = True
+            elif isinstance(item, str) and _is_live_readiness_marker(item):
+                masked[key] = "paper_only"
+            elif isinstance(item, str) and _is_dashboard_live_value_marker(item):
+                masked[key] = "paper"
+            else:
+                masked[key] = mask_dashboard_live_surfaces(item)
+        return masked
+    if isinstance(value, list):
+        return [mask_dashboard_live_surfaces(item) for item in value]
+    if isinstance(value, str) and _is_live_readiness_marker(value):
+        return "paper_only"
+    if isinstance(value, str) and _is_dashboard_live_value_marker(value):
+        return "paper"
+    return value
+
+def compact_live_readiness(payload: dict) -> dict:
+    masked = hard_mask_live_flags(payload if isinstance(payload, dict) else {})
+    masked = mask_dashboard_live_surfaces(masked)
+    masked = _scrub_compact_live_readiness(masked)
+    masked["passed"] = False
+    masked["mode"] = "paper"
+    masked["status"] = "paper_only"
+    masked["reason"] = "dashboard_hard_mask_paper_only"
+    return masked
 
 def compact_promotion(payload: dict) -> dict:
     req = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
@@ -917,7 +1436,20 @@ def compact_promotion(payload: dict) -> dict:
         except Exception:
             passed = bool(value)
         rows.append({"metric": key, "value": value, "target": target, "passed": passed})
-    return {"evaluated_at": payload.get("evaluated_at"), "state": payload.get("state") or "paper_learning", "passed": bool(payload.get("passed")), "failures": failures, "rows": rows, "metrics": metrics, "requirements": req, "can_place_live_orders": bool(payload.get("can_place_live_orders"))}
+    return {"evaluated_at": payload.get("evaluated_at"), "state": payload.get("state") or "paper_learning", "passed": bool(payload.get("passed")), "failures": failures, "rows": rows, "metrics": metrics, "requirements": req, "can_place_live_orders": False, "live_eligible": False, "paper_only": True}
+
+def mask_dashboard_metric_sentinels(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key in {"profit_factor", "profit_factor_after_costs", "pf"}:
+                out[key] = dashboard_profit_factor(item)
+            else:
+                out[key] = mask_dashboard_metric_sentinels(item)
+        return out
+    if isinstance(value, list):
+        return [mask_dashboard_metric_sentinels(item) for item in value]
+    return value
 
 def compact_experiments(payload: dict) -> dict:
     by_status = payload.get("by_status") if isinstance(payload.get("by_status"), dict) else {}
@@ -929,9 +1461,145 @@ def compact_experiments(payload: dict) -> dict:
         "running": int(by_status.get("running") or 0),
         "passed": int(by_status.get("passed") or 0),
         "failed": int(by_status.get("failed") or 0),
-        "rows": rows[-12:],
+        "rows": mask_dashboard_metric_sentinels(rows[-12:]),
         "can_place_live_orders": False,
     }
+
+def compact_security_import_guard(payload: dict) -> dict:
+    return {
+        "ok": payload.get("ok") if "ok" in payload else payload.get("status") == "ok",
+        "status": payload.get("status") or "unknown",
+        "updated_at": payload.get("updated_at") or payload.get("checked_at") or payload.get("ts"),
+        "violation_count": len(payload.get("violations") if isinstance(payload.get("violations"), list) else payload.get("errors") if isinstance(payload.get("errors"), list) else []),
+        "errors": (payload.get("errors") if isinstance(payload.get("errors"), list) else [])[:8],
+    }
+
+def compact_runtime_contract(payload: dict) -> dict:
+    agents = payload.get("agents") if isinstance(payload.get("agents"), list) else payload.get("registry") if isinstance(payload.get("registry"), list) else []
+    return {
+        "updated_at": payload.get("updated_at") or payload.get("ts"),
+        "agent_count": len(agents) if isinstance(agents, list) else len(payload),
+        "status": payload.get("status") or "unknown",
+        "manifest_hash": payload.get("manifest_hash") or stable_hash(payload, "registry"),
+    }
+
+def compact_test_result_memory(payload: dict) -> dict:
+    return {
+        "updated_at": payload.get("updated_at") or payload.get("ts"),
+        "lesson_count": int(payload.get("lesson_count") or len(payload.get("lessons", []) if isinstance(payload.get("lessons"), list) else [])),
+        "high_severity_count": int(payload.get("high_severity_count") or 0),
+        "known_gaps": (payload.get("known_gaps") if isinstance(payload.get("known_gaps"), list) else [])[:8],
+        "can_place_live_orders": False,
+    }
+
+def compact_whale_flow(payload: dict) -> dict:
+    by_symbol = payload.get("by_symbol") if isinstance(payload.get("by_symbol"), dict) else {}
+    rows = []
+    for symbol, row in list(by_symbol.items())[:24]:
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "symbol": row.get("symbol") or symbol,
+                "pressure_side": row.get("pressure_side") or "NEUTRAL",
+                "pressure_score": safe_float(row.get("pressure_score")),
+                "crowd_bias": row.get("crowd_bias"),
+                "squeeze_risk": row.get("squeeze_risk"),
+                "event_count": int(row.get("event_count") or 0),
+                "long_flow_notional": safe_float(row.get("long_flow_notional")),
+                "short_flow_notional": safe_float(row.get("short_flow_notional")),
+                "long_liquidation_notional": safe_float(row.get("long_liquidation_notional")),
+                "short_liquidation_notional": safe_float(row.get("short_liquidation_notional")),
+            }
+        )
+    return {
+        "status": payload.get("status") or "unknown",
+        "updated_at": payload.get("updated_at") or payload.get("ts"),
+        "event_count": int(payload.get("event_count") or 0),
+        "channels": (payload.get("channels") if isinstance(payload.get("channels"), list) else [])[:12],
+        "source_health": (payload.get("source_health") if isinstance(payload.get("source_health"), list) else [])[:8],
+        "by_symbol": {row["symbol"]: row for row in rows},
+        "can_place_live_orders": False,
+    }
+
+def compact_loop_latest(payload: dict) -> dict:
+    return {
+        "status": payload.get("status") or payload.get("state") or "unknown",
+        "updated_at": payload.get("updated_at") or payload.get("ts"),
+        "candidate_count": int(payload.get("candidate_count") or len(payload.get("candidates", []) if isinstance(payload.get("candidates"), list) else [])),
+        "result_count": int(payload.get("result_count") or len(payload.get("results", []) if isinstance(payload.get("results"), list) else [])),
+        "pending_count": int(payload.get("pending_count") or len(payload.get("pending_patches", []) if isinstance(payload.get("pending_patches"), list) else [])),
+        "rejected_count": int(payload.get("rejected_count") or 0),
+        "decision": payload.get("decision") if isinstance(payload.get("decision"), dict) else {},
+        "action": payload.get("action"),
+        "errors": (payload.get("errors") if isinstance(payload.get("errors"), list) else [])[:8],
+        "can_place_live_orders": False,
+    }
+
+def compact_execution_lifecycle(payload: dict) -> dict:
+    rows = []
+    for row in (payload.get("monitor_results") if isinstance(payload.get("monitor_results"), list) else [])[-40:]:
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "position_id": row.get("position_id"),
+                "symbol": row.get("symbol"),
+                "mark": row.get("mark"),
+                "status": row.get("status"),
+                "reason": row.get("reason"),
+            }
+        )
+    base = compact_loop_latest(payload)
+    base["monitor_results"] = rows
+    return base
+
+def compact_dont_do(payload: dict) -> dict:
+    rules = payload.get("rules") if isinstance(payload.get("rules"), list) else []
+    return {
+        "updated_at": payload.get("updated_at") or payload.get("ts"),
+        "rules": [
+            {
+                "rule_id": row.get("rule_id") or row.get("id"),
+                "reason": row.get("reason"),
+                "severity": row.get("severity"),
+                "evidence_ids": (row.get("evidence_ids") if isinstance(row.get("evidence_ids"), list) else [])[:6],
+            }
+            for row in rules[:24]
+            if isinstance(row, dict)
+        ],
+    }
+
+def compact_phase_b_learning(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    compact = dict(payload)
+    compact["recent_reviews"] = [
+        {
+            "trade_id": row.get("trade_id"),
+            "classification": row.get("classification"),
+            "primary_failure_reason": row.get("primary_failure_reason"),
+            "mfe": row.get("mfe"),
+            "mae": row.get("mae"),
+            "r_multiple": row.get("r_multiple"),
+            "review_id": row.get("review_id"),
+        }
+        for row in (payload.get("recent_reviews") if isinstance(payload.get("recent_reviews"), list) else [])[-8:]
+        if isinstance(row, dict)
+    ]
+    compact["recent_replays"] = [
+        {
+            "signal_id": row.get("signal_id"),
+            "status": row.get("status"),
+            "reason": row.get("reason"),
+            "conclusion": row.get("conclusion"),
+            "candle_source": row.get("candle_source") if isinstance(row.get("candle_source"), dict) else {},
+            "coverage": row.get("coverage") if isinstance(row.get("coverage"), dict) else {},
+        }
+        for row in (payload.get("recent_replays") if isinstance(payload.get("recent_replays"), list) else [])[-8:]
+        if isinstance(row, dict)
+    ]
+    return compact
 
 def compact_ops() -> dict:
     return {
@@ -941,16 +1609,518 @@ def compact_ops() -> dict:
         "host_runtime": read_json(STATE_DIR / "host_runtime_latest.json"),
         "model_usage": read_json(MEMORY_DIR / "model_usage_latest.json"),
         "learning_benchmark": read_json(MEMORY_DIR / "learning_exam_benchmark_latest.json"),
-        "test_result_memory": read_json(MEMORY_DIR / "test_result_memory_latest.json"),
-        "skill_forge": read_json(MEMORY_DIR / "skill_forge_latest.json"),
+        "test_result_memory": compact_test_result_memory(read_json(MEMORY_DIR / "test_result_memory_latest.json")),
+        "skill_forge": compact_loop_latest(read_json(MEMORY_DIR / "skill_forge_latest.json")),
         "skill_patch_integration": read_json(MEMORY_DIR / "skill_patch_integration_latest.json"),
-        "dont_do": read_json(MEMORY_DIR / "dont_do_memory.json"),
-        "paper_loop": read_json(MEMORY_DIR / "autonomous_paper_trading_loop_latest.json"),
-        "paper_execution_lifecycle": read_json(MEMORY_DIR / "paper_execution_lifecycle_latest.json"),
-        "microstructure_loop": read_json(MEMORY_DIR / "microstructure_observer_loop_latest.json"),
-        "security_import_guard": read_json(MEMORY_DIR / "security_import_guard_latest.json"),
+        "dont_do": compact_dont_do(read_json(MEMORY_DIR / "dont_do_memory.json")),
+        "paper_loop": compact_loop_latest(read_json(MEMORY_DIR / "autonomous_paper_trading_loop_latest.json")),
+        "paper_execution_lifecycle": compact_execution_lifecycle(read_json(MEMORY_DIR / "paper_execution_lifecycle_latest.json")),
+        "microstructure_loop": compact_loop_latest(read_json(MEMORY_DIR / "microstructure_observer_loop_latest.json")),
+        "whale_flow": compact_whale_flow(read_json(MEMORY_DIR / "whale_flow_latest.json")),
+        "security_import_guard": compact_security_import_guard(read_json(MEMORY_DIR / "security_import_guard_latest.json")),
+        "runtime_contract": compact_runtime_contract(read_json(STATE_DIR / "agent_registry.json")),
         "queue": queue_summary(),
     }
+
+def event_bus_dashboard(db_path: Path | None = None) -> dict:
+    db_path = db_path or EVENT_STORE_DB
+    if not db_path.exists():
+        return {
+            "state": "missing",
+            "db_path": str(db_path),
+            "total_events": 0,
+            "throughput_1h": 0,
+            "dlq_count": 0,
+            "subscriptions": [],
+            "consumer_lag_max": None,
+            "latest_seq": None,
+            "errors": ["event_store_db_missing"],
+        }
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=3)
+        try:
+            latest_seq = conn.execute("SELECT COALESCE(MAX(seq),0) FROM event_envelopes").fetchone()[0]
+            total_events = conn.execute("SELECT COUNT(*) FROM event_envelopes").fetchone()[0]
+            one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+            throughput = conn.execute("SELECT COUNT(*) FROM event_envelopes WHERE ingested_at >= ?", (one_hour_ago,)).fetchone()[0]
+            dlq_count = conn.execute("SELECT COUNT(*) FROM event_dlq").fetchone()[0]
+            rows = conn.execute(
+                """
+                SELECT s.subscription_id,s.consumer_id,o.event_type,o.last_acked_seq,o.acked_at
+                FROM consumer_subscriptions s
+                LEFT JOIN subscription_offsets o ON o.subscription_id=s.subscription_id
+                ORDER BY s.consumer_id,o.event_type
+                LIMIT 24
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "state": "error",
+            "db_path": str(db_path),
+            "total_events": 0,
+            "throughput_1h": 0,
+            "dlq_count": 0,
+            "subscriptions": [],
+            "consumer_lag_max": None,
+            "latest_seq": None,
+            "errors": [type(exc).__name__],
+        }
+    subscriptions = []
+    lag_max = 0
+    for sid, consumer, event_type, offset, acked_at in rows:
+        lag = max(0, int(latest_seq or 0) - int(offset or 0))
+        lag_max = max(lag_max, lag)
+        subscriptions.append(
+            {
+                "subscription_id": sid,
+                "consumer_id": consumer,
+                "event_type": event_type,
+                "last_acked_seq": int(offset or 0),
+                "lag_events": lag,
+                "acked_at": acked_at,
+            }
+        )
+    state = "ok"
+    errors = []
+    if dlq_count:
+        state = "degraded"
+        errors.append("dlq_not_empty")
+    if lag_max > 500:
+        state = "degraded"
+        errors.append("consumer_lag_high")
+    return {
+        "state": state,
+        "db_path": str(db_path),
+        "total_events": int(total_events or 0),
+        "throughput_1h": int(throughput or 0),
+        "dlq_count": int(dlq_count or 0),
+        "subscriptions": subscriptions,
+        "consumer_lag_max": lag_max,
+        "latest_seq": int(latest_seq or 0),
+        "errors": errors,
+    }
+
+def feature_health_dashboard(limit: int = 12) -> dict:
+    files = sorted(FEATURE_STORE_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)[:limit] if FEATURE_STORE_DIR.exists() else []
+    rows = []
+    degraded = 0
+    source_scores = []
+    watermarks = []
+    for path in files:
+        payload = read_json(path)
+        mask = payload.get("decision_data_capability_mask") if isinstance(payload.get("decision_data_capability_mask"), dict) else payload.get("capability_mask") if isinstance(payload.get("capability_mask"), dict) else {}
+        features = payload.get("features") if isinstance(payload.get("features"), dict) else {}
+        source_trust = payload.get("source_trust") if isinstance(payload.get("source_trust"), dict) else {}
+        confidence = safe_float(mask.get("source_confidence"), 0.0)
+        source_scores.append(confidence)
+        action = str(mask.get("action") or "unknown")
+        row_as_of = payload.get("updated_at") or payload.get("computed_at") or payload.get("created_at") or payload.get("decision_cutoff") or source_trust.get("checked_at")
+        if row_as_of:
+            watermarks.append(row_as_of)
+        if action in {"skip", "size_cap", "unknown"}:
+            degraded += 1
+        rows.append(
+            {
+                "feature_id": payload.get("feature_id") or path.stem,
+                "symbol": payload.get("symbol") or features.get("symbol") or "unknown",
+                "timeframe": payload.get("timeframe") or features.get("timeframe") or "unknown",
+                "as_of": row_as_of,
+                "action": action,
+                "source_trust": round(confidence, 4),
+                "missing_required": mask.get("missing_required") or [],
+                "missing_optional": mask.get("missing_optional") or [],
+                "stale_optional": mask.get("stale_optional") or [],
+            }
+        )
+    missing_rate = degraded / len(rows) if rows else 1.0
+    state = "missing" if not rows else "degraded" if degraded else "ok"
+    return {
+        "state": state,
+        "feature_store_dir": str(FEATURE_STORE_DIR),
+        "row_count": len(rows),
+        "missing_or_degraded_rate": round(missing_rate, 4),
+        "avg_source_trust": round(sum(source_scores) / len(source_scores), 4) if source_scores else 0.0,
+        "latest_rows": rows,
+        "freshness": latest_file_freshness(files, 600, FEATURE_STORE_DIR, watermarks=watermarks),
+    }
+
+def latest_file_freshness(files: list[Path], ttl_seconds: int, root_path: Path, *, watermarks: list[str] | None = None) -> dict:
+    if not files:
+        return {
+            "path": str(root_path),
+            "exists": False,
+            "as_of": None,
+            "age_seconds": None,
+            "age": "unknown",
+            "ttl_seconds": int(ttl_seconds),
+            "state": "missing",
+            "source_watermark": None,
+        }
+    valid_watermarks = [ts for ts in (watermarks or []) if parse_ts(ts)]
+    if valid_watermarks:
+        latest_ts = max(valid_watermarks, key=lambda ts: parse_ts(ts) or datetime.min.replace(tzinfo=timezone.utc))
+        result = freshness(files[0], ttl_seconds, as_of=latest_ts)
+        result["path"] = str(root_path)
+        result["source_watermark"] = latest_ts
+        return result
+    latest = files[0]
+    result = freshness(latest, ttl_seconds)
+    result["path"] = str(root_path)
+    result["latest_file"] = str(latest)
+    return result
+
+def dashboard_profit_factor(value: object) -> float | None:
+    pf = safe_float(value, 0.0)
+    if pf <= 0 or pf >= 100:
+        return None
+    return pf
+
+def scoring_dashboard(paper_report: dict, shadow_performance: dict) -> dict:
+    scoring = read_json(MEMORY_DIR / "real_scoring_board_latest.json")
+    scoring_exists = bool(scoring)
+    overall = scoring.get("overall") if isinstance(scoring.get("overall"), dict) else {}
+    eff = overall.get("effective_sample") if isinstance(overall.get("effective_sample"), dict) else {}
+    ci = overall.get("confidence_interval") if isinstance(overall.get("confidence_interval"), dict) else {}
+    hard_errors = scoring.get("hard_errors") if isinstance(scoring.get("hard_errors"), list) else []
+    windows = []
+    for size in ("5", "10", "20"):
+        row = (paper_report.get("rolling") or {}).get(size) or {}
+        windows.append(
+            {
+                "window": f"{size}_closed_trades",
+                "purpose": "monitoring",
+                "readiness_eligibility": "promotion_ineligible",
+                "n": int(row.get("count") or 0),
+                "effective_n": int(row.get("count") or 0),
+                "profit_factor": None,
+                "expectancy": safe_float(row.get("expectancy")),
+                "expectancy_lower_bound_95": None,
+                "ci_lower_bound": None,
+                "setup_contract_hash": "monitoring_mixed_or_unknown",
+                "win_rate": safe_float(row.get("win_rate")),
+                "cost_vector": cost_completeness_vector({}),
+                "source_watermarks": [paper_report.get("account_created_at")],
+            }
+        )
+    windows.append(
+        {
+            "window": "real_scoring_overall",
+            "purpose": "readiness",
+            "readiness_eligibility": "paper_promotion_check_only_not_live_eligible",
+            "n": int(overall.get("trades") or paper_report.get("closed_trades") or 0),
+            "effective_n": safe_float(eff.get("effective_n"), safe_float(overall.get("trades"))),
+            "profit_factor": dashboard_profit_factor(overall.get("profit_factor_after_costs")) or dashboard_profit_factor(paper_report.get("profit_factor")),
+            "expectancy": safe_float(overall.get("expectancy_after_costs"), safe_float(paper_report.get("expectancy"))),
+            "expectancy_lower_bound_95": ci.get("lower_95"),
+            "ci_lower_bound": ci.get("lower_95"),
+            "setup_contract_hash": "mixed_or_unknown" if not scoring.get("by_setup_contract_hash") else ",".join(list(scoring.get("by_setup_contract_hash", {}).keys())[:3]),
+            "win_rate": safe_float(overall.get("win_rate"), safe_float(paper_report.get("win_rate"))),
+            "cost_vector": cost_completeness_vector(overall),
+            "source_watermarks": [scoring.get("as_of"), paper_report.get("account_created_at")],
+        }
+    )
+    return {
+        "state": "ok" if scoring.get("passed") else "degraded" if scoring_exists else "missing",
+        "snapshot_id": scoring.get("snapshot_id") or stable_hash({"paper_report": paper_report.get("closed_trades"), "shadow": shadow_performance.get("closed")}, "dash_score"),
+        "as_of": scoring.get("as_of"),
+        "metric_manifest_digest": scoring.get("metric_manifest_digest"),
+        "hard_errors": hard_errors,
+        "passed": bool(scoring.get("passed")),
+        "windows": windows,
+        "chart_contract": {
+            "axis_units": "USDT / closed trade windows",
+            "denominator": "mature closed rows at report cutoff",
+            "ci_method": ci.get("method") or "normal_lcb95_with_block_bootstrap_params",
+            "mandatory_tooltip_fields": [
+                "window",
+                "denominator",
+                "n",
+                "effective_n",
+                "setup_contract_hash",
+                "cost_vector",
+                "ci_lower_bound",
+                "snapshot_id",
+                "source_watermarks",
+                "staleness",
+                "readiness_eligibility",
+            ],
+        },
+    }
+
+def cost_completeness_vector(metric: dict) -> dict:
+    complete = bool(metric.get("cost_completeness")) if metric else False
+    return {
+        "entry_fee": "included" if complete else "unknown",
+        "exit_fee": "included" if complete else "unknown",
+        "funding": "realized_or_estimated" if metric.get("funding_abs") is not None else "unknown",
+        "slippage": "included" if metric.get("slippage_abs") is not None else "unknown",
+        "liquidation_fee": "not_applicable_or_unknown",
+        "adl_stress": "stress_tested" if metric.get("liquidations") is not None else "unknown",
+        "margin_haircut": "stress_tested",
+        "unknown_or_missing": not complete,
+    }
+
+def memory_skill_dashboard() -> dict:
+    memory = read_json(MEMORY_DIR / "memory_consolidation_latest.json")
+    skill_forge = read_json(MEMORY_DIR / "skill_forge_latest.json")
+    skill_integration = read_json(MEMORY_DIR / "skill_patch_integration_latest.json")
+    dont_do = read_json(MEMORY_DIR / "dont_do_memory.json")
+    rules = dont_do.get("rules") if isinstance(dont_do.get("rules"), list) else []
+    pending = skill_forge.get("pending_patches") if isinstance(skill_forge.get("pending_patches"), list) else skill_forge.get("patches") if isinstance(skill_forge.get("patches"), list) else []
+    promoted = memory.get("promoted_memories") if isinstance(memory.get("promoted_memories"), list) else memory.get("promoted") if isinstance(memory.get("promoted"), list) else []
+    evidence_ids = sorted(
+        {
+            str(item)
+            for row in [*promoted[:8], *pending[:8], *rules[:8]]
+            if isinstance(row, dict)
+            for key in ("evidence_ids", "objective_evidence_ids", "trade_ids", "review_ids", "memory_ids")
+            for item in (row.get(key) if isinstance(row.get(key), list) else [row.get(key)] if row.get(key) else [])
+        }
+    )[:24]
+    return {
+        "state": "ok" if memory or skill_forge or rules else "missing",
+        "memory": {
+            "as_of": memory.get("updated_at") or memory.get("ts"),
+            "phase": memory.get("phase") or memory.get("cycle_phase") or "unknown",
+            "promoted_count": int(memory.get("promoted_count") or len(promoted)),
+            "candidate_count": int(memory.get("candidate_count") or len(memory.get("candidates", []) if isinstance(memory.get("candidates"), list) else [])),
+        },
+        "skills": {
+            "as_of": skill_forge.get("updated_at") or skill_forge.get("ts"),
+            "pending_count": int(skill_forge.get("pending_count") or len(pending)),
+            "applied_count": int(skill_integration.get("applied_count") or 0),
+            "rejected_count": int(skill_forge.get("rejected_count") or 0),
+        },
+        "dont_do": {"rule_count": len(rules), "as_of": dont_do.get("updated_at") or dont_do.get("ts")},
+        "evidence_ids": evidence_ids,
+    }
+
+def build_neurocore_dashboard(
+    *,
+    heartbeats: list[dict],
+    paper_report: dict,
+    shadow_performance: dict,
+    ops: dict,
+    process: dict,
+) -> dict:
+    hb_lookup = {row.get("name"): row for row in heartbeats if isinstance(row, dict)}
+    bus = event_bus_dashboard()
+    features = feature_health_dashboard()
+    scoring = scoring_dashboard(paper_report, shadow_performance)
+    memory_skills = memory_skill_dashboard()
+    topology_nodes = [
+        {"id": "observers", "label": "Observers", "agents": ["market_observer", "news_observer", "whale_flow_observer", "microstructure_observer_loop"]},
+        {"id": "event_bus", "label": "Event Bus", "agents": ["event_store"]},
+        {"id": "feature_factory", "label": "Feature Factory", "agents": ["market_feature_store", "microstructure_flow_factory"]},
+        {"id": "paper", "label": "Paper Trader", "agents": ["paper_candidate_feeder", "autonomous_paper_trading_loop", "paper_execution_lifecycle_loop"]},
+        {"id": "learning", "label": "Learning", "agents": ["counterfactual_replay_agent", "learning_exam_benchmark", "test_result_memory_agent"]},
+        {"id": "memory_skills", "label": "Memory/Skills", "agents": ["memory_consolidation_agent", "skill_forge_agent", "promotion_evaluator_loop"]},
+    ]
+    artifact_state_by_node = {
+        "event_bus": bus.get("state") or "missing",
+        "feature_factory": features.get("state") or "missing",
+        "paper": (process.get("paper_runtime") or {}).get("state") or "missing",
+        "learning": "ok" if not any((hb_lookup.get(agent) or {}).get("state") not in {"ok", None} for agent in ["counterfactual_replay_agent", "learning_exam_benchmark", "test_result_memory_agent"]) else "degraded",
+        "memory_skills": memory_skills.get("state") or "missing",
+    }
+    for node in topology_nodes:
+        states = []
+        for agent in node["agents"]:
+            if agent in HEARTBEAT_FILES:
+                states.append((hb_lookup.get(agent) or {}).get("state") or "missing")
+        if node["id"] in artifact_state_by_node:
+            states.append(artifact_state_by_node[node["id"]])
+        if not states:
+            node["state"] = "missing"
+        elif any(state in {"critical", "dead", "missing", "error"} for state in states):
+            node["state"] = "critical"
+        elif any(state != "ok" and state != "running" and state != "fresh" for state in states):
+            node["state"] = "degraded"
+        else:
+            node["state"] = "ok"
+    blockers = []
+    stale = [row["name"] for row in heartbeats if row.get("state") in {"missing", "dead", "stale", "unknown"}]
+    if stale:
+        blockers.append({"severity": "high", "code": "stale_or_dead_agents", "detail": ", ".join(stale[:8])})
+    if bus.get("state") != "ok":
+        blockers.append({"severity": "medium", "code": "event_bus_not_green", "detail": ", ".join(bus.get("errors") or [bus.get("state")])})
+    if features.get("state") != "ok":
+        blockers.append({"severity": "medium", "code": "feature_health_not_green", "detail": f"missing/degraded {features.get('missing_or_degraded_rate')}"})
+    if scoring.get("hard_errors"):
+        blockers.append({"severity": "high", "code": "scoring_gate_failed", "detail": ", ".join(scoring.get("hard_errors")[:6])})
+    if not (ops.get("promotion") or {}).get("passed"):
+        blockers.append({"severity": "high", "code": "promotion_not_ready", "detail": ", ".join((ops.get("promotion") or {}).get("failures") or ["paper_learning"])})
+    top_state = "critical" if any(row["severity"] == "high" for row in blockers) else "degraded" if blockers else "ok"
+    snapshot_id = stable_hash(
+        {
+            "now": utc_now(),
+            "bus": bus.get("latest_seq"),
+            "score": scoring.get("snapshot_id"),
+            "paper": paper_report.get("closed_trades"),
+            "hb": [(row.get("name"), row.get("state")) for row in heartbeats],
+        },
+        "dash_snapshot",
+    )
+    return {
+        "schema_version": "neurocore_dashboard.v1",
+        "snapshot_id": snapshot_id,
+        "build_id": DASHBOARD_BUILD_ID,
+        "as_of": utc_now(),
+        "state": top_state,
+        "disclaimer": PAPER_ONLY_DISCLAIMER_VI,
+        "paper_only": True,
+        "live_eligible": False,
+        "top_blockers": blockers[:12],
+        "topology": {"nodes": topology_nodes, "edges": ["observers->event_bus", "event_bus->feature_factory", "feature_factory->paper", "paper->learning", "learning->memory_skills"]},
+        "event_bus": bus,
+        "features": features,
+        "scoring": scoring,
+        "memory_skills": memory_skills,
+        "experiments": ops.get("experiments") or {},
+        "ops": {
+            "paper_runtime": process.get("paper_runtime") or {},
+            "queue": ops.get("queue") or {},
+            "host_runtime": ops.get("host_runtime") or {},
+            "model_usage": ops.get("model_usage") or {},
+        },
+        "security": validate_dashboard_bind(str(DASHBOARD_RUNTIME.get("host") or "127.0.0.1"), os.environ.get("TRADING_AGENT_DASHBOARD_TOKEN") if DASHBOARD_RUNTIME.get("token_required") else None),
+        "freshness": {
+            "event_bus": freshness(MEMORY_DIR / "event_bus_health_latest.json", 600),
+            "features": features.get("freshness"),
+            "scoring": freshness(MEMORY_DIR / "real_scoring_board_latest.json", 900),
+            "memory": freshness(MEMORY_DIR / "memory_consolidation_latest.json", 3600),
+            "skills": freshness(MEMORY_DIR / "skill_forge_latest.json", 3600),
+        },
+        "glossary": {
+            "PF": "Profit Factor sau fee/funding/slippage khi co du lieu.",
+            "DD": "Drawdown, muc sut giam tu dinh equity.",
+            "expectancy": "Ky vong loi nhuan trung binh moi lenh sau chi phi.",
+            "liquidation": "Bi thanh ly futures khi margin khong du.",
+            "uncertainty": "Do bat dinh; LCB/CI thap thi khong duoc xem la ready.",
+            "source trust": "Diem tin cay nguon du lieu dau vao.",
+        },
+        "chart_contract": scoring.get("chart_contract") or {},
+    }
+
+def sanitize_dashboard_payload(payload: dict) -> dict:
+    sanitized = prepare_llm_egress(payload, "dashboard_status", allow_internal_strategy=True)["payload"]
+    sanitized = sanitized if isinstance(sanitized, dict) else payload
+    return mask_dashboard_live_surfaces(sanitized)
+
+def refresh_dashboard_payload_size(payload: dict, budget_bytes: int) -> int:
+    payload.setdefault("dashboard_contract", {})
+    payload["dashboard_contract"]["payload_budget_bytes"] = budget_bytes
+    size = 0
+    for _ in range(4):
+        size = payload_size_bytes(payload)
+        if payload["dashboard_contract"].get("estimated_payload_bytes") == size:
+            break
+        payload["dashboard_contract"]["estimated_payload_bytes"] = size
+    return payload_size_bytes(payload)
+
+def enforce_dashboard_payload_budget(payload: dict, budget_bytes: int = DASHBOARD_PAYLOAD_BUDGET_BYTES) -> dict:
+    payload.setdefault("dashboard_contract", {})
+    size = refresh_dashboard_payload_size(payload, budget_bytes)
+    if size <= budget_bytes:
+        return payload
+    trimmed = dict(payload)
+    trimmed["paper"] = {**(trimmed.get("paper") or {}), "latest_events": (trimmed.get("paper") or {}).get("latest_events", [])[-8:]}
+    if isinstance(trimmed.get("paper_report"), dict):
+        trimmed["paper_report"] = {
+            **trimmed["paper_report"],
+            "recent_closes": trimmed["paper_report"].get("recent_closes", [])[-16:],
+            "curve": trimmed["paper_report"].get("curve", [])[-80:],
+        }
+    if isinstance(trimmed.get("phase_b_learning"), dict):
+        trimmed["phase_b_learning"] = {
+            **trimmed["phase_b_learning"],
+            "recent_reviews": trimmed["phase_b_learning"].get("recent_reviews", [])[-4:],
+            "recent_replays": trimmed["phase_b_learning"].get("recent_replays", [])[-4:],
+        }
+    trimmed["dashboard_contract"]["budget_trimmed"] = True
+    refresh_dashboard_payload_size(trimmed, budget_bytes)
+    if trimmed["dashboard_contract"]["estimated_payload_bytes"] > budget_bytes:
+        trimmed["ops"] = {
+            "promotion": (trimmed.get("ops") or {}).get("promotion", {}),
+            "experiments": (trimmed.get("ops") or {}).get("experiments", {}),
+            "queue": (trimmed.get("ops") or {}).get("queue", {}),
+        }
+        trimmed["dashboard_contract"]["budget_trimmed_hard"] = True
+        refresh_dashboard_payload_size(trimmed, budget_bytes)
+    if trimmed["dashboard_contract"]["estimated_payload_bytes"] > budget_bytes:
+        if isinstance(trimmed.get("paper"), dict):
+            trimmed["paper"]["latest_events"] = []
+        if isinstance(trimmed.get("paper_report"), dict):
+            trimmed["paper_report"]["recent_closes"] = []
+            trimmed["paper_report"]["curve"] = []
+        if isinstance(trimmed.get("phase_b_learning"), dict):
+            trimmed["phase_b_learning"]["recent_reviews"] = []
+            trimmed["phase_b_learning"]["recent_replays"] = []
+        trimmed["dashboard_contract"]["budget_trimmed_series"] = True
+        refresh_dashboard_payload_size(trimmed, budget_bytes)
+    if trimmed["dashboard_contract"]["estimated_payload_bytes"] > budget_bytes:
+        nc = trimmed.get("neurocore") if isinstance(trimmed.get("neurocore"), dict) else {}
+        minimal_neurocore = {
+            "schema_version": nc.get("schema_version"),
+            "snapshot_id": nc.get("snapshot_id"),
+            "build_id": nc.get("build_id"),
+            "as_of": nc.get("as_of"),
+            "state": nc.get("state"),
+            "disclaimer": nc.get("disclaimer"),
+            "paper_only": nc.get("paper_only", True),
+            "live_eligible": False,
+            "top_blockers": (nc.get("top_blockers") if isinstance(nc.get("top_blockers"), list) else [])[:6],
+        }
+        keep = {
+            "now": trimmed.get("now"),
+            "overview": trimmed.get("overview"),
+            "process": trimmed.get("process"),
+            "paper": trimmed.get("paper"),
+            "paper_report": trimmed.get("paper_report"),
+            "neurocore": minimal_neurocore,
+            "dashboard_contract": trimmed.get("dashboard_contract"),
+        }
+        keep["dashboard_contract"]["budget_trimmed_minimal"] = True
+        refresh_dashboard_payload_size(keep, budget_bytes)
+        if keep["dashboard_contract"]["estimated_payload_bytes"] > budget_bytes:
+            keep = {
+                "now": trimmed.get("now"),
+                "overview": trimmed.get("overview"),
+                "neurocore": minimal_neurocore,
+                "dashboard_contract": trimmed.get("dashboard_contract"),
+            }
+            keep["dashboard_contract"]["budget_trimmed_emergency"] = True
+            refresh_dashboard_payload_size(keep, budget_bytes)
+        if keep["dashboard_contract"]["estimated_payload_bytes"] > budget_bytes:
+            keep = {
+                "now": trimmed.get("now"),
+                "neurocore": minimal_neurocore,
+                "dashboard_contract": {
+                    "build_id": DASHBOARD_BUILD_ID,
+                    "payload_budget_bytes": budget_bytes,
+                    "paper_only_disclaimer": PAPER_ONLY_DISCLAIMER_VI,
+                    "budget_trimmed_emergency": True,
+                    "budget_trimmed_floor": True,
+                },
+            }
+            refresh_dashboard_payload_size(keep, budget_bytes)
+        if keep["dashboard_contract"]["estimated_payload_bytes"] > budget_bytes:
+            keep = {
+                "now": trimmed.get("now"),
+                "dashboard_contract": {
+                    "build_id": DASHBOARD_BUILD_ID,
+                    "payload_budget_bytes": budget_bytes,
+                    "paper_only_disclaimer": PAPER_ONLY_DISCLAIMER_VI,
+                    "budget_trimmed_emergency": True,
+                    "budget_trimmed_floor": True,
+                    "budget_trimmed_minimum": True,
+                },
+            }
+            refresh_dashboard_payload_size(keep, budget_bytes)
+        return keep
+    return trimmed
 
 def load_dashboard_status() -> dict:
     bias = read_json(MEMORY_DIR / "execution_bias.json")
@@ -959,7 +2129,7 @@ def load_dashboard_status() -> dict:
     dream_latest = read_json(MEMORY_DIR / "dream_cycle_latest.json")
     belief_ledger = read_json(MEMORY_DIR / "belief_ledger.json")
     setup_library = read_json(MEMORY_DIR / "setup_skills.json")
-    live_readiness = read_json(MEMORY_DIR / "live_readiness_latest.json")
+    live_readiness = compact_live_readiness(read_json(MEMORY_DIR / "live_readiness_latest.json"))
     news_latest = read_json(MEMORY_DIR / "news_latest.json")
     shadow_performance = read_json(MEMORY_DIR / "shadow_performance_latest.json")
     self_improvement = read_json(MEMORY_DIR / "self_improvement_latest.json")
@@ -969,9 +2139,11 @@ def load_dashboard_status() -> dict:
     curiosity_focus = read_json(MEMORY_DIR / "curiosity_focus_latest.json")
     reasoning_trace = read_json(MEMORY_DIR / "reasoning_trace_latest.json")
     paper_account = read_json(STATE_DIR / "paper_account.json")
-    scalp_rows = read_jsonl_tail(LOG_FILES["scalp_autotrader"], 500)
-    lifecycle_rows = read_jsonl_tail(LOG_FILES.get("paper_lifecycle", MEMORY_DIR / "paper_trades.jsonl"), 500)
-    paper_rows = [*scalp_rows, *lifecycle_rows]
+    paper_reset_ts = parse_ts(paper_account.get("created_at"))
+    scalp_rows = read_jsonl_since(LOG_FILES["scalp_autotrader"], paper_reset_ts)
+    lifecycle_rows = read_jsonl_since(LOG_FILES.get("paper_lifecycle", MEMORY_DIR / "paper_trades.jsonl"), paper_reset_ts)
+    paper_rows = filter_paper_rows_since_account_reset([*scalp_rows, *lifecycle_rows], paper_account)
+    current_paper_rows = paper_rows
     heartbeats = [heartbeat_status(name, path) for name, path in HEARTBEAT_FILES.items()]
     log_health = [
         {"name": name, "path": str(path), "exists": path.exists(), "age_seconds": file_mtime_age(path), "age": human_age(file_mtime_age(path))}
@@ -987,7 +2159,9 @@ def load_dashboard_status() -> dict:
     paper_report = summarize_paper_report(paper_rows, paper_account)
     process = process_status()
     process["paper_runtime"] = paper_runtime_status(heartbeats)
-    return {
+    shadow_compact = compact_shadow_performance(shadow_performance)
+    ops_compact = compact_ops()
+    payload = {
         "now": utc_now(),
         "overview": {
             "risk_posture": bias.get("risk_posture", "unknown"),
@@ -999,7 +2173,7 @@ def load_dashboard_status() -> dict:
             "regime": (bias.get("market_learning") or {}).get("regime") or market_state.get("primary_regime"),
             "tags": (bias.get("market_learning") or {}).get("tags") or market_state.get("tags", []),
             "hot": market_latest.get("hot", [{}])[0].get("symbol") if isinstance(market_latest.get("hot"), list) and market_latest.get("hot") else None,
-            "live_mode": live_readiness.get("mode") or live_readiness.get("status") or "paper",
+            "live_mode": "paper",
         },
         "bias": bias,
         "market_state": market_state,
@@ -1010,27 +2184,43 @@ def load_dashboard_status() -> dict:
             "paper_candidates": (dream_latest.get("bias_patch") or {}).get("paper_candidates", []),
             "blocks": dream_cycle.get("blocks", [])[:12],
         },
-        "paper": {**summarize_paper(paper_rows), "account": paper_account, "account_summary": paper_account_summary},
+        "paper": {**summarize_paper(current_paper_rows), "account": paper_account, "account_summary": paper_account_summary},
         "paper_report": paper_report,
         "process": process,
         "market_latest": compact_market_latest(market_latest),
         "beliefs": compact_beliefs(belief_ledger),
         "setups": compact_setups(setup_library),
         "news": compact_news(news_latest),
-        "shadow_performance": compact_shadow_performance(shadow_performance),
+        "shadow_performance": shadow_compact,
         "self_improvement": compact_self_improvement(self_improvement),
         "daily_exam": compact_daily_exam(daily_exam),
         "llm_reasoning": compact_llm_reasoning(llm_reasoning),
-        "ops": compact_ops(),
+        "ops": ops_compact,
+        "neurocore": build_neurocore_dashboard(
+            heartbeats=heartbeats,
+            paper_report=paper_report,
+            shadow_performance=shadow_compact,
+            ops=ops_compact,
+            process=process,
+        ),
         "cognitive": compact_cognitive(cognitive_state),
         "curiosity": curiosity_focus,
         "reasoning": compact_reasoning(reasoning_trace),
-        "phase_b_learning": load_phase_b_learning(),
+        "phase_b_learning": compact_phase_b_learning(load_phase_b_learning()),
         "live_readiness": live_readiness,
         "heartbeats": heartbeats,
         "live_monitors": live_monitor_status(),
         "logs": log_health,
     }
+    payload["dashboard_contract"] = {
+        "build_id": DASHBOARD_BUILD_ID,
+        "payload_budget_bytes": DASHBOARD_PAYLOAD_BUDGET_BYTES,
+        "estimated_payload_bytes": payload_size_bytes(payload),
+        "cache_control": "no-store",
+        "paper_only_disclaimer": PAPER_ONLY_DISCLAIMER_VI,
+    }
+    sanitized = sanitize_dashboard_payload(payload)
+    return enforce_dashboard_payload_budget(sanitized)
 
 
 HTML = r"""
@@ -1060,18 +2250,19 @@ button{font:inherit}.mono,.metric,.value,.table .num{font-family:ui-monospace,SF
 .alertstrip{display:none}.tape{display:flex;gap:8px;overflow:auto;padding:1px 0 12px;scrollbar-width:thin}.tapeitem{min-width:152px;background:rgba(18,24,23,.84);border:1px solid var(--line);border-radius:var(--r);padding:9px 10px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.tapeitem b{display:block;color:var(--text);font-size:12px}.tapeitem span{display:block;color:var(--muted);font-size:11px}.tapeitem.up{border-color:rgba(120,212,154,.22)}.tapeitem.down{border-color:rgba(225,115,105,.22)}.tapeitem.up span:first-of-type{color:var(--green)}.tapeitem.down span:first-of-type{color:var(--red)}
 .kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 12px}.kpi{min-width:0;background:linear-gradient(180deg,rgba(25,33,31,.95),rgba(18,24,23,.95));border:1px solid var(--line);border-radius:var(--r);padding:13px 12px;min-height:90px;box-shadow:var(--shadow2);overflow:hidden}.label{color:var(--muted);font-size:12px;font-weight:620}.value{font-size:22px;font-weight:780;margin-top:8px;white-space:nowrap;letter-spacing:0;overflow:hidden;text-overflow:ellipsis}.hint{color:var(--muted);font-size:12px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oktxt{color:var(--green)}.warntxt{color:var(--amber)}.badtxt{color:var(--red)}
 .viewgrid{display:grid;grid-template-columns:1.18fr .82fr;gap:12px}.viewwide{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.view.subtabbed{display:block}.subtabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px;padding:6px;background:rgba(16,22,20,.86);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow2)}.subtabs button{min-height:36px;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--soft);padding:0 10px;cursor:pointer;font-size:12.5px;transition:background .18s,border-color .18s,color .18s}.subtabs button:hover{background:rgba(255,255,255,.045);border-color:var(--line2)}.subtabs button.active{background:rgba(99,199,165,.18);border-color:rgba(99,199,165,.42);color:var(--text)}.subtabs button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.subpane{display:none}.subpane.active{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;min-width:0}.subpane .panel.wide{grid-column:1/-1}.panel{background:rgba(18,24,23,.88);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow2);min-width:0;overflow:hidden}.panel.wide{grid-column:1/-1}.panel h3{margin:0;padding:12px 13px;border-bottom:1px solid var(--line);font-size:13px;font-weight:720;color:var(--text);background:rgba(25,33,31,.78)}.body{padding:12px 13px}.kv{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.055);font-size:12.5px}.kv:last-child{border-bottom:0}.kv span{color:var(--muted)}.kv b{font-weight:650;text-align:right;max-width:48ch;overflow:hidden;text-overflow:ellipsis}.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{border:1px solid var(--line2);background:rgba(25,33,31,.88);border-radius:6px;padding:4px 7px;color:#d7e1de;font-size:12px}.chip.warn{border-color:rgba(212,170,84,.46);color:#efce82}.chip.bad{border-color:rgba(225,115,105,.46);color:#efa8a2}.tablewrap{overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{text-align:left;border-bottom:1px solid rgba(255,255,255,.065);padding:8px 10px;font-size:12px;vertical-align:top}.table th{color:var(--muted);font-weight:680;white-space:nowrap;background:rgba(13,18,17,.72);position:sticky;top:0}.table td{color:#d8e1df}.table th.num,.table td.num{text-align:right;white-space:nowrap}.table th.center,.table td.center{text-align:center}.table tr:hover td{background:rgba(99,199,165,.055)}.meter{height:7px;background:#26322f;border-radius:999px;overflow:hidden}.bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));width:0}.reportgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.reportcard{border:1px solid var(--line);border-radius:7px;background:rgba(13,18,17,.72);padding:10px 11px;min-height:76px}.reportcard span{display:block;color:var(--muted);font-size:11px}.reportcard b{display:block;margin-top:6px;font-size:18px}.chartbox{height:280px;border:1px solid var(--line);border-radius:7px;background:linear-gradient(180deg,rgba(13,18,17,.72),rgba(9,13,12,.86));padding:8px;overflow:hidden}.chartbox svg{width:100%;height:100%;display:block}.chartline{fill:none;stroke:var(--accent);stroke-width:2.4;vector-effect:non-scaling-stroke}.chartarea{fill:rgba(99,199,165,.1)}.chartaxis{stroke:rgba(189,210,203,.18);stroke-width:1}.chartzero{stroke:rgba(212,170,84,.45);stroke-width:1;stroke-dasharray:5 5}.charttext{fill:var(--muted);font:11px ui-monospace,SFMono-Regular,Consolas,monospace}.tradebars{height:120px;display:flex;align-items:flex-end;gap:4px;border:1px solid var(--line);border-radius:7px;background:rgba(9,13,12,.72);padding:8px;overflow:hidden}.tradebar{flex:1;min-width:4px;border-radius:3px 3px 0 0;background:var(--muted);opacity:.9}.tradebar.win{background:var(--green)}.tradebar.loss{background:var(--red)}.log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;background:#090d0c;border:1px solid var(--line);border-radius:7px;padding:11px;max-height:560px;overflow:auto;color:#cbd6d3}.timeline{display:grid;gap:7px}.event{border-left:2px solid var(--accent);padding:3px 0 7px 10px;border-bottom:1px solid rgba(255,255,255,.05)}.event b{display:block}.hidden{display:none!important}
-.reporthero{display:grid;grid-template-columns:minmax(260px,.95fr) minmax(0,1.35fr);gap:14px;align-items:stretch}.reportheadline{border:1px solid rgba(99,199,165,.24);border-radius:8px;background:linear-gradient(180deg,rgba(21,33,29,.9),rgba(12,17,16,.94));padding:15px;min-width:0}.reportheadline span{display:block;color:var(--muted);font-size:12px}.reportheadline b{display:block;margin-top:6px;font-size:34px;line-height:1;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:0}.reportheadline b.good{color:var(--green)}.reportheadline b.bad{color:var(--red)}.reportheadline b.warn{color:var(--amber)}.reportstatus{display:inline-flex;align-items:center;gap:7px;margin-top:12px;border:1px solid var(--line2);border-radius:999px;padding:6px 9px;color:var(--soft);background:rgba(255,255,255,.035);font-size:12px}.reportstatus.ok{border-color:rgba(120,212,154,.38);color:var(--green)}.reportstatus.warn{border-color:rgba(212,170,84,.48);color:var(--amber)}.reportstatus.bad{border-color:rgba(225,115,105,.5);color:var(--red)}.reportmatrix{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.reportmetric{min-width:0;border:1px solid rgba(189,210,203,.12);border-radius:8px;background:rgba(13,18,17,.72);padding:10px 11px;overflow:hidden}.reportmetric span{display:block;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reportmetric b{display:block;margin-top:5px;font-size:18px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reportmetric small{display:block;margin-top:4px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reportmetric.good b{color:var(--green)}.reportmetric.bad b{color:var(--red)}.reportmetric.warn b{color:var(--amber)}.chartbox{height:340px;padding:10px;background:radial-gradient(circle at 78% 12%,rgba(99,199,165,.12),transparent 34%),linear-gradient(180deg,rgba(12,18,17,.94),rgba(7,10,10,.96));border-color:rgba(189,210,203,.16)}.chartbox.compact{height:190px}.chartline{stroke-width:2.8}.chartarea{fill:url(#equityArea)}.chartgrid{stroke:rgba(189,210,203,.105);stroke-width:1}.chartaxis{stroke:rgba(189,210,203,.2)}.chartzero{stroke:rgba(212,170,84,.62);stroke-dasharray:4 5}.chartdd{fill:rgba(225,115,105,.08)}.chartpoint{fill:var(--bg);stroke:var(--accent);stroke-width:2}.chartpoint.bad{stroke:var(--red)}.chartpoint.warn{stroke:var(--amber)}.charthit{fill:transparent;stroke:transparent;cursor:crosshair;pointer-events:all}.charthit:hover+.chartpoint,.chartpoint:hover{stroke-width:3}.charttext{fill:#9fb0aa;font:11px ui-monospace,SFMono-Regular,Consolas,monospace}.chartlabel{fill:#d9e5e1;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.reportlegend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;color:var(--muted);font-size:11.5px}.legenditem::before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;background:var(--accent)}.legenditem.warn::before{background:var(--amber)}.legenditem.bad::before{background:var(--red)}.tradebars{position:relative;height:170px;display:flex;align-items:stretch;gap:3px;padding:12px 9px;border-color:rgba(189,210,203,.16);background:linear-gradient(180deg,rgba(9,13,12,.84),rgba(8,11,11,.96))}.tradebars .zeroline{position:absolute;left:8px;right:8px;top:50%;height:1px;background:rgba(212,170,84,.45)}.tradebarwrap{position:relative;flex:1;min-width:5px;cursor:crosshair}.tradebarwrap:hover .tradebar,.distbar:hover i{filter:brightness(1.18);box-shadow:0 0 0 1px rgba(238,245,242,.28)}.tradebar{position:absolute;left:0;right:0;min-height:3px;border-radius:4px;background:var(--muted);opacity:.95}.tradebar.win{bottom:50%;background:linear-gradient(180deg,#98e7b2,var(--green))}.tradebar.loss{top:50%;background:linear-gradient(180deg,var(--red),#a9433d)}.distbars{height:190px;display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:5px;align-items:end;border:1px solid rgba(189,210,203,.16);border-radius:7px;background:rgba(9,13,12,.78);padding:10px}.distbar{display:grid;grid-template-rows:1fr auto;gap:5px;min-width:0;height:100%;align-items:end;cursor:crosshair}.distbar i{display:block;border-radius:4px 4px 0 0;background:linear-gradient(180deg,var(--accent),rgba(99,199,165,.42));min-height:3px}.distbar.loss i{background:linear-gradient(180deg,var(--red),rgba(225,115,105,.36))}.distbar span{font-size:9.5px;color:var(--muted);text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.charttip{position:fixed;z-index:9999;max-width:min(320px,calc(100vw - 24px));pointer-events:none;opacity:0;transform:translate3d(-9999px,-9999px,0);transition:opacity .08s ease;background:rgba(8,12,11,.96);border:1px solid rgba(99,199,165,.45);border-radius:7px;box-shadow:0 12px 34px rgba(0,0,0,.42);padding:8px 9px;color:var(--text);font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-line}.charttip.visible{opacity:1}.minirow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.splitbody{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}.callout{border-left:3px solid var(--accent);background:rgba(99,199,165,.06);border-radius:7px;padding:10px 11px;color:var(--soft);font-size:12px}.callout.bad{border-left-color:var(--red);background:rgba(225,115,105,.07)}
+.reporthero{display:grid;grid-template-columns:minmax(260px,.95fr) minmax(0,1.35fr);gap:14px;align-items:stretch}.reportheadline{border:1px solid rgba(99,199,165,.24);border-radius:8px;background:linear-gradient(180deg,rgba(21,33,29,.9),rgba(12,17,16,.94));padding:15px;min-width:0}.reportheadline span{display:block;color:var(--muted);font-size:12px}.reportheadline b{display:block;margin-top:6px;font-size:34px;line-height:1;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:0}.reportheadline b.good{color:var(--green)}.reportheadline b.bad{color:var(--red)}.reportheadline b.warn{color:var(--amber)}.reportstatus{display:inline-flex;align-items:center;gap:7px;margin-top:12px;border:1px solid var(--line2);border-radius:999px;padding:6px 9px;color:var(--soft);background:rgba(255,255,255,.035);font-size:12px}.reportstatus.ok{border-color:rgba(120,212,154,.38);color:var(--green)}.reportstatus.warn{border-color:rgba(212,170,84,.48);color:var(--amber)}.reportstatus.bad{border-color:rgba(225,115,105,.5);color:var(--red)}.reportmatrix{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.reportmetric{min-width:0;border:1px solid rgba(189,210,203,.12);border-radius:8px;background:rgba(13,18,17,.72);padding:10px 11px;overflow:hidden}.reportmetric span{display:block;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reportmetric b{display:block;margin-top:5px;font-size:18px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reportmetric small{display:block;margin-top:4px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reportmetric.good b{color:var(--green)}.reportmetric.bad b{color:var(--red)}.reportmetric.warn b{color:var(--amber)}.chartbox{height:340px;padding:10px;background:radial-gradient(circle at 78% 12%,rgba(99,199,165,.12),transparent 34%),linear-gradient(180deg,rgba(12,18,17,.94),rgba(7,10,10,.96));border-color:rgba(189,210,203,.16)}.chartbox.compact{height:190px}.chartline{stroke-width:2.8}.chartarea{fill:url(#equityArea)}.chartgrid{stroke:rgba(189,210,203,.105);stroke-width:1}.chartaxis{stroke:rgba(189,210,203,.2)}.chartzero{stroke:rgba(212,170,84,.62);stroke-dasharray:4 5}.chartdd{fill:rgba(225,115,105,.08)}.chartpoint{fill:var(--bg);stroke:var(--accent);stroke-width:2}.chartpoint.bad{stroke:var(--red)}.chartpoint.warn{stroke:var(--amber)}.charthit{fill:transparent;stroke:transparent;cursor:crosshair;pointer-events:all}.charthit:hover+.chartpoint,.chartpoint:hover{stroke-width:3}.charttext{fill:#9fb0aa;font:11px ui-monospace,SFMono-Regular,Consolas,monospace}.chartlabel{fill:#d9e5e1;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.reportlegend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;color:var(--muted);font-size:11.5px}.legenditem::before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;background:var(--accent)}.legenditem.warn::before{background:var(--amber)}.legenditem.bad::before{background:var(--red)}.tradebars{position:relative;height:170px;display:flex;align-items:stretch;gap:3px;padding:12px 9px;border-color:rgba(189,210,203,.16);background:linear-gradient(180deg,rgba(9,13,12,.84),rgba(8,11,11,.96))}.tradebars .zeroline{position:absolute;left:8px;right:8px;top:50%;height:1px;background:rgba(212,170,84,.45)}.tradebarwrap{position:relative;flex:1;min-width:5px;cursor:crosshair}.tradebarwrap:hover .tradebar,.distbar:hover i{filter:brightness(1.18);box-shadow:0 0 0 1px rgba(238,245,242,.28)}.tradebar{position:absolute;left:0;right:0;min-height:3px;border-radius:4px;background:var(--muted);opacity:.95}.tradebar.win{bottom:50%;background:linear-gradient(180deg,#98e7b2,var(--green))}.tradebar.loss{top:50%;background:linear-gradient(180deg,var(--red),#a9433d)}.distbars{height:190px;display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:5px;align-items:end;border:1px solid rgba(189,210,203,.16);border-radius:7px;background:rgba(9,13,12,.78);padding:10px}.distbar{display:grid;grid-template-rows:1fr auto;gap:5px;min-width:0;height:100%;align-items:end;cursor:crosshair}.distbar i{display:block;border-radius:4px 4px 0 0;background:linear-gradient(180deg,var(--accent),rgba(99,199,165,.42));min-height:3px}.distbar.loss i{background:linear-gradient(180deg,var(--red),rgba(225,115,105,.36))}.distbar span{font-size:9.5px;color:var(--muted);text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.charttip{position:fixed;z-index:9999;max-width:min(320px,calc(100vw - 24px));pointer-events:none;opacity:0;transform:translate3d(-9999px,-9999px,0);transition:opacity .08s ease;background:rgba(8,12,11,.96);border:1px solid rgba(99,199,165,.45);border-radius:7px;box-shadow:0 12px 34px rgba(0,0,0,.42);padding:8px 9px;color:var(--text);font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-line}.charttip.visible{opacity:1}.minirow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.splitbody{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}.callout{border-left:3px solid var(--accent);background:rgba(99,199,165,.06);border-radius:7px;padding:10px 11px;color:var(--soft);font-size:12px}.callout.bad{border-left-color:var(--red);background:rgba(225,115,105,.07)}.topoflow{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:8px}.toponode{position:relative;border:1px solid var(--line);border-radius:7px;background:rgba(13,18,17,.72);padding:10px;min-height:86px}.toponode::after{content:"";position:absolute;right:-8px;top:50%;width:8px;border-top:1px solid rgba(99,199,165,.42)}.toponode:last-child::after{display:none}.toponode b{display:block;font-size:12px}.toponode span{display:block;margin-top:5px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toponode.ok{border-color:rgba(120,212,154,.26)}.toponode.degraded,.toponode.critical{border-color:rgba(225,115,105,.42)}.contractnote{border:1px solid rgba(212,170,84,.34);border-radius:7px;background:rgba(69,54,27,.18);padding:10px 11px;color:#efdba4;font-size:12px}.blockerlist{display:grid;gap:7px}.blocker{border-left:3px solid var(--amber);background:rgba(212,170,84,.08);border-radius:7px;padding:8px 10px}.blocker.high{border-left-color:var(--red);background:rgba(225,115,105,.08)}.blocker b{display:block}.blocker span{display:block;color:var(--muted);font-size:12px;margin-top:3px}
 .charthit-band{fill:transparent;stroke:transparent;cursor:crosshair;pointer-events:all}.charthit-band:hover{fill:rgba(99,199,165,.035)}.chartprobe .chartcursor{opacity:0;stroke:rgba(238,245,242,.62);stroke-width:1;stroke-dasharray:4 4;vector-effect:non-scaling-stroke}.chartprobe:hover .chartcursor,.chartprobe.probe-active .chartcursor{opacity:1}.barcursor{position:absolute;top:0;bottom:0;left:50%;width:1px;background:rgba(238,245,242,.55);opacity:0;transform:translateX(-50%);pointer-events:none}.tradebarwrap:hover .barcursor,.tradebarwrap.probe-active .barcursor{opacity:1}.distbar{position:relative}.distbar::before{content:"";position:absolute;top:0;bottom:20px;left:50%;width:1px;background:rgba(238,245,242,.5);opacity:0;transform:translateX(-50%);pointer-events:none}.distbar:hover::before,.distbar.probe-active::before{opacity:1}.charttime{fill:#9fb0aa;font:10.5px ui-monospace,SFMono-Regular,Consolas,monospace}
+.distbar.neutral i{background:linear-gradient(180deg,#aeb8b4,rgba(174,184,180,.38))}.distbar.warn i{background:linear-gradient(180deg,var(--amber),rgba(212,170,84,.36))}
 @media(max-width:1180px){.layout{display:block}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.reportgrid{grid-template-columns:repeat(2,minmax(0,1fr))}.reporthero,.splitbody{grid-template-columns:1fr}.reportmatrix{grid-template-columns:repeat(2,minmax(0,1fr))}.viewgrid,.viewwide,.subpane.active{grid-template-columns:1fr}.rail{position:relative;top:0;min-height:0;display:grid;grid-template-rows:auto auto;grid-template-columns:1fr;margin-bottom:14px}.railhead{display:none}.nav{grid-template-columns:repeat(3,minmax(0,1fr))}.nav button{text-align:center}.nav button.active{box-shadow:inset 0 0 0 1px rgba(99,199,165,.12)}.railfoot{display:flex;gap:12px;align-items:center;justify-content:space-between}.hero{display:block}.actions{margin-top:12px}.stamp{text-align:left}}
-@media(max-width:620px){.topinner{grid-template-columns:minmax(0,1fr);padding:12px 14px}.statusline{display:grid;grid-template-columns:minmax(0,1fr);justify-content:stretch}.pill{min-width:0;overflow:hidden;text-overflow:ellipsis}.layout{padding:12px 14px 22px}.kpis,.alertstrip,.reportgrid,.reportmatrix,.minirow{grid-template-columns:1fr}.nav{grid-template-columns:repeat(2,minmax(0,1fr))}.railfoot{display:block;white-space:normal}.hero{grid-template-columns:minmax(0,1fr)}.hero h2{font-size:23px}.value{font-size:20px}.table th,.table td{font-size:12px}.actions{flex-wrap:wrap}.chartbox{height:260px}.chartbox.compact{height:180px}.reportheadline b{font-size:28px}.distbars{grid-template-columns:repeat(3,minmax(0,1fr));height:auto}.distbar{height:112px}}
+@media(max-width:620px){.topinner{grid-template-columns:minmax(0,1fr);padding:12px 14px}.statusline{display:grid;grid-template-columns:minmax(0,1fr);justify-content:stretch}.pill{min-width:0;overflow:hidden;text-overflow:ellipsis}.layout{padding:12px 14px 22px}.kpis,.alertstrip,.reportgrid,.reportmatrix,.minirow{grid-template-columns:1fr}.nav{grid-template-columns:repeat(2,minmax(0,1fr))}.railfoot{display:block;white-space:normal}.hero{grid-template-columns:minmax(0,1fr)}.hero h2{font-size:23px}.value{font-size:20px}.table th,.table td{font-size:12px}.actions{flex-wrap:wrap}.chartbox{height:260px}.chartbox.compact{height:180px}.reportheadline b{font-size:28px}.distbars{grid-template-columns:repeat(3,minmax(0,1fr));height:auto}.distbar{height:112px}.topoflow{grid-template-columns:1fr}.toponode::after{display:none}}
 </style>
 </head>
 <body>
 <div class="app">
   <header class="topbar"><div class="topinner"><div class="brand"><h1>Bảng điều khiển Trading Agent</h1><p>Theo dõi Paper, Shadow, Risk gate, thị trường, tin tức và learning loop.</p></div><div class="statusline" id="statusline"></div></div></header>
   <div class="layout">
-    <aside class="rail"><div class="railhead"><span>Điều hướng</span><b>Khu vực theo dõi</b></div><nav class="nav"><button class="active" data-view="overview">Tổng quan</button><button data-view="report">Báo cáo</button><button data-view="agents">Agent</button><button data-view="market">Thị trường</button><button data-view="news">Tin tức</button><button data-view="learning">Học</button><button data-view="logs">Logs</button></nav><div class="railfoot"><div id="side-health"><span class="dot warn"></span>đang tải</div><div id="side-clock" class="mono" style="margin-top:8px"></div></div></aside>
-    <main class="main"><section class="hero"><div><h2>Cockpit Trading Agent</h2><div class="sub">Một màn hình gọn để đọc Paper simulation, Risk gate, market tape, news risk và learning loop.</div></div><div class="actions"><button class="btn" id="refresh">Làm mới</button><button class="btn" id="pause">Tạm dừng</button></div></section><div class="stamp" id="stamp"></div><section class="alertstrip" id="alertstrip"></section><section class="tape" id="market-tape"></section><section class="kpis" id="kpis"></section><section id="view-overview" class="view viewgrid"></section><section id="view-report" class="view viewwide hidden"></section><section id="view-agents" class="view viewwide hidden"></section><section id="view-market" class="view viewwide hidden"></section><section id="view-news" class="view viewwide hidden"></section><section id="view-learning" class="view viewwide hidden"></section><section id="view-logs" class="view hidden"></section></main>
+    <aside class="rail"><div class="railhead"><span>Điều hướng</span><b>Khu vực theo dõi</b></div><nav class="nav"><button class="active" data-view="overview">Tổng quan</button><button data-view="neurocore">NeuroCore</button><button data-view="report">Báo cáo</button><button data-view="agents">Agent</button><button data-view="market">Thị trường</button><button data-view="news">Tin tức</button><button data-view="learning">Học</button><button data-view="logs">Logs</button></nav><div class="railfoot"><div id="side-health"><span class="dot warn"></span>đang tải</div><div id="side-clock" class="mono" style="margin-top:8px"></div></div></aside>
+    <main class="main"><section class="hero"><div><h2>Cockpit Trading Agent</h2><div class="sub">Một màn hình gọn để đọc Paper simulation, Risk gate, NeuroCore, market tape, news risk và learning loop.</div></div><div class="actions"><button class="btn" id="refresh">Làm mới</button><button class="btn" id="pause">Tạm dừng</button></div></section><div class="stamp" id="stamp"></div><section class="alertstrip" id="alertstrip"></section><section class="tape" id="market-tape"></section><section class="kpis" id="kpis"></section><section id="view-overview" class="view viewgrid"></section><section id="view-neurocore" class="view viewwide hidden"></section><section id="view-report" class="view viewwide hidden"></section><section id="view-agents" class="view viewwide hidden"></section><section id="view-market" class="view viewwide hidden"></section><section id="view-news" class="view viewwide hidden"></section><section id="view-learning" class="view viewwide hidden"></section><section id="view-logs" class="view hidden"></section></main>
   </div>
 </div>
 <script>
@@ -1098,24 +2289,31 @@ function pill(label,value){return `<span class="pill ${stateClass(value)}">${esc
 function chipList(items, cls=''){return (items||[]).map(x=>`<span class="chip ${cls}">${esc(txt(x))}</span>`).join('')||'<span class="hint">không có</span>'}
 function panel(title, body, cls=''){return `<article class="panel ${cls}"><h3>${esc(title)}</h3><div class="body">${body}</div></article>`}
 function kv(obj){return Object.entries(obj).map(([k,v])=>`<div class="kv"><span>${esc(k)}</span><b>${esc(txt(v))}</b></div>`).join('')}
-const numericHeaders=new Set(['PID','Tuổi dữ liệu','Cập nhật cách đây','Số tin','Giá','24h','Vol quote','Hot','Funding','Risk','Bull','Bear','Ưu tiên','Confidence','Score','Lệnh','WR','Expectancy','Đã đóng','Entry','Mark','Margin','Notional','Lev','SL','TP','PnL tạm','Tuổi','Net','PF','Avg notional','Fee','R','Avg R','Win','Loss','Count']);
+const numericHeaders=new Set(['PID','Tuổi dữ liệu','Cập nhật cách đây','Số tin','Giá','24h','Vol quote','Hot','Funding','Risk','Bull','Bear','Ưu tiên','Confidence','Score','Lệnh','WR','Expectancy','Đã đóng','Entry','Mark','Margin','Notional','Lev','SL','TP','PnL tạm','Tuổi','Net','PF','Avg notional','Fee','R','Avg R','Win','Loss','Count','N','Effective N','Lag','Seq','DLQ','Throughput']);
 function table(headers, rows){const head=headers.map(h=>{const label=typeof h==='string'?h:h.label;const cls=typeof h==='string'?(numericHeaders.has(h)?'num':''):(h.cls||'');return `<th class="${esc(cls)}">${esc(label)}</th>`}).join('');return `<div class="tablewrap"><table class="table"><thead><tr>${head}</tr></thead><tbody>${rows.length?rows.join(''):`<tr><td colspan="${headers.length}">Chưa có dữ liệu</td></tr>`}</tbody></table></div>`}
 function td(v, cls=''){return `<td class="${cls}">${esc(txt(v))}</td>`}
 const SUBTAB_STATE={};
-function mountSubtabs(viewId, groups){const view=document.getElementById(viewId);if(!view)return;const panels=Array.from(view.children).filter(el=>el.classList&&el.classList.contains('panel'));if(!panels.length)return;view.classList.add('subtabbed');const tabs=document.createElement('div');tabs.className='subtabs';tabs.setAttribute('role','tablist');const panes=[];let index=0;groups.forEach((g,i)=>{const pane=document.createElement('section');pane.className='subpane';pane.dataset.subpane=g.id;const count=g.count==='rest'?panels.length-index:Number(g.count||0);for(let n=0;n<count&&index<panels.length;n++,index++)pane.appendChild(panels[index]);panes.push(pane);const btn=document.createElement('button');btn.type='button';btn.textContent=g.label;btn.dataset.subtab=g.id;btn.setAttribute('role','tab');btn.onclick=()=>activateSubtab(viewId,g.id);tabs.appendChild(btn)});if(index<panels.length&&panes.length){while(index<panels.length)panes[panes.length-1].appendChild(panels[index++])}view.prepend(tabs);panes.forEach(p=>view.appendChild(p));const params=new URLSearchParams(location.search);const queryKey=viewId.replace(/^view-/,'')+'Tab';const queryWanted=params.get(queryKey)||params.get('subtab');const wanted=queryWanted&&panes.some(p=>p.dataset.subpane===queryWanted)?queryWanted:SUBTAB_STATE[viewId]&&panes.some(p=>p.dataset.subpane===SUBTAB_STATE[viewId])?SUBTAB_STATE[viewId]:(groups[0]||{}).id;activateSubtab(viewId,wanted)}
-function activateSubtab(viewId,id){SUBTAB_STATE[viewId]=id;const view=document.getElementById(viewId);if(!view)return;view.querySelectorAll('.subtabs button').forEach(btn=>{const active=btn.dataset.subtab===id;btn.classList.toggle('active',active);btn.setAttribute('aria-selected',active?'true':'false')});view.querySelectorAll('.subpane').forEach(pane=>pane.classList.toggle('active',pane.dataset.subpane===id))}
+function mountSubtabs(viewId, groups){const view=document.getElementById(viewId);if(!view)return;const panels=Array.from(view.children).filter(el=>el.classList&&el.classList.contains('panel'));if(!panels.length)return;view.classList.add('subtabbed');const tabs=document.createElement('div');tabs.className='subtabs';tabs.setAttribute('role','tablist');tabs.setAttribute('aria-label','Tab nội bộ');const panes=[];let index=0;groups.forEach((g,i)=>{const pane=document.createElement('section');pane.className='subpane';pane.dataset.subpane=g.id;pane.id=`${viewId}-pane-${g.id}`;pane.setAttribute('role','tabpanel');pane.setAttribute('tabindex','0');const count=g.count==='rest'?panels.length-index:Number(g.count||0);for(let n=0;n<count&&index<panels.length;n++,index++)pane.appendChild(panels[index]);panes.push(pane);const btn=document.createElement('button');btn.type='button';btn.textContent=g.label;btn.dataset.subtab=g.id;btn.id=`${viewId}-tab-${g.id}`;btn.setAttribute('role','tab');btn.setAttribute('aria-controls',pane.id);pane.setAttribute('aria-labelledby',btn.id);btn.onclick=()=>activateSubtab(viewId,g.id);btn.onkeydown=(e)=>handleSubtabKey(e,viewId);tabs.appendChild(btn)});if(index<panels.length&&panes.length){while(index<panels.length)panes[panes.length-1].appendChild(panels[index++])}view.prepend(tabs);panes.forEach(p=>view.appendChild(p));const params=new URLSearchParams(location.search);const queryKey=viewId.replace(/^view-/,'')+'Tab';const queryWanted=params.get(queryKey)||params.get('subtab');const wanted=queryWanted&&panes.some(p=>p.dataset.subpane===queryWanted)?queryWanted:SUBTAB_STATE[viewId]&&panes.some(p=>p.dataset.subpane===SUBTAB_STATE[viewId])?SUBTAB_STATE[viewId]:(groups[0]||{}).id;activateSubtab(viewId,wanted)}
+function handleSubtabKey(e,viewId){const keys=['ArrowLeft','ArrowRight','Home','End'];if(!keys.includes(e.key))return;const buttons=[...document.querySelectorAll(`#${viewId} .subtabs button`)];const current=buttons.indexOf(e.currentTarget);let next=current;if(e.key==='ArrowLeft')next=Math.max(0,current-1);if(e.key==='ArrowRight')next=Math.min(buttons.length-1,current+1);if(e.key==='Home')next=0;if(e.key==='End')next=buttons.length-1;e.preventDefault();buttons[next]?.focus();if(buttons[next])activateSubtab(viewId,buttons[next].dataset.subtab)}
+function activateSubtab(viewId,id){SUBTAB_STATE[viewId]=id;const view=document.getElementById(viewId);if(!view)return;view.querySelectorAll('.subtabs button').forEach(btn=>{const active=btn.dataset.subtab===id;btn.classList.toggle('active',active);btn.setAttribute('aria-selected',active?'true':'false');btn.setAttribute('tabindex',active?'0':'-1')});view.querySelectorAll('.subpane').forEach(pane=>{const active=pane.dataset.subpane===id;pane.classList.toggle('active',active);pane.hidden=!active})}
 function latestSignal(row){const s=row?.signal||{}; return s.symbol?`${s.symbol} ${s.side||''} score ${s.score||''}`:'không có'}
-async function fetchJson(url){const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error(url+' '+r.status); return r.json()}
-async function fetchText(url){const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error(url+' '+r.status); return r.text()}
-async function load(){if(paused)return;try{DATA=await fetchJson('/api/status');render(DATA);document.getElementById('stamp').textContent='cập nhật '+new Date().toLocaleTimeString()}catch(e){document.getElementById('stamp').textContent='lỗi '+e}}
-function render(d){const o=d.overview||{},p=d.paper||{},pa=p.account||{},ps=paperOpenPositionSummary(d),proc=d.process||{},hb=d.heartbeats||[],n=d.news||{},c=d.cognitive||{},cur=d.curiosity||{},s=d.shadow_performance||{};const bad=hb.filter(x=>x.state!=='ok').length;document.getElementById('side-health').innerHTML=`<span class="dot ${bad?'bad':'ok'}"></span>${bad?bad+' agent cần chú ý':'Core agents OK'}`;document.getElementById('side-clock').textContent=d.now||'';document.getElementById('statusline').innerHTML=[pill('watchdog',proc.watchdog_running?'ok':'dead'),pill('paper',paperRuntimeLabel(proc)),pill('mode',o.live_mode||'paper'),pill('risk',o.risk_posture||'unknown'),pill('tin',`${n.event_count||0} sự kiện`)].join('');renderAlertStrip(d);renderMarketTape(d);document.getElementById('kpis').innerHTML=[['Vốn',fixed(pa.equity,2),'vốn đầu '+fixed(pa.starting_equity||100,2)],['Lãi/lỗ paper',money(p.net),`${p.closes||0} lệnh đóng, ${ps.count} lệnh đang mở`],['Cổng rủi ro',o.min_signal_score||'none','ngủ '+(o.sleep_remaining||'không có')],['Tỉ lệ shadow',pct(s.win_rate),`${s.closed||0} lệnh, kỳ vọng ${money(s.expectancy)}`]].map(([a,b,c])=>`<div class="kpi"><div class="label">${esc(a)}</div><div class="value metric">${esc(b)}</div><div class="hint">${esc(c)}</div></div>`).join('');renderOverview(d);renderReport(d);renderAgents(d);renderMarket(d);renderNews(d);renderLearning(d);renderLogsShell()}
+function dashboardHeaders(){const hashParams=new URLSearchParams((location.hash||'').replace(/^#/,''));const hashToken=hashParams.get('token')||'';if(hashToken){localStorage.setItem('dashboardToken',hashToken);history.replaceState(null,'',location.pathname+location.search)}const token=localStorage.getItem('dashboardToken')||'';return token?{'X-Dashboard-Token':token}:{}}
+async function fetchJson(url){const r=await fetch(url,{cache:'no-store',headers:dashboardHeaders()}); if(!r.ok) throw new Error(url+' '+r.status); return r.json()}
+async function fetchText(url){const r=await fetch(url,{cache:'no-store',headers:dashboardHeaders()}); if(!r.ok) throw new Error(url+' '+r.status); return r.text()}
+function showDashboardError(e){const msg=String(e?.message||e||'unknown error');const side=document.getElementById('side-health');const stamp=document.getElementById('stamp');const kpis=document.getElementById('kpis');if(side)side.innerHTML=`<span class="dot bad"></span>lỗi dashboard`;if(stamp)stamp.textContent='lỗi '+msg;if(kpis&&!kpis.children.length)kpis.innerHTML=`<div class="kpi"><div class="label">Dashboard</div><div class="value metric">ERROR</div><div class="hint">${esc(msg)}</div></div>`}
+window.addEventListener('error',e=>showDashboardError(e.message||e.error||e));
+window.addEventListener('unhandledrejection',e=>showDashboardError(e.reason||e));
+async function load(){if(paused)return;try{DATA=await fetchJson('/api/status');render(DATA);document.getElementById('stamp').textContent='cập nhật '+new Date().toLocaleTimeString()}catch(e){showDashboardError(e)}}
+function render(d){const o=d.overview||{},p=d.paper||{},pa=p.account||{},ps=paperOpenPositionSummary(d),proc=d.process||{},hb=d.heartbeats||[],n=d.news||{},c=d.cognitive||{},cur=d.curiosity||{},s=d.shadow_performance||{},nc=d.neurocore||{};const bad=hb.filter(x=>x.state!=='ok').length;document.getElementById('side-health').innerHTML=`<span class="dot ${bad?'bad':'ok'}"></span>${bad?bad+' agent cần chú ý':'Core agents OK'}`;document.getElementById('side-clock').textContent=d.now||'';document.getElementById('statusline').innerHTML=[pill('supervisor',proc.supervisor_running?'ok':'dead'),pill('paper',paperRuntimeLabel(proc)),pill('neuro',nc.state||'unknown'),pill('mode',o.live_mode||'paper'),pill('risk',o.risk_posture||'unknown'),pill('tin',`${n.event_count||0} sự kiện`)].join('');renderAlertStrip(d);renderMarketTape(d);const starting=num(pa.starting_equity||100),equity=num(pa.equity),equityPnl=equity-starting;document.getElementById('kpis').innerHTML=[['Vốn',fixed(pa.equity,2),'vốn đầu '+fixed(pa.starting_equity||100,2)],['PnL đã chốt',money(p.net),`${p.closes||0} lệnh đóng · equity ${money(equityPnl)}`],['Cổng rủi ro',o.min_signal_score||'none','ngủ '+(o.sleep_remaining||'không có')],['NeuroCore',txt(nc.state||'unknown'),`${(nc.top_blockers||[]).length} blocker · ${nc.paper_only?'paper-only':'check mode'}`]].map(([a,b,c])=>`<div class="kpi"><div class="label">${esc(a)}</div><div class="value metric">${esc(b)}</div><div class="hint">${esc(c)}</div></div>`).join('');renderOverview(d);renderNeurocore(d);renderReport(d);renderAgents(d);renderMarket(d);renderNews(d);renderLearning(d);renderLogsShell()}
 function renderAlertStrip(d){const p=d.paper||{},proc=d.process||{},cur=d.curiosity||{},c=d.cognitive||{},r=d.reasoning||{},latest=p.latest_close||{},b=d.bias||{};const cells=[['Hệ thống',(proc.paper_runtime||{}).running?'Paper loop online':'Paper loop offline',(proc.paper_runtime||{}).running?'good':'danger'],['Paper gần nhất',latest.symbol?`${latest.symbol} ${latest.side} ${money(latest.net)}`:'chưa có close hợp lệ',''],['Focus hiện tại',cur.focus_id?`${cur.focus_type} / ${cur.focus_id}`:'chưa có focus',''],['Quyết định',(c.decision||{}).mode||(r.decision||{}).mode||`min score ${b.min_signal_score||'NA'}`,'']];document.getElementById('alertstrip').innerHTML=cells.map(([k,v,cls])=>`<div class="alertcell ${cls}"><strong>${esc(k)}</strong><span>${esc(txt(v))}</span></div>`).join('')}
 function renderMarketTape(d){const hot=((d.market_latest||{}).hot||[]).slice(0,6);document.getElementById('market-tape').innerHTML=hot.map(x=>{const change=num(x.change_pct??x.change_24h_pct);const cls=change>=0?'up':'down';return `<div class="tapeitem ${cls}"><b>${esc(x.symbol||'')}</b><span>${esc(fixed(x.price,4)+' / '+change.toFixed(2)+'%')}</span><span>Vol ${esc(compactNumber(x.quote_volume||x.quote_volume_m))}</span></div>`}).join('')||'<div class="tapeitem"><b>Chưa có market tape</b><span>market observer chưa có hot list</span></div>'}
 function renderOpenPaperPositions(d){const rows=paperOpenPositionSummary(d).rows;const marks=markByPosition(d);const renderRow=row=>{const markEntry=marks.get(row.position_id)||marks.get(row.symbol)||{};const mark=Number.isFinite(markEntry.mark)?markEntry.mark:null;const entry=num(row.entry);const qty=num(row.qty);const pnl=Number.isFinite(mark)?(row.side==='SHORT'?(entry-mark)*qty:(mark-entry)*qty):null;return `<tr>${td(row.symbol)}${td(row.side)}${td(fixed(row.entry,6),'num')}${td(Number.isFinite(mark)?fixed(mark,6):'','num')}${td(fixed(row.margin,4),'num')}${td(fixed(row.notional,4),'num')}${td(row.leverage,'num')}${td(row.sl,'num')}${td(row.tp,'num')}${td(Number.isFinite(pnl)?money(pnl):'','num')}${td(tsAgeText(row.opened_at),'num')}</tr>`};return panel('Vị thế paper đang mở',table(['Coin','Chiều','Entry','Mark','Margin','Notional','Lev','SL','TP','PnL tạm','Tuổi'],rows.length?rows.map(renderRow):[]),'wide')}
-function renderOverview(d){const o=d.overview||{},b=d.bias||{},p=d.paper||{},pa=p.account||{},ps=paperOpenPositionSummary(d),proc=d.process||{},lr=d.live_readiness||{},latestClose=p.latest_close||{},s=d.shadow_performance||{},sf=s.fresh_window||{},q=s.data_quality||{},c=d.cognitive||{},r=d.reasoning||{},cur=d.curiosity||{};const recent=(p.latest_events||[]).slice(-4).reverse();const decision=(c.decision||{}).mode||(r.decision||{}).mode||'không có';const paperState=(proc.paper_runtime||{}).state||'unknown';document.getElementById('view-overview').innerHTML=panel('Tóm tắt hệ thống',kv({'Bot mô phỏng':paperState==='running'?'đang chạy':paperState==='degraded'?'đang chạy, có cảnh báo':'đã dừng','Watchdog':proc.watchdog_running?'đang chạy':'đã dừng','Chế độ':o.live_mode||'paper','Sẵn sàng live':lr.status||lr.mode||'không có'}))+panel('Rủi ro hiện tại',kv({'Tư thế':b.risk_posture||'không rõ','Điểm vào tối thiểu':b.min_signal_score||'không có','Ngủ còn':o.sleep_remaining||'không có','Chặn chiều':(b.blocked_sides||[]).join(', ')||'không có'}))+panel('Mô phỏng paper',kv({'Vốn':fixed(pa.equity,2),'Lệnh đang mở':ps.count,'Margin đang dùng':fixed(ps.margin,4),'Notional đang mở':fixed(ps.notional,4),'Lệnh đã đóng':p.closes||0,'Lãi/lỗ':money(p.net),'Lệnh gần nhất':latestClose.symbol?`${latestClose.symbol} ${latestClose.side} ${money(latestClose.net)}`:'không có'}))+renderOpenPaperPositions(d)+panel('Học & shadow',kv({'Trọng tâm':compactId(cur.focus_id||'không có'),'Quyết định':decision,'Shadow fresh':`${sf.closed||0} lệnh · WR ${pct(sf.win_rate)} · exp ${money(sf.expectancy)}`,'Shadow WR all':pct(s.win_rate),'Kỳ vọng all':money(s.expectancy),'Độ tin cậy dữ liệu':q.confidence||'thấp'}))+panel('Sự kiện mới',`<div class="timeline">${recent.length?recent.map(e=>`<div class="event"><b>${esc(txt(e.event||'event'))} <span class="hint mono">${esc(e.ts||'')}</span></b><span class="hint">${esc(e.symbol||e.reason||e.block_reason||latestSignal(e)||'không có')}</span></div>`).join(''):'<span class="hint">chưa có sự kiện mới</span>'}</div>`,'wide')+`<!-- compatibility anchors: External Live Monitors | Self Improvement | Shadow Performance | Shadow / would-trade only | Starting equity -->`}
+function renderOverview(d){const o=d.overview||{},b=d.bias||{},p=d.paper||{},pa=p.account||{},ps=paperOpenPositionSummary(d),proc=d.process||{},lr=d.live_readiness||{},latestClose=p.latest_close||{},s=d.shadow_performance||{},sf=s.fresh_window||{},q=s.data_quality||{},c=d.cognitive||{},r=d.reasoning||{},cur=d.curiosity||{};const recent=(p.latest_events||[]).slice(-4).reverse();const decision=(c.decision||{}).mode||(r.decision||{}).mode||'không có';const paperState=(proc.paper_runtime||{}).state||'unknown';const equityPnl=num(pa.equity)-num(pa.starting_equity||100);document.getElementById('view-overview').innerHTML=panel('Tóm tắt hệ thống',kv({'Bot mô phỏng':paperState==='running'?'đang chạy':paperState==='degraded'?'đang chạy, có cảnh báo':'đã dừng','Supervisor paper':proc.supervisor_running?'đang chạy':'đã dừng','Live watchdog cũ':proc.watchdog_running?'đang chạy':'đã dừng','Chế độ':o.live_mode||'paper','Sẵn sàng live':lr.status||lr.mode||'không có'}))+panel('Rủi ro hiện tại',kv({'Tư thế':b.risk_posture||'không rõ','Điểm vào tối thiểu':b.min_signal_score||'không có','Ngủ còn':o.sleep_remaining||'không có','Chặn chiều':(b.blocked_sides||[]).join(', ')||'không có'}))+panel('Mô phỏng paper',kv({'Vốn':fixed(pa.equity,2),'PnL đã chốt':money(p.net),'PnL equity':money(equityPnl),'Unrealized':money(pa.unrealized_pnl),'Lệnh đang mở':ps.count,'Margin đang dùng':fixed(ps.margin,4),'Notional đang mở':fixed(ps.notional,4),'Lệnh đã đóng':p.closes||0,'Lệnh gần nhất':latestClose.symbol?`${latestClose.symbol} ${latestClose.side} ${money(latestClose.net)}`:'không có'}))+renderOpenPaperPositions(d)+panel('Học & shadow',kv({'Trọng tâm':compactId(cur.focus_id||'không có'),'Quyết định':decision,'Shadow fresh':`${sf.closed||0} lệnh · WR ${pct(sf.win_rate)} · exp ${money(sf.expectancy)}`,'Shadow WR all':pct(s.win_rate),'Kỳ vọng all':money(s.expectancy),'Độ tin cậy dữ liệu':q.confidence||'thấp'}))+panel('Sự kiện mới',`<div class="timeline">${recent.length?recent.map(e=>`<div class="event"><b>${esc(txt(e.event||'event'))} <span class="hint mono">${esc(e.ts||'')}</span></b><span class="hint">${esc(e.symbol||e.reason||e.block_reason||latestSignal(e)||'không có')}</span></div>`).join(''):'<span class="hint">chưa có sự kiện mới</span>'}</div>`,'wide')+`<!-- compatibility anchors: External Live Monitors | Self Improvement | Shadow Performance | Shadow / would-trade only | Starting equity -->`}
 function reportTone(v){const n=num(v);return n>0?'good':n<0?'bad':'warn'}
 function reportMetric(label,value,hint='',tone=''){return `<div class="reportmetric ${esc(tone)}"><span>${esc(label)}</span><b>${esc(txt(value))}</b><small>${esc(txt(hint))}</small></div>`}
-function reportStatus(report){const pf=num(report.profit_factor),wr=num(report.win_rate),net=num(report.net);if((report.closed_trades||0)<20)return ['warn','đang gom mẫu'];if(net>0&&pf>=1.2&&wr>=.5)return ['ok','edge đang dương'];if(net<0||pf<1)return ['bad','edge đang âm'];return ['warn','cần thêm xác nhận']}
+function usablePF(v){const p=num(v);return Number.isFinite(p)&&p>0&&p<100?p:null}
+function pfText(v){const p=usablePF(v);return p===null?'chưa đủ mẫu loss':fixed(p,2)}
+function reportStatus(report){const pf=usablePF(report.profit_factor),wr=num(report.win_rate),net=num(report.net),n=num(report.closed_trades);if(n<20)return ['warn','đang gom mẫu'];if(net>0&&pf!==null&&pf>=1.2&&wr>=.5)return ['warn','edge dương, chưa phải live-ready'];if(net<0||(pf!==null&&pf<1))return ['bad','edge đang âm'];return ['warn','cần thêm xác nhận']}
 function equityChart(report){
 const curve=(report.curve||[]).slice(-120);if(curve.length<2)return '<div class="chartbox"><span class="hint">Chưa đủ lệnh đóng để vẽ equity curve</span></div>';
 const w=900,h=320,padL=50,padR=18,padT=22,padB=38;const start=num(report.starting_equity||100);const values=curve.map(x=>num(x.equity)).concat([start]);let min=Math.min(...values),max=Math.max(...values);const span=Math.max(.01,max-min);min-=span*.12;max+=span*.12;
@@ -1131,35 +2329,55 @@ return `<div class="chartbox equitychart"><svg viewBox="0 0 ${w} ${h}" role="img
 function tradeBars(report){const rows=(report.recent_closes||[]).slice(-42);if(!rows.length)return '<div class="tradebars"><span class="hint">Chưa có lệnh đóng</span></div>';const maxAbs=Math.max(...rows.map(r=>Math.abs(num(r.net))),0.0001);return `<div class="tradebars" aria-label="Biểu đồ cột từng lệnh paper đã đóng"><div class="zeroline"></div>${rows.map((r,i)=>{const net=num(r.net);const h=Math.max(4,Math.min(48,Math.abs(net)/maxAbs*48));const closed=r.close_ts||r.ts||'không có';const label=net>=0?'Lệnh lời':'Lệnh lỗ';const tip=`${label} #${i+1} / ${rows.length}\nThời gian đóng: ${closed}\nCoin: ${r.symbol||'không có'} ${r.side||''}\nNet: ${money(net)}\nR: ${r.r_multiple===undefined?'không có':fixed(r.r_multiple,2)}\nReason: ${r.reason||'không có'}\nSetup: ${compactId(r.setup_id||'unknown')}`;return `<div class="tradebarwrap" data-tip="${attr(tip)}" aria-label="${attr(label+' '+(i+1)+' '+money(net))}"><span class="barcursor"></span><div class="tradebar ${net>=0?'win':'loss'}" style="height:${h}%"></div></div>`}).join('')}</div>`}
 function distributionChart(report){const rows=report.pnl_histogram||[];const maxCount=Math.max(...rows.map(r=>num(r.count)),1);return `<div class="distbars" aria-label="Phân phối PnL theo bucket">${rows.map(r=>{const count=num(r.count),bucket=String(r.bucket||'không có'),loss=bucket.startsWith('-')||bucket.startsWith('<='),net=num(r.net);const h=Math.max(3,count/maxCount*100);const kind=net>0?'nhóm lời':net<0?'nhóm lỗ':'nhóm hòa vốn';const tip=`Bucket PnL: ${bucket}\nLoại: ${kind}\nSố lệnh: ${count}\nTổng net: ${money(net)}\nTỉ trọng: ${pct(count/Math.max(1,rows.reduce((a,x)=>a+num(x.count),0)))}`;return `<div class="distbar ${loss?'loss':''}" data-tip="${attr(tip)}" aria-label="${attr('Bucket '+bucket+' '+count+' lệnh')}"><i style="height:${h}%"></i><span>${esc(bucket)}</span></div>`}).join('')}</div>`}
 function dailyNetChart(report){const rows=(((report.breakdown||{}).by_day)||[]).slice(-14);if(!rows.length)return '<div class="tradebars"><span class="hint">Chưa có daily net</span></div>';const maxAbs=Math.max(...rows.map(r=>Math.abs(num(r.net))),0.0001);return `<div class="tradebars compact" aria-label="Biểu đồ net theo ngày"><div class="zeroline"></div>${rows.map((r,i)=>{const net=num(r.net);const h=Math.max(4,Math.min(48,Math.abs(net)/maxAbs*48));const label=net>=0?'Ngày lời':'Ngày lỗ';const tip=`${label} #${i+1} / ${rows.length}\nNgày: ${r.key}\nNet: ${money(net)}\nLệnh: ${r.trades}\nWR: ${pct(r.win_rate)}\nExpectancy: ${money(r.expectancy)}`;return `<div class="tradebarwrap" data-tip="${attr(tip)}" aria-label="${attr(label+' '+r.key+' '+money(net))}"><span class="barcursor"></span><div class="tradebar ${net>=0?'win':'loss'}" style="height:${h}%"></div></div>`}).join('')}</div>`}
-function ensureChartTooltip(){let tip=document.getElementById('charttip');if(!tip){tip=document.createElement('div');tip.id='charttip';tip.className='charttip';document.body.appendChild(tip)}if(document.body.dataset.chartTipBound==='1')return;document.body.dataset.chartTipBound='1';let active=null;const clearActive=()=>{if(active){active.classList.remove('probe-active');active=null}};const markActive=(el)=>{let probe=el?.classList?.contains('charthit-band')?el.closest('.chartprobe'):el;if(!probe||!(probe.classList.contains('tradebarwrap')||probe.classList.contains('distbar')||probe.classList.contains('chartprobe')))probe=null;if(active!==probe){clearActive();active=probe;if(active)active.classList.add('probe-active')}};const nearestByX=(items,x)=>{let best=null,dist=Infinity;items.forEach(el=>{const r=el.getBoundingClientRect();const cx=r.left+r.width/2;const d=Math.abs(cx-x);if(d<dist){best=el;dist=d}});return best};const tooltipTargetAtCursor=(e)=>{const direct=e.target.closest&&e.target.closest('[data-tip]');if(direct)return direct;const equity=e.target.closest&&e.target.closest('.equitychart');if(equity)return nearestByX([...equity.querySelectorAll('.charthit-band[data-tip],.charthit[data-tip],.chartpoint[data-tip]')],e.clientX);const bars=e.target.closest&&e.target.closest('.tradebars');if(bars)return nearestByX([...bars.querySelectorAll('.tradebarwrap[data-tip]')],e.clientX);const dist=e.target.closest&&e.target.closest('.distbars');if(dist)return nearestByX([...dist.querySelectorAll('.distbar[data-tip]')],e.clientX);return null};const move=(e)=>{const target=tooltipTargetAtCursor(e);if(!target){clearActive();tip.classList.remove('visible');return}markActive(target);tip.textContent=target.dataset.tip||'';tip.classList.add('visible');const pad=14,rect=tip.getBoundingClientRect();let left=e.clientX+16,top=e.clientY+16;if(left+rect.width+pad>window.innerWidth)left=e.clientX-rect.width-16;if(top+rect.height+pad>window.innerHeight)top=e.clientY-rect.height-16;tip.style.transform=`translate3d(${Math.max(pad,left)}px,${Math.max(pad,top)}px,0)`};document.addEventListener('mousemove',move);document.addEventListener('scroll',()=>{clearActive();tip.classList.remove('visible')},true);document.addEventListener('mouseleave',()=>{clearActive();tip.classList.remove('visible')})}
-function breakdownTable(rows){return table(['Key','Lệnh','WR','Net','Expectancy','PF','Avg notional'],(rows||[]).map(r=>`<tr>${td(compactId(r.key))}${td(r.trades,'num')}${td(pct(r.win_rate),'num')}${td(money(r.net),'num')}${td(money(r.expectancy),'num')}${td(fixed(r.profit_factor,2),'num')}${td(fixed(r.avg_notional,2),'num')}</tr>`))}
-function renderReport(d){const report=d.paper_report||{},paper=d.paper||{},pa=paper.account||{},ps=paperOpenPositionSummary(d),bd=report.breakdown||{},rolling=report.rolling||{};const closes=(report.recent_closes||[]).slice(-18).reverse();const [statusCls,statusText]=reportStatus(report);const headline=`<div class="reporthero"><div class="reportheadline"><span>Net paper / vốn mô phỏng</span><b class="${reportTone(report.net)}">${esc(money(report.net))}</b><div class="reportstatus ${statusCls}"><span class="dot ${statusCls}"></span>${esc(statusText)} · ${esc(report.progress_state||'chưa đủ mẫu')}</div><div class="hint">Equity ${esc(fixed(report.current_equity??pa.equity,2))} / vốn đầu ${esc(fixed(report.starting_equity??pa.starting_equity??100,2))}</div></div><div class="reportmatrix">${[
+function ensureChartTooltip(){let tip=document.getElementById('charttip');if(!tip){tip=document.createElement('div');tip.id='charttip';tip.className='charttip';tip.setAttribute('role','tooltip');document.body.appendChild(tip)}document.querySelectorAll('[data-tip]').forEach(el=>{if(!el.hasAttribute('tabindex'))el.setAttribute('tabindex','0');el.setAttribute('aria-describedby','charttip')});if(document.body.dataset.chartTipBound==='1')return;document.body.dataset.chartTipBound='1';let active=null;const clearActive=()=>{if(active){active.classList.remove('probe-active');active=null}};const markActive=(el)=>{let probe=el?.classList?.contains('charthit-band')?el.closest('.chartprobe'):el;if(!probe||!(probe.classList.contains('tradebarwrap')||probe.classList.contains('distbar')||probe.classList.contains('chartprobe')))probe=null;if(active!==probe){clearActive();active=probe;if(active)active.classList.add('probe-active')}};const nearestByX=(items,x)=>{let best=null,dist=Infinity;items.forEach(el=>{const r=el.getBoundingClientRect();const cx=r.left+r.width/2;const d=Math.abs(cx-x);if(d<dist){best=el;dist=d}});return best};const tooltipTargetAtCursor=(e)=>{const direct=e.target.closest&&e.target.closest('[data-tip]');if(direct)return direct;const equity=e.target.closest&&e.target.closest('.equitychart');if(equity)return nearestByX([...equity.querySelectorAll('.charthit-band[data-tip],.charthit[data-tip],.chartpoint[data-tip]')],e.clientX);const bars=e.target.closest&&e.target.closest('.tradebars');if(bars)return nearestByX([...bars.querySelectorAll('.tradebarwrap[data-tip]')],e.clientX);const dist=e.target.closest&&e.target.closest('.distbars');if(dist)return nearestByX([...dist.querySelectorAll('.distbar[data-tip]')],e.clientX);return null};const showAt=(target,x,y)=>{if(!target){clearActive();tip.classList.remove('visible');return}markActive(target);tip.textContent=target.dataset.tip||'';tip.classList.add('visible');const pad=14,rect=tip.getBoundingClientRect();let left=x+16,top=y+16;if(left+rect.width+pad>window.innerWidth)left=x-rect.width-16;if(top+rect.height+pad>window.innerHeight)top=y-rect.height-16;tip.style.transform=`translate3d(${Math.max(pad,left)}px,${Math.max(pad,top)}px,0)`};const move=(e)=>showAt(tooltipTargetAtCursor(e),e.clientX,e.clientY);document.addEventListener('mousemove',move);document.addEventListener('focusin',e=>{const target=e.target.closest&&e.target.closest('[data-tip]');if(target){const r=target.getBoundingClientRect();showAt(target,r.left+r.width/2,r.top+r.height/2)}});document.addEventListener('touchstart',e=>{const t=e.target.closest&&e.target.closest('[data-tip]');if(t){const p=e.touches&&e.touches[0];const r=t.getBoundingClientRect();showAt(t,p?p.clientX:r.left+r.width/2,p?p.clientY:r.top+r.height/2)}},{passive:true});document.addEventListener('focusout',()=>{clearActive();tip.classList.remove('visible')});document.addEventListener('scroll',()=>{clearActive();tip.classList.remove('visible')},true);document.addEventListener('mouseleave',()=>{clearActive();tip.classList.remove('visible')})}
+function breakdownTable(rows){return table(['Key','Lệnh','WR','Net','Expectancy','PF','Avg notional'],(rows||[]).map(r=>`<tr>${td(compactId(r.key))}${td(r.trades,'num')}${td(pct(r.win_rate),'num')}${td(money(r.net),'num')}${td(money(r.expectancy),'num')}${td(pfText(r.profit_factor),'num')}${td(fixed(r.avg_notional,2),'num')}</tr>`))}
+function renderPaperAudit(d){const report=d.paper_report||{},paper=d.paper||{},pa=paper.account||{},ps=paperOpenPositionSummary(d),align=report.account_alignment||{},lifecycle=(((d.ops||{}).paper_execution_lifecycle||{}).lifecycle)||{};const starting=num(report.starting_equity??pa.starting_equity??100),equity=num(report.current_equity??pa.equity),realized=num(pa.realized_pnl??report.net),unrealized=num(pa.unrealized_pnl),equityPnl=equity-starting,fees=num(pa.fees_paid??report.total_fees),funding=num(report.total_funding_payment),countOk=num(align.closed_trade_count_delta)===0,pnlOk=Math.abs(num(align.realized_pnl_delta))<0.00001,lifecycleOk=(lifecycle.status||'')==='ok'&&num(lifecycle.invalid_events_count)===0,openMarginDelta=num(pa.open_margin??report.open_margin??ps.margin)-ps.margin;const cards=`<div class="reportmatrix">${[
+reportMetric('PnL đã chốt',money(realized),`${report.closed_trades||0} lệnh đóng`,reportTone(realized)),
+reportMetric('PnL equity',money(equityPnl),`unrealized ${money(unrealized)}`,reportTone(equityPnl)),
+reportMetric('Phí đã trả',money(-fees),`funding ${money(funding)}`,'warn'),
+reportMetric('Audit trạng thái',countOk&&pnlOk&&lifecycleOk?'OK':'CẦN XEM',`lifecycle ${lifecycle.status||'unknown'}`,countOk&&pnlOk&&lifecycleOk?'good':'bad'),
+reportMetric('Window',report.window||'unknown',`reset ${shortTs(report.account_created_at||align.account_created_at)}`),
+reportMetric('Open exposure',fixed(ps.notional,2),`margin ${fixed(ps.margin,2)}`)
+].join('')}</div>`;const checks=table(['Check','Giá trị','Kết quả'],[
+`<tr>${td('Closed trade delta')}${td(align.closed_trade_count_delta??'không có','num')}${td(countOk?'OK':'lệch')}</tr>`,
+`<tr>${td('Realized PnL delta')}${td(money(align.realized_pnl_delta),'num')}${td(pnlOk?'OK':'lệch')}</tr>`,
+`<tr>${td('Open margin delta')}${td(money(openMarginDelta),'num')}${td(Math.abs(openMarginDelta)<0.00001?'OK':'lệch')}</tr>`,
+`<tr>${td('Lifecycle invalid')}${td(lifecycle.invalid_events_count??'không có','num')}${td(lifecycleOk?'OK':'cần xem')}</tr>`,
+`<tr>${td('Quarantine')}${td(lifecycle.quarantined_events_count??0,'num')}${td('đã loại khỏi học')}</tr>`,
+`<tr>${td('Learning allowed')}${td(lifecycle.learning_allowed)}${td(lifecycle.learning_allowed===false?'blocked':'OK')}</tr>`
+]);return cards+checks}
+function renderReport(d){const report=d.paper_report||{},paper=d.paper||{},pa=paper.account||{},ps=paperOpenPositionSummary(d),bd=report.breakdown||{},rolling=report.rolling||{};const closes=(report.recent_closes||[]).slice(-18).reverse();const [statusCls,statusText]=reportStatus(report);const equityPnl=num(report.current_equity??pa.equity)-num(report.starting_equity??pa.starting_equity??100);const headline=`<div class="reporthero"><div class="reportheadline"><span>PnL đã chốt / equity</span><b class="${reportTone(report.net)}">${esc(money(report.net))}</b><div class="reportstatus ${statusCls}"><span class="dot ${statusCls}"></span>${esc(statusText)} · ${esc(report.progress_state||'chưa đủ mẫu')}</div><div class="hint">Equity ${esc(fixed(report.current_equity??pa.equity,2))} · PnL equity ${esc(money(equityPnl))} / vốn đầu ${esc(fixed(report.starting_equity??pa.starting_equity??100,2))}</div></div><div class="reportmatrix">${[
 reportMetric('Lệnh đóng',report.closed_trades||0,`${report.wins||0} win / ${report.losses||0} loss`),
 reportMetric('Winrate',pct(report.win_rate),`rolling 10 ${pct(report.recent_10_win_rate)}`),
-reportMetric('Profit factor',fixed(report.profit_factor,2),`payoff ${fixed(report.payoff_ratio,2)}`),
+reportMetric('Profit factor',pfText(report.profit_factor),`payoff ${fixed(report.payoff_ratio,2)}`),
 reportMetric('Expectancy',money(report.expectancy),`10 lệnh ${money(report.recent_10_expectancy)}`,reportTone(report.expectancy)),
 reportMetric('Max DD',money(-(report.max_drawdown||0)),pct(report.max_drawdown_pct),'bad'),
 reportMetric('Exposure mở',fixed(report.open_notional??ps.notional,2),`margin ${fixed(report.open_margin??ps.margin,2)}`),
 reportMetric('Avg R',report.avg_r===null||report.avg_r===undefined?'không đủ dữ liệu':fixed(report.avg_r,2),`streak ${txt(report.current_streak_side||'flat')} ${report.current_streak||0}`),
 reportMetric('Fees',money(-(report.total_fees||0)),`fee drag ${pct(report.fee_drag_pct)}`,'warn'),
-reportMetric('Return',pct(report.return_pct),`equity high ${fixed(report.equity_high,2)}`,reportTone(report.return_pct))
-].join('')}</div></div>`;const rollingPanel=`<div class="minirow">${[5,10,20].map(n=>{const r=rolling[String(n)]||{};return reportMetric(`${n} lệnh gần`,money(r.net),`WR ${pct(r.win_rate)} · exp ${money(r.expectancy)}`,reportTone(r.net))}).join('')}</div>`;const best=report.best_trade||{},worst=report.worst_trade||{};document.getElementById('view-report').innerHTML=panel('Báo cáo trader mô phỏng',headline,'wide')+panel('Rolling performance',rollingPanel)+panel('Risk & exposure',kv({'Vốn hiện tại':fixed(report.current_equity??pa.equity,2),'Notional đang mở':fixed(report.open_notional??ps.notional,2),'Margin đang mở':fixed(report.open_margin??ps.margin,2),'Margin usage':pct(report.margin_usage_pct),'Notional / equity':pct(report.notional_exposure_pct),'Current drawdown':`${money(-(report.current_drawdown||0))} · ${pct(report.current_drawdown_pct)}`,'Avg notional/lệnh':fixed(report.avg_notional,2),'Max win/loss streak':`${report.max_win_streak||0} / ${report.max_loss_streak||0}`}))+panel('Equity curve paper',equityChart(report),'wide')+panel('PnL từng lệnh gần đây',tradeBars(report))+panel('Phân phối PnL',distributionChart(report))+panel('Daily net',dailyNetChart(report))+panel('Phân rã theo coin và setup',`<div class="splitbody"><div>${breakdownTable(bd.by_symbol||[])}</div><div>${breakdownTable(bd.by_setup||[])}</div></div>`,'wide')+panel('Phân rã theo chiều và lý do thoát',`<div class="splitbody"><div>${breakdownTable(bd.by_side||[])}</div><div>${breakdownTable(bd.by_reason||[])}</div></div>`,'wide')+panel('Best / Worst trade',`<div class="splitbody"><div class="callout"><b>Best</b><div class="metric">${esc(best.symbol||'không có')} ${esc(best.side||'')} ${esc(money(best.net))}</div><div class="hint">${esc(best.close_ts||best.ts||'')}</div></div><div class="callout bad"><b>Worst</b><div class="metric">${esc(worst.symbol||'không có')} ${esc(worst.side||'')} ${esc(money(worst.net))}</div><div class="hint">${esc(worst.close_ts||worst.ts||'')}</div></div></div>`)+panel('Lệnh paper đã đóng gần nhất',table(['Thời gian','Coin','Chiều','Lý do','Net','R','Fee','Notional','Setup'],closes.map(r=>`<tr>${td(r.close_ts||r.ts)}${td(r.symbol)}${td(r.side)}${td(r.reason)}${td(money(r.net),'num')}${td(r.r_multiple===undefined?'':fixed(r.r_multiple,2),'num')}${td(money(-(num(r.fee||r.fees))),'num')}${td(fixed(r.notional,2),'num')}${td(compactId(r.setup_id||'unknown'))}</tr>`)),'wide');ensureChartTooltip()}
-function renderAgents(d){const proc=d.process||{};document.getElementById('view-agents').innerHTML=panel('Watchdog và bot con',kv({'Watchdog PID':proc.watchdog_pid||'none','Watchdog đang chạy':proc.watchdog_running,'Bot con PID':proc.child_pid||'none','Bot con đang chạy':proc.child_running,'Stop file':proc.stop_file_exists}))+panel('Monitor live bên ngoài',table(['Monitor','Trạng thái','PID','Vai trò','Agent control'],(d.live_monitors||[]).map(m=>`<tr>${td(m.name)}${td(m.state)}${td((m.pids||[]).join(', ')||'none','num')}${td(m.role)}${td(m.agent_controls)}</tr>`)))+panel('Heartbeat agent lõi',table(['Agent','Trạng thái','Tuổi dữ liệu','PID','Đang chạy'],(d.heartbeats||[]).map(h=>`<tr>${td(h.name)}<td><span class="dot ${stateClass(h.state)}"></span>${esc(txt(h.state))}</td>${td(h.age,'num')}${td(h.pid,'num')}${td(h.running)}</tr>`)),'wide')+panel('Độ mới logs',table(['File','Có tồn tại','Cập nhật cách đây','Đường dẫn'],(d.logs||[]).map(l=>`<tr>${td(l.name)}${td(l.exists)}${td(l.age,'num')}${td(l.path)}</tr>`)),'wide')}
+reportMetric('Equity PnL',money(equityPnl),`return ${pct(equityPnl/Math.max(1,num(report.starting_equity??pa.starting_equity??100)))}`,reportTone(equityPnl))
+].join('')}</div></div>`;const rollingPanel=`<div class="minirow">${[5,10,20].map(n=>{const r=rolling[String(n)]||{};return reportMetric(`${n} lệnh gần`,money(r.net),`WR ${pct(r.win_rate)} · exp ${money(r.expectancy)}`,reportTone(r.net))}).join('')}</div>`;const best=report.best_trade||{},worst=report.worst_trade||{};document.getElementById('view-report').innerHTML=panel('Báo cáo trader mô phỏng',headline,'wide')+panel('Rolling performance',rollingPanel)+panel('Risk & exposure',kv({'Vốn hiện tại':fixed(report.current_equity??pa.equity,2),'Notional đang mở':fixed(report.open_notional??ps.notional,2),'Margin đang mở':fixed(report.open_margin??ps.margin,2),'Margin usage':pct(report.margin_usage_pct),'Notional / equity':pct(report.notional_exposure_pct),'Current drawdown':`${money(-(report.current_drawdown||0))} · ${pct(report.current_drawdown_pct)}`,'Avg notional/lệnh':fixed(report.avg_notional,2),'Max win/loss streak':`${report.max_win_streak||0} / ${report.max_loss_streak||0}`}))+panel('Audit số liệu',renderPaperAudit(d),'wide')+panel('Equity curve paper',equityChart(report),'wide')+panel('PnL từng lệnh gần đây',tradeBars(report))+panel('Phân phối PnL',distributionChart(report))+panel('Daily net',dailyNetChart(report))+panel('Phân rã theo coin và setup',`<div class="splitbody"><div>${breakdownTable(bd.by_symbol||[])}</div><div>${breakdownTable(bd.by_setup||[])}</div></div>`,'wide')+panel('Phân rã theo chiều và lý do thoát',`<div class="splitbody"><div>${breakdownTable(bd.by_side||[])}</div><div>${breakdownTable(bd.by_reason||[])}</div></div>`,'wide')+panel('Best / Worst trade',`<div class="splitbody"><div class="callout"><b>Best</b><div class="metric">${esc(best.symbol||'không có')} ${esc(best.side||'')} ${esc(money(best.net))}</div><div class="hint">${esc(best.close_ts||best.ts||'')}</div></div><div class="callout bad"><b>Worst</b><div class="metric">${esc(worst.symbol||'không có')} ${esc(worst.side||'')} ${esc(money(worst.net))}</div><div class="hint">${esc(worst.close_ts||worst.ts||'')}</div></div></div>`)+panel('Lệnh paper đã đóng gần nhất',table(['Thời gian','Coin','Chiều','Lý do','Net','R','Fee','Notional','Setup'],closes.map(r=>`<tr>${td(r.close_ts||r.ts)}${td(r.symbol)}${td(r.side)}${td(r.reason)}${td(money(r.net),'num')}${td(r.r_multiple===undefined?'':fixed(r.r_multiple,2),'num')}${td(money(-(num(r.fee||r.fees))),'num')}${td(fixed(r.notional,2),'num')}${td(compactId(r.setup_id||'unknown'))}</tr>`)),'wide');ensureChartTooltip()}
+function renderAgents(d){const proc=d.process||{};document.getElementById('view-agents').innerHTML=panel('Supervisor và live watchdog',kv({'Supervisor PID':proc.supervisor_pid||'none','Supervisor đang chạy':proc.supervisor_running,'Live watchdog PID':proc.watchdog_pid||'none','Live watchdog đang chạy':proc.watchdog_running,'Bot live cũ PID':proc.child_pid||'none','Bot live cũ đang chạy':proc.child_running,'Stop file':proc.stop_file_exists}))+panel('Monitor live bên ngoài',table(['Monitor','Trạng thái','PID','Vai trò','Agent control'],(d.live_monitors||[]).map(m=>`<tr>${td(m.name)}${td(m.state)}${td((m.pids||[]).join(', ')||'none','num')}${td(m.role)}${td(m.agent_controls)}</tr>`)))+panel('Heartbeat agent lõi',table(['Agent','Trạng thái','Tuổi dữ liệu','PID','Đang chạy'],(d.heartbeats||[]).map(h=>`<tr>${td(h.name)}<td><span class="dot ${stateClass(h.state)}"></span>${esc(txt(h.state))}</td>${td(h.age,'num')}${td(h.pid,'num')}${td(h.running)}</tr>`)),'wide')+panel('Độ mới logs',table(['File','Có tồn tại','Cập nhật cách đây','Đường dẫn'],(d.logs||[]).map(l=>`<tr>${td(l.name)}${td(l.exists)}${td(l.age,'num')}${td(l.path)}</tr>`)),'wide')}
 function renderMarket(d){const m=d.market_state||{},ml=d.market_latest||{},o=d.overview||{};const rowMarket=x=>`<tr>${td(x.symbol)}${td(fixed(x.price,4),'num')}${td(fixed(x.change_pct??x.change_24h_pct,2)+'%','num')}${td(compactNumber(x.quote_volume||x.quote_volume_m),'num')}${td(fixed(x.hot_score,2),'num')}${td(x.funding_pct!==undefined?fixed(x.funding_pct,4)+'%':'','num')}</tr>`;const marketHeaders=['Coin','Giá','24h','Vol quote','Hot','Funding'];document.getElementById('view-market').innerHTML=panel('Regime thị trường',kv({'Regime':m.primary_regime||o.regime,'TB coin lớn 24h':fixed(m.major_avg_24h_pct??0,2)+'%','Số coin lớn tăng':m.major_positive_count??'n/a','Biên độ TB':m.major_range_avg??'n/a','Chase risk':m.chase_risk,'Snapshot thị trường':ml.ts||'none'}))+panel('Tag và crowded',`<div class="chips">${chipList(m.tags||o.tags)}</div><div class="hint" style="margin:10px 0 6px">Coin đang crowded</div><div class="chips">${chipList(m.crowded_symbols||[],'warn')}</div>`)+panel('Coin đang nóng',table(marketHeaders,(ml.hot||m.hot_symbols||[]).map(x=>typeof x==='string'?`<tr>${td(x)}${td('')}${td('')}${td('')}${td('')}${td('')}</tr>`:rowMarket(x))),'wide')+panel('Funding bất thường',table(marketHeaders,(ml.funding_extremes||[]).map(rowMarket)),'wide')+panel('Coin lớn',table(marketHeaders,(ml.majors||[]).map(rowMarket)),'wide')}
 function renderNews(d){const n=d.news||{};const impacts=Object.entries(n.symbol_impacts||{}).sort((a,b)=>(num(b[1].risk)-num(a[1].risk))).slice(0,16);document.getElementById('view-news').innerHTML=panel('Rủi ro tin tức',kv({'Cập nhật gần nhất':n.ts||'none','Sự kiện':n.event_count||0,'Macro risk':pct(n.macro_risk_score),'Regulatory risk':pct(n.crypto_regulatory_risk),'Catalyst':pct(n.catalyst_score),'Headline chaos':pct(n.headline_chaos),'Độ mới':pct(n.freshness_score),'Chất lượng nguồn':pct(n.source_quality_score),'Risk contract':n.risk_contract||'tighten_only'}))+panel('Tình trạng nguồn tin',table(['Nguồn','Trạng thái','Số tin','Lỗi'],(n.source_health||[]).map(s=>`<tr>${td(s.source)}${td(s.status)}${td(s.count,'num')}${td(s.error||'')}</tr>`)))+panel('Tin nổi bật',table(['Nguồn','Risk','Coin','Tiêu đề'],(n.top_events||[]).map(e=>`<tr>${td(e.source)}${td(pct(e.risk),'num')}${td((e.symbols||[]).join(', '))}${td(e.title)}</tr>`)),'wide')+panel('Tác động theo coin',table(['Coin','Risk','Bull','Bear'],impacts.map(([sym,v])=>`<tr>${td(sym)}${td(pct(v.risk),'num')}${td(pct(v.bullish),'num')}${td(pct(v.bearish),'num')}</tr>`)),'wide')}
-function renderLearning(d){const si=d.self_improvement||{},guard=si.guardrail_proposal||{},c=d.cognitive||{},r=d.reasoning||{},beliefs=d.beliefs||{},setups=d.setups||{},shadow=d.shadow_performance||{},exam=d.daily_exam||{},llm=d.llm_reasoning||{};const examScores=Object.entries(exam.score_snapshot||{});document.getElementById('view-learning').innerHTML=panel('Tự cải thiện',kv({'Cập nhật':si.ts||'none','Điểm học':pct(si.overall_learning_score),'Độ sẵn sàng':si.readiness||'unknown','Điểm mù':(si.blindspots||[]).length,'Có thể nới risk':guard.can_loosen,'Có thể live trade':guard.can_trade_live,'Min score đề xuất':guard.recommended_min_signal_score||'none'}))+panel('LLM reasoning',kv({'Trạng thái':llm.status||'unknown','Provider':llm.provider||'unknown','Model deep':llm.deep_model||'unknown','Model quick':llm.quick_model||'unknown','Tóm tắt':llm.summary||'không có','Không live':!llm.can_place_live_orders,'Không nới risk':!llm.can_loosen_risk,'Lỗi':llm.error||'không có'}))+panel('Kỳ thi ngày',kv({'Ngày':exam.local_date||'chưa có','Loại đề':compactId(exam.exam_type||'không có'),'Điểm chất lượng':fixed(exam.quality_score,1)+' / 100','Grade':exam.quality_grade||'không có','Điểm bài thi':fixed(exam.exam_score,0)+' / 100','Kết quả':exam.passed?'đạt':'chưa đạt','Action':(exam.answer||{}).action||'không có','Paper-only':(exam.contract||{}).paper_only!==false}))+panel('Trọng tâm học hiện tại',kv({'Curiosity type':d.curiosity?.focus_type||'none','Focus id':compactId(d.curiosity?.focus_id||'none'),'Expected value':d.curiosity?.expected_learning_value||'none','Score':d.curiosity?.score||'none','Reasoning mode':(r.decision||{}).mode||'none','Lý do quyết định':(r.decision||{}).reason||'none'}))+panel('Promotion board',renderPromotion(d),'wide')+panel('Ops học máy',renderOpsLearning(d),'wide')+panel('Điểm mù từ model lớn',table(['Blindspot'],(llm.critical_blindspots||[]).map(t=>`<tr>${td(t)}</tr>`)),'wide')+panel('Curriculum từ model lớn',table(['Ưu tiên','Task','Acceptance test'],(llm.curriculum||[]).map(t=>`<tr>${td(t.priority)}${td(t.task)}${td(t.acceptance_test)}</tr>`)),'wide')+panel('Điểm kỳ thi',table(['Trục','Score'],examScores.map(([k,v])=>`<tr>${td(compactId(k))}${td(pct(v),'num')}</tr>`)),'wide')+panel('Learning target từ kỳ thi',table(['Mục tiêu'],(exam.learning_targets||[]).map(t=>`<tr>${td(t)}</tr>`)),'wide')+panel('Lộ trình học',table(['Ưu tiên','Task','Hành động'],(si.learning_curriculum||[]).map(t=>`<tr>${td(t.priority)}${td(t.task)}${td(t.action)}</tr>`)),'wide')+panel('Điểm mù',table(['Mức độ','Loại','Chi tiết'],(si.blindspots||[]).map(b=>`<tr>${td(b.severity)}${td(compactId(b.type))}${td(b.detail)}</tr>`)),'wide')+panel('Giả thuyết cần test',table(['Hypothesis','Setup','Confidence','Coin'],(c.hypotheses_to_test||[]).map(h=>`<tr>${td(compactId(h.hypothesis_id))}${td(compactId(h.setup_id))}${td(pct(h.confidence_prior),'num')}${td((h.symbols||[]).join(', '))}</tr>`)),'wide')+panel('Niềm tin thị trường',table(['Niềm tin','Confidence','Trạng thái'],(beliefs.top||[]).map(b=>`<tr>${td(b.statement)}<td><div class="meter"><div class="bar" style="width:${Math.max(0,Math.min(100,num(b.confidence)*100))}%"></div></div></td>${td(b.status)}</tr>`)),'wide')+panel('Kỹ năng setup',table(['Setup','Bật','Lệnh','WR','Expectancy'],(setups.rows||[]).map(s=>`<tr>${td(compactId(s.setup_id))}${td(s.enabled)}${td(s.trades,'num')}${td(pct(s.win_rate),'num')}${td(money(s.expectancy),'num')}</tr>`)),'wide')+panel('Ứng viên promote / loại bỏ',table(['Loại','Nhóm','Key','Đã đóng','WR','Expectancy'],[...(shadow.promotion_candidates||[]).map(x=>({type:'promote',...x})),...(shadow.kill_candidates||[]).map(x=>({type:'kill',...x}))].map(x=>`<tr>${td(x.type)}${td(x.group)}${td(compactId(x.key))}${td(x.closed,'num')}${td(pct(x.win_rate),'num')}${td(money(x.expectancy),'num')}</tr>`)),'wide')}
+function renderLearning(d){const si=d.self_improvement||{},guard=si.guardrail_proposal||{},c=d.cognitive||{},r=d.reasoning||{},beliefs=d.beliefs||{},setups=d.setups||{},shadow=d.shadow_performance||{},exam=d.daily_exam||{},llm=d.llm_reasoning||{};const examScores=Object.entries(exam.score_snapshot||{});document.getElementById('view-learning').innerHTML=panel('Tự cải thiện',kv({'Cập nhật':si.ts||'none','Điểm học':pct(si.overall_learning_score),'Độ sẵn sàng':si.readiness||'unknown','Điểm mù':(si.blindspots||[]).length,'Có thể nới risk':guard.can_loosen,'Live bị khóa':true,'Min score đề xuất':guard.recommended_min_signal_score||'none'}))+panel('LLM reasoning',kv({'Trạng thái':llm.status||'unknown','Provider':llm.provider||'unknown','Model deep':llm.deep_model||'unknown','Model quick':llm.quick_model||'unknown','Tóm tắt':llm.summary||'không có','Không live':!llm.can_place_live_orders,'Không nới risk':!llm.can_loosen_risk,'Lỗi':llm.error||'không có'}))+panel('Kỳ thi ngày',kv({'Ngày':exam.local_date||'chưa có','Loại đề':compactId(exam.exam_type||'không có'),'Điểm chất lượng':fixed(exam.quality_score,1)+' / 100','Grade':exam.quality_grade||'không có','Điểm bài thi':fixed(exam.exam_score,0)+' / 100','Kết quả':exam.passed?'đạt':'chưa đạt','Action':(exam.answer||{}).action||'không có','Paper-only':(exam.contract||{}).paper_only!==false}))+panel('Trọng tâm học hiện tại',kv({'Curiosity type':d.curiosity?.focus_type||'none','Focus id':compactId(d.curiosity?.focus_id||'none'),'Expected value':d.curiosity?.expected_learning_value||'none','Score':d.curiosity?.score||'none','Reasoning mode':(r.decision||{}).mode||'none','Lý do quyết định':(r.decision||{}).reason||'none'}))+panel('Promotion board',renderPromotion(d),'wide')+panel('Ops học máy',renderOpsLearning(d),'wide')+panel('Điểm mù từ model lớn',table(['Blindspot'],(llm.critical_blindspots||[]).map(t=>`<tr>${td(t)}</tr>`)),'wide')+panel('Curriculum từ model lớn',table(['Ưu tiên','Task','Acceptance test'],(llm.curriculum||[]).map(t=>`<tr>${td(t.priority)}${td(t.task)}${td(t.acceptance_test)}</tr>`)),'wide')+panel('Điểm kỳ thi',table(['Trục','Score'],examScores.map(([k,v])=>`<tr>${td(compactId(k))}${td(pct(v),'num')}</tr>`)),'wide')+panel('Learning target từ kỳ thi',table(['Mục tiêu'],(exam.learning_targets||[]).map(t=>`<tr>${td(t)}</tr>`)),'wide')+panel('Lộ trình học',table(['Ưu tiên','Task','Hành động'],(si.learning_curriculum||[]).map(t=>`<tr>${td(t.priority)}${td(t.task)}${td(t.action)}</tr>`)),'wide')+panel('Điểm mù',table(['Mức độ','Loại','Chi tiết'],(si.blindspots||[]).map(b=>`<tr>${td(b.severity)}${td(compactId(b.type))}${td(b.detail)}</tr>`)),'wide')+panel('Giả thuyết cần test',table(['Hypothesis','Setup','Confidence','Coin'],(c.hypotheses_to_test||[]).map(h=>`<tr>${td(compactId(h.hypothesis_id))}${td(compactId(h.setup_id))}${td(pct(h.confidence_prior),'num')}${td((h.symbols||[]).join(', '))}</tr>`)),'wide')+panel('Niềm tin thị trường',table(['Niềm tin','Confidence','Trạng thái'],(beliefs.top||[]).map(b=>`<tr>${td(b.statement)}<td><div class="meter"><div class="bar" style="width:${Math.max(0,Math.min(100,num(b.confidence)*100))}%"></div></div></td>${td(b.status)}</tr>`)),'wide')+panel('Kỹ năng setup',table(['Setup','Bật','Lệnh','WR','Expectancy'],(setups.rows||[]).map(s=>`<tr>${td(compactId(s.setup_id))}${td(s.enabled)}${td(s.trades,'num')}${td(pct(s.win_rate),'num')}${td(money(s.expectancy),'num')}</tr>`)),'wide')+panel('Ứng viên promote / loại bỏ',table(['Loại','Nhóm','Key','Đã đóng','WR','Expectancy'],[...(shadow.promotion_candidates||[]).map(x=>({type:'promote',...x})),...(shadow.kill_candidates||[]).map(x=>({type:'kill',...x}))].map(x=>`<tr>${td(x.type)}${td(x.group)}${td(compactId(x.key))}${td(x.closed,'num')}${td(pct(x.win_rate),'num')}${td(money(x.expectancy),'num')}</tr>`)),'wide')}
 function renderPromotion(d){const p=(d.ops||{}).promotion||{};return kv({'Trạng thái':p.state||'paper_learning','Đạt gate':p.passed?'đạt':'chưa đạt','Không đặt live':!p.can_place_live_orders,'Đánh giá lúc':p.evaluated_at||'chưa có','Fail reasons':(p.failures||[]).join(', ')||'không có'})+table(['Metric','Hiện tại','Target','Qua'],(p.rows||[]).map(x=>`<tr>${td(compactId(x.metric))}${td(x.value,'num')}${td(x.target,'num')}${td(x.passed?'OK':'thiếu')}</tr>`))}
 function renderOpsLearning(d){const ops=d.ops||{},mu=ops.model_usage||{},sf=ops.skill_forge||{},spi=ops.skill_patch_integration||{},exp=ops.experiments||{},dd=ops.dont_do||{},q=ops.queue||{};return kv({'Model calls':mu.call_count||0,'Token input est':mu.input_tokens_est||0,'Token output est':mu.output_tokens_est||0,'Cost est USD':fixed(mu.cost_usd_est||0,6),'Skill patches pending':sf.pending_count||0,'Skill patches applied':spi.applied_count||0,'Walk-forward experiments':exp.experiment_count||0,'Walk-forward running':exp.running||0,'Walk-forward passed':exp.passed||0,'Walk-forward failed':exp.failed||0,'DONT_DO rules':(dd.rules||[]).length,'Queue':JSON.stringify(q.by_status||{})})}
 function renderPostTradeLearning(d){const pb=d.phase_b_learning||{},pt=pb.post_trade||{},q=pt.review_quality||{},recent=pb.recent_reviews||[],byReason=Object.entries(pt.by_primary_failure_reason||{}).sort((a,b)=>num(b[1])-num(a[1])).slice(0,10),byClass=Object.entries(pt.by_classification||{}).sort((a,b)=>num(b[1])-num(a[1])).slice(0,10);return panel('Post-trade review',kv({'Review total':pt.review_count||0,'MFE/MAE coverage':pct(q.mfe_mae_coverage_pct),'R coverage':pct(q.r_multiple_coverage_pct),'Cost coverage':pct(q.cost_coverage_pct),'Counterfactual attach':pct(q.counterfactual_attach_pct),'Process avg':fixed(pt.avg_process_quality_score,3),'Outcome avg':fixed(pt.avg_outcome_quality_score,3),'Setup validity avg':fixed(pt.avg_setup_validity_score,3),'Cập nhật':pt.updated_at||'chưa có'}))+panel('Lý do thua / failure reason',table(['Reason','Count'],byReason.map(([k,v])=>`<tr>${td(compactId(k))}${td(v,'num')}</tr>`)))+panel('Class review',table(['Class','Count'],byClass.map(([k,v])=>`<tr>${td(compactId(k))}${td(v,'num')}</tr>`)))+panel('Review gần nhất',table(['Trade','Class','Failure','MFE','MAE','R'],recent.map(r=>`<tr>${td(compactId(r.trade_id||''))}${td(compactId(r.classification||''))}${td(compactId(r.primary_failure_reason||''))}${td(fixed(r.mfe,4),'num')}${td(fixed(r.mae,4),'num')}${td(fixed(r.r_multiple,2),'num')}</tr>`)),'wide')}
 function renderCounterfactualLearning(d){const pb=d.phase_b_learning||{},cf=pb.counterfactual||{},recent=pb.recent_replays||[],by=Object.entries(cf.by_conclusion||{}).sort((a,b)=>num(b[1])-num(a[1]));return panel('Counterfactual replay',kv({'Replay total':cf.replay_count||0,'Hoàn tất':cf.complete_count||0,'Chưa đủ dữ liệu':cf.unresolved_count||0,'Coverage':pct(cf.coverage_pct),'Cập nhật':cf.updated_at||'chưa có'}))+panel('Replay gần nhất',table(['Signal','Trạng thái','Lý do','Nguồn candle','Số nến'],recent.map(r=>`<tr>${td(compactId(r.signal_id||''))}${td(r.status)}${td(r.reason||r.conclusion||'')}${td((r.candle_source||{}).source||'unknown')}${td((r.coverage||{}).candle_count,'num')}</tr>`)),'wide')+panel('Kết luận replay',table(['Kết luận','Count'],by.map(([k,v])=>`<tr>${td(compactId(k))}${td(v,'num')}</tr>`)))}
-function renderWalkForwardLearning(d){const exp=(d.ops||{}).experiments||{},rows=exp.rows||[];return panel('Walk-forward validation',kv({'Experiments':exp.experiment_count||0,'Running':exp.running||0,'Passed':exp.passed||0,'Failed':exp.failed||0,'Cập nhật':exp.updated_at||'chưa có','Không đặt live':!exp.can_place_live_orders}))+panel('Experiment gần nhất',table(['Patch','Setup','Status','Future trades','Expectancy','PF','Errors'],rows.map(r=>{const tm=r.test_metrics||{};return `<tr>${td(compactId(r.patch_id||r.experiment_id||''))}${td(compactId(r.setup_id||''))}${td(r.status)}${td(tm.trades||0,'num')}${td(money(tm.expectancy_after_fees),'num')}${td(fixed(tm.profit_factor,2),'num')}${td((r.errors||[]).join(', ')||'không có')}</tr>`}),'wide')}
+function renderWalkForwardLearning(d){const exp=(d.ops||{}).experiments||{},rows=exp.rows||[];return panel('Walk-forward validation',kv({'Experiments':exp.experiment_count||0,'Running':exp.running||0,'Passed':exp.passed||0,'Failed':exp.failed||0,'Cập nhật':exp.updated_at||'chưa có','Không đặt live':!exp.can_place_live_orders}))+panel('Experiment gần nhất',table(['Patch','Setup','Status','Future trades','Expectancy','PF','Errors'],rows.map(r=>{const tm=r.test_metrics||{};return `<tr>${td(compactId(r.patch_id||r.experiment_id||''))}${td(compactId(r.setup_id||''))}${td(r.status)}${td(tm.trades||0,'num')}${td(money(tm.expectancy_after_fees),'num')}${td(pfText(tm.profit_factor),'num')}${td((r.errors||[]).join(', ')||'không có')}</tr>`})),'wide')}
 function renderImprovementProof(d){const exam=d.daily_exam||{},scores=exam.score_snapshot||{},promo=((d.ops||{}).promotion)||{},exp=((d.ops||{}).experiments)||{},pt=(((d.phase_b_learning||{}).post_trade)||{}).review_quality||{},cf=((d.phase_b_learning||{}).counterfactual)||{};return panel('Bằng chứng cải thiện',kv({'Performance improvement':pct(scores.performance_improvement),'Edge quality':pct(scores.edge_quality),'Evidence coverage':pct(scores.evidence_coverage),'Counterfactual coverage':pct(cf.coverage_pct),'Review cost coverage':pct(pt.cost_coverage_pct),'Walk-forward running':exp.running||0,'Walk-forward passed':exp.passed||0,'Promotion blockers':(promo.failures||[]).join(', ')||'không có','Không đặt live':!promo.can_place_live_orders}))}
+function renderNeuroBlockers(n){const rows=n.top_blockers||[];if(!rows.length)return '<div class="contractnote">Không có blocker bắt buộc trong snapshot này. Vẫn là Paper-only, chưa live eligible.</div>';return `<div class="blockerlist">${rows.map(b=>`<div class="blocker ${b.severity==='high'?'high':''}"><b>${esc(compactId(b.code||'blocker'))}</b><span>${esc(txt(b.detail||''))}</span></div>`).join('')}</div>`}
+function renderNeuroTopology(n){const nodes=((n.topology||{}).nodes||[]);return `<div class="topoflow">${nodes.map(node=>`<div class="toponode ${esc(node.state||'')}"><b><span class="dot ${stateClass(node.state)}"></span>${esc(node.label||node.id)}</b><span>${esc((node.agents||[]).join(' / '))}</span><span>${esc(txt(node.state||'ok'))}</span></div>`).join('')}</div>`}
+function freshnessTable(n){const rows=Object.entries(n.freshness||{}).map(([k,v])=>`<tr>${td(compactId(k))}${td((v||{}).state)}${td((v||{}).age,'num')}${td((v||{}).ttl_seconds,'num')}${td((v||{}).source_watermark)}</tr>`);return table(['Widget','Trạng thái','Tuổi dữ liệu','TTL','Watermark'],rows)}
+function neuroScoringBars(n){const scoring=n.scoring||{},wins=scoring.windows||[];if(!wins.length)return '<div class="distbars"><span class="hint">Chưa có scoring window</span></div>';const maxAbs=Math.max(...wins.map(w=>Math.abs(num(w.expectancy))),0.0001);return `<div class="distbars" aria-label="NeuroCore scoring windows">${wins.map(w=>{const exp=num(w.expectancy),h=Math.max(4,Math.min(96,Math.abs(exp)/maxAbs*92));const neutral=w.purpose==='monitoring';const cls=neutral?'neutral':exp<0?'loss':'warn';const cv=w.cost_vector||{};const lcb=w.ci_lower_bound??w.expectancy_lower_bound_95??'unknown';const tip=`Window: ${w.window||'unknown'}\nDenominator: mature closed rows at report cutoff\nN: ${w.n||0}\nEffective N: ${w.effective_n??'unknown'}\nSetup contract hash: ${w.setup_contract_hash||'mixed_or_unknown'}\nPF: ${pfText(w.profit_factor)}\nExpectancy: ${money(exp)}\nCI lower bound: ${lcb}\nCost vector: ${JSON.stringify(cv)}\nSnapshot id: ${scoring.snapshot_id||'unknown'}\nSource watermarks: ${(w.source_watermarks||[]).filter(Boolean).join(', ')||'unknown'}\nStaleness: ${(n.freshness?.scoring||{}).state||'unknown'}\nReadiness eligibility: ${w.readiness_eligibility||'unknown'}`;return `<div class="distbar ${cls}" tabindex="0" data-tip="${attr(tip)}"><i style="height:${h}%"></i><span>${esc(String(w.window||'').replace('_closed_trades',''))}</span></div>`}).join('')}</div><div class="reportlegend"><span class="legenditem warn">Readiness paper-only</span><span class="legenditem">Monitoring = promotion_ineligible</span><span class="legenditem bad">Negative/blocked</span></div>`}
+function renderNeurocore(d){const n=d.neurocore||{},bus=n.event_bus||{},feat=n.features||{},score=n.scoring||{},ms=n.memory_skills||{},sec=n.security||{},ops=n.ops||{},contract=n.chart_contract||{},gloss=n.glossary||{};const busRows=(bus.subscriptions||[]).slice(0,12).map(r=>`<tr>${td(compactId(r.consumer_id||''))}${td(compactId(r.event_type||''))}${td(r.last_acked_seq,'num')}${td(r.lag_events,'num')}${td(r.acked_at)}</tr>`);const featureRows=(feat.latest_rows||[]).slice(0,12).map(r=>`<tr>${td(r.symbol)}${td(r.timeframe)}${td(compactId(r.action))}${td(pct(r.source_trust),'num')}${td((r.missing_required||[]).join(', ')||'không có')}${td((r.missing_optional||[]).join(', ')||'không có')}</tr>`);const windowRows=(score.windows||[]).map(w=>{const lcb=w.ci_lower_bound??w.expectancy_lower_bound_95;return `<tr>${td(compactId(w.window))}${td(w.purpose)}${td(w.readiness_eligibility)}${td(w.n,'num')}${td(w.effective_n,'num')}${td(pfText(w.profit_factor),'num')}${td(money(w.expectancy),'num')}${td(lcb===null||lcb===undefined?'unknown':fixed(lcb,4),'num')}</tr>`});const glossaryRows=Object.entries(gloss).map(([k,v])=>`<tr>${td(k)}${td(v)}</tr>`);document.getElementById('view-neurocore').innerHTML=panel('Trạng thái NeuroCore',kv({'Trạng thái':n.state||'unknown','Snapshot':n.snapshot_id||'unknown','Build':n.build_id||'unknown','Chỉ mô phỏng paper':n.paper_only!==false,'Được live':false,'Blocker':(n.top_blockers||[]).length,'Payload':`${(d.dashboard_contract||{}).estimated_payload_bytes||0} / ${(d.dashboard_contract||{}).payload_budget_bytes||0} bytes`}),'wide')+panel('Ranh giới rủi ro',`<div class="contractnote">${esc(n.disclaimer||'Dashboard nghiên cứu mô phỏng paper-only.')}</div>`,'wide')+panel('Blocker ưu tiên',renderNeuroBlockers(n),'wide')+panel('Sơ đồ hệ thần kinh',renderNeuroTopology(n),'wide')+panel('Event Bus',kv({'Trạng thái':bus.state||'unknown','Seq mới nhất':bus.latest_seq||0,'Throughput 1h':bus.throughput_1h||0,'DLQ':bus.dlq_count||0,'Lag lớn nhất':bus.consumer_lag_max??'unknown'}))+panel('Offset consumer',table(['Consumer','Event type','Seq','Lag','Acked'],busRows),'wide')+panel('Sức khỏe feature',kv({'Trạng thái':feat.state||'unknown','Feature rows':feat.row_count||0,'Tỉ lệ thiếu/degraded':pct(feat.missing_or_degraded_rate),'Source trust TB':pct(feat.avg_source_trust)}))+panel('Feature rows mới',table(['Coin','TF','Action','Source trust','Missing required','Missing optional'],featureRows),'wide')+panel('Cửa sổ scoring',table(['Window','Purpose','Eligibility','N','Effective N','PF','Expectancy','LCB95'],windowRows),'wide')+panel('Chart scoring đúng dữ liệu',neuroScoringBars(n),'wide')+panel('Contract tooltip chart',kv({'Axis units':contract.axis_units||'unknown','Denominator':contract.denominator||'unknown','CI method':contract.ci_method||'unknown','Trường bắt buộc':(contract.mandatory_tooltip_fields||[]).join(', ')}),'wide')+panel('Lineage Memory / Skill',kv({'Memory phase':(ms.memory||{}).phase||'unknown','Promoted memories':(ms.memory||{}).promoted_count||0,'Skill pending':(ms.skills||{}).pending_count||0,'Skill applied':(ms.skills||{}).applied_count||0,'DONT_DO rules':(ms.dont_do||{}).rule_count||0,'Evidence ids':(ms.evidence_ids||[]).join(', ')||'không có'}),'wide')+panel('Experiment / Ops',kv({'Walk-forward experiments':(n.experiments||{}).experiment_count||0,'Running':(n.experiments||{}).running||0,'Passed':(n.experiments||{}).passed||0,'Queue':JSON.stringify((ops.queue||{}).by_status||{}),'Paper runtime':(ops.paper_runtime||{}).state||'unknown','Model calls':(ops.model_usage||{}).call_count||0}))+panel('Bảo mật dashboard local',kv({'Bind host':sec.bind_host||'127.0.0.1','Local bind':sec.local_bind!==false,'Token required':sec.token_required===true,'Token configured':sec.token_configured===true,'CORS':sec.cors||'deny_by_default','Cache':sec.cache_control||'no-store','Build id':sec.build_id||'unknown'}))+panel('Độ mới widget',freshnessTable(n),'wide')+panel('Bảng thuật ngữ',table(['Term','Nghĩa'],glossaryRows),'wide');ensureChartTooltip();mountSubtabs('view-neurocore',[{id:'status',label:'Trạng thái',count:4},{id:'bus',label:'Bus',count:2},{id:'features',label:'Feature',count:2},{id:'scoring',label:'Scoring',count:3},{id:'memory',label:'Memory & Skill',count:2},{id:'ops',label:'Ops & Bảo mật',count:3},{id:'glossary',label:'Thuật ngữ',count:'rest'}])}
 const baseRenderOverview=renderOverview;renderOverview=function(d){baseRenderOverview(d);mountSubtabs('view-overview',[{id:'system',label:'Hệ thống',count:2},{id:'paper',label:'Paper & học',count:3},{id:'events',label:'Sự kiện',count:'rest'}])}
-const baseRenderReport=renderReport;renderReport=function(d){baseRenderReport(d);mountSubtabs('view-report',[{id:'summary',label:'Tổng hợp',count:3},{id:'charts',label:'Biểu đồ',count:4},{id:'breakdown',label:'Phân rã',count:2},{id:'history',label:'Lịch sử',count:'rest'}])}
-const baseRenderMarket=renderMarket;renderMarket=function(d){baseRenderMarket(d);mountSubtabs('view-market',[{id:'regime',label:'Regime',count:2},{id:'hot',label:'Coin nóng',count:1},{id:'lists',label:'Funding & majors',count:'rest'}])}
+const baseRenderReport=renderReport;renderReport=function(d){baseRenderReport(d);mountSubtabs('view-report',[{id:'summary',label:'Tổng hợp',count:4},{id:'charts',label:'Biểu đồ',count:4},{id:'breakdown',label:'Phân rã',count:2},{id:'history',label:'Lịch sử',count:'rest'}])}
+const baseRenderMarket=renderMarket;renderMarket=function(d){baseRenderMarket(d);const wf=((d.ops||{}).whale_flow)||{},rows=Object.values(wf.by_symbol||{}).slice(0,12),health=wf.source_health||[];const whaleBody=kv({'Trạng thái':wf.status||'chưa có','Cập nhật':wf.updated_at||'chưa có','Sự kiện':wf.event_count||0,'Nguồn':(wf.channels||[]).join(', ')||'chưa có','Không đặt live':!wf.can_place_live_orders})+table(['Coin','Pressure','Crowd','Squeeze','Events','Long flow','Short flow','Long liq','Short liq'],rows.map(r=>`<tr>${td(r.symbol)}${td(`${r.pressure_side||'NEUTRAL'} ${fixed(r.pressure_score,3)}`,'num')}${td(r.crowd_bias||'none')}${td(r.squeeze_risk||'none')}${td(r.event_count,'num')}${td(compactNumber(r.long_flow_notional),'num')}${td(compactNumber(r.short_flow_notional),'num')}${td(compactNumber(r.long_liquidation_notional),'num')}${td(compactNumber(r.short_liquidation_notional),'num')}</tr>`))+table(['Nguồn','Status','Tin','Lỗi'],health.map(s=>`<tr>${td(s.channel)}${td(s.status)}${td(s.message_count,'num')}${td(s.error||'')}</tr>`));document.getElementById('view-market').insertAdjacentHTML('beforeend',panel('Whale flow Telegram',whaleBody,'wide'));mountSubtabs('view-market',[{id:'regime',label:'Regime',count:2},{id:'hot',label:'Coin nóng',count:1},{id:'lists',label:'Funding & majors',count:3},{id:'whales',label:'Whale flow',count:'rest'}])}
 const baseRenderNews=renderNews;renderNews=function(d){baseRenderNews(d);mountSubtabs('view-news',[{id:'risk',label:'Risk',count:1},{id:'sources',label:'Nguồn tin',count:1},{id:'events',label:'Tin & coin',count:'rest'}])}
 const baseRenderLearning=renderLearning;renderLearning=function(d){baseRenderLearning(d);document.getElementById('view-learning').insertAdjacentHTML('beforeend',renderImprovementProof(d)+renderPostTradeLearning(d)+renderCounterfactualLearning(d)+renderWalkForwardLearning(d));mountSubtabs('view-learning',[{id:'summary',label:'Tổng hợp',count:4},{id:'promotion',label:'Promotion',count:2},{id:'llm',label:'Model lớn',count:2},{id:'exam',label:'Kỳ thi',count:3},{id:'curriculum',label:'Curriculum',count:3},{id:'skills',label:'Skills & edge',count:3},{id:'reviews',label:'Review lệnh',count:4},{id:'counterfactual',label:'Replay',count:3},{id:'walkforward',label:'Walk-forward',count:'rest'}])}
-const baseRenderAgents=renderAgents;renderAgents=function(d){baseRenderAgents(d);const ops=d.ops||{};document.getElementById('view-agents').insertAdjacentHTML('beforeend',panel('Paper loop và microstructure loop',kv({'Paper loop':(ops.paper_loop||{}).status||'chưa có','Paper loop action':((ops.paper_loop||{}).decision||{}).action||(ops.paper_loop||{}).action||'không có','Paper candidates':(ops.paper_loop||{}).candidate_count||0,'Microstructure':(ops.microstructure_loop||{}).status||'chưa có','Micro results':(ops.microstructure_loop||{}).result_count||0,'Host runtime':(ops.host_runtime||{}).status||'chưa có','Security import guard':(ops.security_import_guard||{}).ok===false?'vi phạm':'OK'}),'wide'));mountSubtabs('view-agents',[{id:'runtime',label:'Runtime',count:2},{id:'health',label:'Heartbeat',count:1},{id:'logs',label:'Logs',count:1},{id:'loops',label:'Loops',count:'rest'}])}
+const baseRenderAgents=renderAgents;renderAgents=function(d){baseRenderAgents(d);const ops=d.ops||{};document.getElementById('view-agents').insertAdjacentHTML('beforeend',panel('Paper loop và microstructure loop',kv({'Paper loop':(ops.paper_loop||{}).status||'chưa có','Paper loop action':((ops.paper_loop||{}).decision||{}).action||(ops.paper_loop||{}).action||'không có','Paper candidates':(ops.paper_loop||{}).candidate_count||0,'Microstructure':(ops.microstructure_loop||{}).status||'chưa có','Micro results':(ops.microstructure_loop||{}).result_count||0,'Whale flow':(ops.whale_flow||{}).status||'chưa có','Whale events':(ops.whale_flow||{}).event_count||0,'Host runtime':(ops.host_runtime||{}).status||'chưa có','Security import guard':(ops.security_import_guard||{}).ok===false?'vi phạm':'OK'}),'wide'));mountSubtabs('view-agents',[{id:'runtime',label:'Runtime',count:2},{id:'health',label:'Heartbeat',count:1},{id:'logs',label:'Logs',count:1},{id:'loops',label:'Loops',count:'rest'}])}
 async function renderLogsShell(){const el=document.getElementById('view-logs');if(!el.dataset.ready){el.innerHTML=panel('Logs live',`<div class="actions" style="margin-bottom:10px;flex-wrap:wrap"><button class="btn" data-log="scalp_autotrader">Autotrader</button><button class="btn" data-log="scalp_watchdog">Watchdog</button><button class="btn" data-log="autotrader_err">Lỗi</button><button class="btn" data-log="autotrader_out">Output</button><button class="btn" data-log="market_updates">Thị trường</button><button class="btn" data-log="news_events">Tin tức</button></div><div class="log" id="logbox">chọn một log</div>`,'wide');el.dataset.ready='1';el.querySelectorAll('[data-log]').forEach(b=>b.onclick=()=>loadLog(b.dataset.log));loadLog('scalp_autotrader')}}
 async function loadLog(name){try{document.getElementById('logbox').textContent=await fetchText('/api/log?name='+encodeURIComponent(name)+'&lines=220')}catch(e){document.getElementById('logbox').textContent='lỗi nhật ký '+e}}
 function showView(view){const b=document.querySelector(`.nav button[data-view="${view}"]`);const panel=document.getElementById('view-'+view);if(!b||!panel)return;document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.view').forEach(v=>v.classList.add('hidden'));panel.classList.remove('hidden')}
@@ -1183,6 +2401,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Dashboard-Build-Id", DASHBOARD_BUILD_ID)
+        identity = getattr(self.server, "dashboard_identity", None)
+        if isinstance(identity, dict):
+            self.send_header("X-Dashboard-Server-Identity", str(identity.get("server_identity") or ""))
+            self.send_header("X-Dashboard-Pid", str(identity.get("pid") or ""))
+            self.send_header("X-Dashboard-Token-Scope", str(identity.get("token_scope") or ""))
+            probe_secret = str(getattr(self.server, "dashboard_probe_secret", "") or DASHBOARD_RUNTIME.get("probe_secret") or "")
+            if probe_secret:
+                self.send_header("X-Dashboard-Identity-Signature", dashboard_identity_signature(identity, probe_secret))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1190,10 +2419,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def send_json(self, payload: dict, status: int = 200) -> None:
         self.send_bytes(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True).encode("utf-8"), "application/json; charset=utf-8", status)
 
+    def request_is_allowed(self, parsed) -> bool:
+        bind_host = str(getattr(self.server, "dashboard_bind_host", DASHBOARD_RUNTIME.get("host", "127.0.0.1")))
+        token = str(getattr(self.server, "dashboard_token", "") or "")
+        host_header = strip_host_port(self.headers.get("Host"))
+        if any(key.lower() == "token" for key in parse_qs(parsed.query)):
+            return False
+        if token:
+            if parsed.path in {"/", "/dashboard"}:
+                return True
+            supplied = self.headers.get("X-Dashboard-Token")
+            if supplied != token:
+                return False
+            return True
+        return is_local_dashboard_host(bind_host) and (not host_header or is_local_dashboard_host(host_header))
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if not self.request_is_allowed(parsed):
+            self.send_json({"error": "dashboard_access_denied", "build_id": DASHBOARD_BUILD_ID}, HTTPStatus.FORBIDDEN)
+            return
+        if parsed.path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         if parsed.path in {"/", "/dashboard"}:
             self.send_bytes(HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if parsed.path == "/healthz":
+            health = build_healthz_payload()
+            self.send_json(health, HTTPStatus.OK if health.get("ok") else HTTPStatus.SERVICE_UNAVAILABLE)
             return
         if parsed.path == "/api/status":
             self.send_json(load_dashboard_status())
@@ -1204,12 +2460,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not identifier:
                 self.send_json({"error": "missing_id"}, HTTPStatus.BAD_REQUEST)
                 return
-            self.send_json(explain_decision(identifier))
+            self.send_json(sanitize_dashboard_payload(explain_decision(identifier)))
             return
         if parsed.path == "/api/log":
             params = parse_qs(parsed.query)
             name = (params.get("name") or ["scalp_autotrader"])[0]
-            lines = int((params.get("lines") or ["120"])[0])
+            try:
+                lines = min(300, max(1, int((params.get("lines") or ["120"])[0])))
+            except Exception:
+                lines = 120
             path = LOG_FILES.get(name)
             if not path:
                 self.send_bytes(b"unknown log", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
@@ -1223,10 +2482,22 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def bind_dashboard_server(host: str, port: int, handler=DashboardHandler, attempts: int = 5) -> ReusableThreadingHTTPServer:
+    last_error: OSError | None = None
+    for offset in range(max(1, attempts)):
+        candidate_port = int(port) + offset
+        try:
+            return ReusableThreadingHTTPServer((host, candidate_port), handler)
+        except OSError as exc:
+            last_error = exc
+    raise last_error or OSError("dashboard_bind_failed")
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the single-page trading agent dashboard")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument("--token-env", default="TRADING_AGENT_DASHBOARD_TOKEN", help="Env var used when binding beyond localhost")
     parser.add_argument("--open", action="store_true", help="Open one browser tab after server starts")
     parser.add_argument("--once", action="store_true", help="Print status JSON and exit")
     return parser.parse_args(list(argv) if argv is not None else None)
@@ -1237,8 +2508,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.once:
         print(json.dumps(load_dashboard_status(), ensure_ascii=True, indent=2, sort_keys=True))
         return 0
-    url = f"http://{args.host}:{args.port}/"
-    with ReusableThreadingHTTPServer((args.host, args.port), DashboardHandler) as server:
+    token = os.environ.get(args.token_env, "")
+    policy = validate_dashboard_bind(args.host, token)
+    if not policy["ok"]:
+        print(f"dashboard_bind_denied {','.join(policy['errors'])}", flush=True)
+        return 2
+    with bind_dashboard_server(args.host, args.port, DashboardHandler) as server:
+        actual_port = int(server.server_address[1])
+        DASHBOARD_RUNTIME.update({"host": args.host, "port": actual_port, "build_id": DASHBOARD_BUILD_ID, "token_required": bool(policy["token_required"])})
+        probe_secret = ensure_dashboard_probe_secret()
+        identity = write_dashboard_port_registry(args.host, actual_port, token_required=bool(policy["token_required"]))
+        url = f"http://{args.host}:{actual_port}/"
+        server.dashboard_bind_host = args.host
+        server.dashboard_token = token if policy["token_required"] else ""
+        server.dashboard_build_id = DASHBOARD_BUILD_ID
+        server.dashboard_identity = identity
+        server.dashboard_probe_secret = probe_secret
         print(f"agent_dashboard {url}", flush=True)
         if args.open:
             webbrowser.open(url, new=1)

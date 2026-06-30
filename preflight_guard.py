@@ -8,7 +8,8 @@ from typing import Any, Iterable
 from agent_data_contracts import SCHEMA_VERSION
 from atomic_state import read_json, write_json_atomic
 from instrument_registry import can_trade_paper, load_registry
-from live_permission_firewall import evaluate_live_permission
+from kill_switch import kill_switch_active
+from live_permission_firewall import evaluate_live_permission, paper_action_allowed, sanitize_and_detect
 from runtime_config import evaluate_mode, load_runtime_config
 from timebase import parse_utc, seconds_between, utc_now
 
@@ -60,14 +61,17 @@ def run_preflight(
     output_path: Path = PRELIGHT_PATH,
 ) -> dict[str, Any]:
     action = action or {"action": "paper_decision"}
+    scanned_action = sanitize_and_detect(action)
     config_eval = evaluate_mode(config or load_runtime_config())
     firewall = evaluate_live_permission(action, config_eval)
     errors: list[str] = []
     warnings: list[str] = []
+    if kill_switch_active(STATE_DIR / "KILL_SWITCH_ACTIVE.json"):
+        errors.append("kill_switch_active")
     if config_eval.get("status") != "ok":
         errors.extend(config_eval.get("errors") or [])
         warnings.extend(config_eval.get("warnings") or [])
-    if not firewall.get("allowed"):
+    if not paper_action_allowed(firewall):
         errors.extend(firewall.get("errors") or [])
     instrument_decision = None
     if symbol:
@@ -84,17 +88,25 @@ def run_preflight(
     warnings.extend(fresh_warnings)
     if action.get("requires_fresh_market", True):
         errors.extend(error for error in fresh_errors if error == "stale_market_observer")
+        market = read_json(freshness_paths["market_observer"], default={})
+        if market and not (market.get("provenance_id") or market.get("source_ids") or market.get("source")):
+            errors.append("missing_market_provenance")
     if action.get("requires_lifecycle_clean", True):
         lifecycle = read_json(freshness_paths["trade_lifecycle"], default={})
         if lifecycle and not lifecycle.get("learning_allowed", False):
             errors.append("trade_lifecycle_not_clean")
 
+    allowed = not errors
     payload = {
         "schema_version": SCHEMA_VERSION,
         "checked_at": utc_now(),
-        "action": action,
+        "action": firewall.get("request_sanitized", scanned_action["sanitized"]),
+        "action_fingerprint": scanned_action["fingerprint"],
         "symbol": str(symbol or "").upper() or None,
-        "allowed": not errors,
+        "paper_action_allowed": allowed,
+        "allowed": allowed,
+        "live_permission": False,
+        "can_place_live_orders": False,
         "mode": config_eval.get("mode"),
         "reason": "ok" if not errors else ";".join(sorted(set(errors))),
         "errors": sorted(set(errors)),

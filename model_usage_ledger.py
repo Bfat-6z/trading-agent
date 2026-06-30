@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 from typing import Any
 
 from agent_data_contracts import SCHEMA_VERSION
@@ -26,7 +27,28 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     rates = MODEL_COST_PER_1K.get(model, {"input": 0.0, "output": 0.0})
     return round((input_tokens / 1000) * rates["input"] + (output_tokens / 1000) * rates["output"], 8)
 
-def record_model_usage(job_type: str, model: str, provider: str, prompt: Any = "", response: Any = "", status: str = "ok", history_path: Path = USAGE_HISTORY, latest_path: Path = USAGE_LATEST) -> dict[str, Any]:
+def stable_request_id(job_type: str, model: str, prompt: Any, response: Any) -> str:
+    raw = f"{job_type}:{model}:{str(prompt)[:500]}:{str(response)[:500]}"
+    return "model_req_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def record_model_usage(
+    job_type: str,
+    model: str,
+    provider: str,
+    prompt: Any = "",
+    response: Any = "",
+    status: str = "ok",
+    history_path: Path = USAGE_HISTORY,
+    latest_path: Path = USAGE_LATEST,
+    *,
+    request_id: str | None = None,
+    latency_ms: int | None = None,
+    actual_response_model_id: str | None = None,
+    route_reason: str | None = None,
+    fallback_reason: str | None = None,
+    quality_gate_ok: bool | None = None,
+) -> dict[str, Any]:
     input_tokens = estimate_tokens(prompt)
     output_tokens = estimate_tokens(response)
     row = {
@@ -35,6 +57,12 @@ def record_model_usage(job_type: str, model: str, provider: str, prompt: Any = "
         "job_type": job_type,
         "provider": provider,
         "model": model,
+        "actual_response_model_id": actual_response_model_id or model,
+        "request_id": request_id or stable_request_id(job_type, model, prompt, response),
+        "latency_ms": latency_ms,
+        "route_reason": route_reason,
+        "fallback_reason": fallback_reason,
+        "quality_gate_ok": quality_gate_ok,
         "status": status,
         "input_tokens_est": input_tokens,
         "output_tokens_est": output_tokens,

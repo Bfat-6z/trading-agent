@@ -54,7 +54,7 @@ def test_run_once_writes_self_improvement_outputs(tmp_path: Path, monkeypatch):
     write_json(memory / "news_latest.json", {"ts": sia.utc_now()})
 
     library = ssl.default_library()
-    ssl.record_setup_outcome(library, "momentum_continuation", -0.1, "risk_on", "BTCUSDT", "LONG")
+    ssl.record_setup_outcome(library, "momentum_continuation", -0.1, "risk_on", "BTCUSDT", "LONG", evidence_id="paper_close_1")
     monkeypatch.setattr(sia, "BIAS_PATH", memory / "execution_bias.json")
     monkeypatch.setattr(sia, "MARKET_MODEL_PATH", memory / "market_model.json")
     monkeypatch.setattr(sia, "COGNITIVE_LATEST", memory / "cognitive_state_latest.json")

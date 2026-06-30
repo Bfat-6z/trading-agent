@@ -21,6 +21,7 @@ from xml.etree import ElementTree
 
 from event_store import safe_append_event, safe_append_snapshot, safe_upsert_heartbeat
 from news_signal_model import normalize_event, save_latest, score_events, stable_event_id
+from source_provenance import build_provenance
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
@@ -300,6 +301,21 @@ def write_events(events: list[dict], events_path: Path | None = None) -> list[di
             continue
         existing.add(event["event_id"])
         append_jsonl(events_path, event)
+        try:
+            from event_store import append_event_envelope
+
+            source_id = "news_observer"
+            provenance = build_provenance("news_event", [source_id], input_ids=[event["event_id"]], metadata={"source": event.get("source")})
+            append_event_envelope(
+                "news.snapshot.captured",
+                {"snapshot_id": event["event_id"], "source_id": source_id, "text_hash": event.get("text_hash")},
+                "news_observer",
+                source_id,
+                event["event_id"],
+                provenance_id=provenance["provenance_id"],
+            )
+        except Exception:
+            pass
         safe_append_event("news_observer", "news_event", event, ts=event.get("ts_seen"))
         written.append(event)
     return written

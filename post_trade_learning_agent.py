@@ -366,6 +366,16 @@ def review_closed_trade(
             "best_variant": counterfactual.get("best_variant"),
         } if counterfactual else {},
         "market_regime": context_value(trade, "market_regime", "regime", "primary_regime"),
+        "decision_regime_state": trade.get("decision_regime_state") if isinstance(trade.get("decision_regime_state"), dict) else {},
+        "post_trade_regime_outcome": {
+            "labeler_version": "post_trade_regime_outcome_v1",
+            "horizon": "post_close_review",
+            "close_ts": trade.get("close_ts"),
+            "market_regime": context_value(trade, "market_regime", "regime", "primary_regime"),
+            "regime_mismatch": has_regime_mismatch,
+            "classification": classification,
+            "post_trade_outcome": True,
+        },
         "data_quality": {
             "candle_count": len(candles),
             "has_counterfactual": bool(counterfactual),

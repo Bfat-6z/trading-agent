@@ -19,6 +19,7 @@ from typing import Iterable
 import requests
 
 from event_store import safe_append_event, safe_append_snapshot, safe_upsert_heartbeat
+from data_source_registry import register_source
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
@@ -179,6 +180,8 @@ def build_snapshot(limit: int = 10) -> dict:
     majors = [by_symbol[symbol] for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT") if symbol in by_symbol]
     return {
         "ts": utc_now(),
+        "source": "market_observer",
+        "source_ids": ["market_observer"],
         "universe_count": len(tickers),
         "majors": [ticker_payload(ticker, funding) for ticker in majors],
         "top_volume": [ticker_payload(ticker, funding) for ticker in top_volume],
@@ -255,6 +258,20 @@ def render_markdown(snapshot: dict) -> str:
 
 def write_snapshot(snapshot: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        register_source(
+            "market_observer",
+            {
+                "provider": "binance",
+                "source_type": "market",
+                "status": "ok",
+                "last_success_at": snapshot.get("ts"),
+                "trust_score": 0.82,
+                "freshness_sla_seconds": 900,
+            },
+        )
+    except Exception:
+        pass
     with JSONL_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(snapshot, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n")
     LATEST_JSON.write_text(json.dumps(snapshot, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")

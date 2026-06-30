@@ -16,9 +16,12 @@ from pathlib import Path
 from typing import Iterable
 
 from event_store import safe_append_event, safe_append_snapshot, safe_upsert_heartbeat
+from data_trust import prepare_llm_egress
 from llm_output_quality_gate import sanitize_output
 from model_usage_ledger import record_model_usage
 from model_router import route_model
+from llm_council import model_budget_allowed
+from trace_eval import build_prompt_trace, save_prompt_trace
 
 ROOT = Path(__file__).resolve().parent
 CRYPTO_SRC = ROOT / "tradingagents_crypto_src"
@@ -197,6 +200,9 @@ def sanitize_reasoning(payload: dict, provider: dict, raw_text: str) -> dict:
     risk["can_place_live_orders"] = False
     risk["can_loosen_risk"] = False
     payload["risk_proposal"] = risk
+    payload["can_place_live_orders"] = False
+    payload["can_loosen_risk"] = False
+    payload["live_permission"] = False
     payload["contract"] = {"read_only": True, "paper_shadow_only": True, "can_place_live_orders": False, "can_loosen_risk": False}
     payload["provider"] = provider
     payload["raw_text_preview"] = raw_text[:1200]
@@ -245,42 +251,163 @@ def render_report(result: dict) -> str:
 
 def run_once(max_log_lines: int = 80, model: str | None = None, max_tokens: int = 1600) -> dict:
     load_dotenv()
-    provider = provider_snapshot()
     model_route = route_model("blindspot")
-    context = collect_context(max_log_lines)
+    provider = {
+        "provider": model_route.get("provider_redacted"),
+        "deep_model": model_route.get("deep_model") or model_route.get("model"),
+        "quick_model": model_route.get("quick_model"),
+        "judge_model": model_route.get("quick_model"),
+        "base_url": None,
+    }
+    raw_context = collect_context(max_log_lines)
+    egress = prepare_llm_egress(raw_context, "llm_reasoning")
+    context = egress["payload"]
     ts = utc_now()
-    try:
-        system, user = build_messages(context)
-        routed_model = model or model_route.get("model") or provider.get("deep_model")
-        text = call_large_model(system, user, model=routed_model, max_tokens=max_tokens)
-        usage = record_model_usage("llm_reasoning", str(routed_model), str(provider.get("provider") or model_route.get("provider_redacted")), prompt=system + user, response=text)
-        payload = sanitize_reasoning(parse_model_json(text), provider, text)
-        quality_input = dict(payload)
-        quality_input.pop("raw_text_preview", None)
-        quality = sanitize_output(quality_input, kind="llm_reasoning")
-        payload = quality.get("sanitized") if isinstance(quality.get("sanitized"), dict) else payload
-        payload["raw_text_preview"] = text[:1200]
-        status = "ok" if quality.get("ok") else "degraded"
-        error = None
-    except Exception as exc:
-        payload = fallback_payload(f"{type(exc).__name__}: {exc}", provider)
+    system = ""
+    user = ""
+    text = ""
+    if not model_route.get("allowed", True):
+        blocked_reason = str(model_route.get("degraded_reason") or "route_blocked")
+        payload = fallback_payload(f"model_route_blocked: {blocked_reason}", provider)
+        payload["egress_proof"] = egress["proof"]
         quality = sanitize_output(payload, kind="llm_reasoning")
-        usage = record_model_usage("llm_reasoning", str(model or model_route.get("model") or provider.get("deep_model")), str(provider.get("provider") or model_route.get("provider_redacted")), prompt="", response=payload.get("error"), status="degraded")
+        usage = record_model_usage(
+            "llm_reasoning",
+            str(model or model_route.get("model") or provider.get("deep_model")),
+            str(provider.get("provider") or model_route.get("provider_redacted")),
+            prompt="",
+            response=payload.get("error"),
+            status="degraded",
+            route_reason=str(model_route.get("route_reason")),
+            fallback_reason=blocked_reason,
+            quality_gate_ok=False,
+        )
         status = "degraded"
         error = payload["error"]
-    result = {"ts": ts, "pid": os.getpid(), "status": status, "provider": provider, "model_route": model_route, "quality_gate": quality, "model_usage": usage, "reasoning": payload, "error": error}
+    else:
+        system, user = build_messages(context)
+        budget_guard = model_budget_allowed("llm_reasoning", "blindspot", system + user, max_response_tokens=max_tokens)
+        if not budget_guard.get("allowed"):
+            blocked_reason = str(budget_guard.get("reason") or "token_budget_exhausted")
+            model_route = {
+                **model_route,
+                "allowed": False,
+                "degraded_reason": blocked_reason,
+                "degraded_action": "fail_closed",
+                "budget_guard": budget_guard,
+            }
+            payload = fallback_payload(f"model_budget_blocked: {blocked_reason}", provider)
+            payload["egress_proof"] = egress["proof"]
+            quality = sanitize_output(payload, kind="llm_reasoning")
+            usage = record_model_usage(
+                "llm_reasoning",
+                str(model or model_route.get("model") or provider.get("deep_model")),
+                str(provider.get("provider") or model_route.get("provider_redacted")),
+                prompt=system + user,
+                response=payload.get("error"),
+                status="degraded",
+                route_reason=str(model_route.get("route_reason")),
+                fallback_reason=blocked_reason,
+                quality_gate_ok=False,
+            )
+            status = "degraded"
+            error = payload["error"]
+        try:
+            if budget_guard.get("allowed"):
+                provider = provider_snapshot()
+                routed_model = model or model_route.get("model") or provider.get("deep_model")
+                text = call_large_model(system, user, model=routed_model, max_tokens=max_tokens)
+                payload = sanitize_reasoning(parse_model_json(text), provider, text)
+                payload["egress_proof"] = egress["proof"]
+                quality_input = dict(payload)
+                quality_input.pop("raw_text_preview", None)
+                quality = sanitize_output(quality_input, kind="llm_reasoning")
+                payload = quality.get("sanitized") if isinstance(quality.get("sanitized"), dict) else payload
+                payload["raw_text_preview"] = text[:1200]
+                status = "ok" if quality.get("ok") else "degraded"
+                usage = record_model_usage(
+                    "llm_reasoning",
+                    str(routed_model),
+                    str(provider.get("provider") or model_route.get("provider_redacted")),
+                    prompt=system + user,
+                    response=text,
+                    status=status,
+                    route_reason=str(model_route.get("route_reason")),
+                    quality_gate_ok=bool(quality.get("ok")),
+                )
+                error = None
+        except Exception as exc:
+            payload = fallback_payload(f"{type(exc).__name__}: {exc}", provider)
+            payload["egress_proof"] = egress["proof"]
+            quality = sanitize_output(payload, kind="llm_reasoning")
+            usage = record_model_usage("llm_reasoning", str(model or model_route.get("model") or provider.get("deep_model")), str(provider.get("provider") or model_route.get("provider_redacted")), prompt="", response=payload.get("error"), status="degraded", route_reason=str(model_route.get("route_reason")), fallback_reason=type(exc).__name__, quality_gate_ok=False)
+            status = "degraded"
+            error = payload["error"]
+    risk = payload.get("risk_proposal") if isinstance(payload.get("risk_proposal"), dict) else {}
+    result = {
+        "ts": ts,
+        "pid": os.getpid(),
+        "status": status,
+        "provider": provider,
+        "model_route": model_route,
+        "quality_gate": quality,
+        "model_usage": usage,
+        "egress_proof": egress["proof"],
+        "reasoning": payload,
+        "can_place_live_orders": bool(risk.get("can_place_live_orders")),
+        "can_loosen_risk": bool(risk.get("can_loosen_risk")),
+        "error": error,
+    }
+    try:
+        prompt_trace = build_prompt_trace(
+            run_id=f"llm_reasoning:{ts}",
+            event_id=result.get("model_usage", {}).get("request_id"),
+            source_ids=[str(result.get("egress_proof", {}).get("egress_id") or "")],
+            provenance_ids=[str(result.get("egress_proof", {}).get("egress_id") or "")],
+            model=str(model or model_route.get("model") or provider.get("deep_model") or ""),
+            prompt_version="llm_reasoning.v1",
+            prompt=system + user,
+            completion=text or payload,
+            model_route=model_route,
+            gate_result=quality,
+            outcome=status,
+            egress_proof=egress["proof"],
+            model_usage=usage,
+            labels=["llm_reasoning", str(status)],
+            evidence_refs=[str(result.get("egress_proof", {}).get("egress_id") or "")],
+            payload=payload,
+        )
+        save_prompt_trace(prompt_trace, MEMORY_DIR / "prompt_trace_latest.json", MEMORY_DIR / "prompt_trace_history.jsonl")
+        result["prompt_trace"] = prompt_trace
+    except Exception as exc:
+        result["status"] = "degraded"
+        trace_error = f"{type(exc).__name__}: {exc}"
+        result["error"] = trace_error if not result.get("error") else f"{result.get('error')} | prompt_trace: {trace_error}"
+        result["prompt_trace_error"] = trace_error
+    try:
+        safe_append_snapshot("llm_reasoning_agent", "llm_reasoning", result, ts=ts)
+        safe_append_event("llm_reasoning_agent", "llm_reasoning_update", {"status": result.get("status"), "provider": provider.get("provider"), "model": provider.get("deep_model"), "error": result.get("error")}, ts=ts)
+    except Exception as exc:
+        event_error = f"{type(exc).__name__}: {exc}"
+        result["status"] = "degraded"
+        result["error"] = event_error if not result.get("error") else f"{result.get('error')} | event_store: {event_error}"
+        result["event_store_error"] = event_error
     write_json(LATEST_JSON, result)
     append_jsonl(HISTORY_JSONL, result)
     REPORT_MD.write_text(render_report(result), encoding="utf-8")
-    safe_append_snapshot("llm_reasoning_agent", "llm_reasoning", result, ts=ts)
-    safe_append_event("llm_reasoning_agent", "llm_reasoning_update", {"status": status, "provider": provider.get("provider"), "model": provider.get("deep_model"), "error": error}, ts=ts)
-    write_heartbeat(status, {"provider": provider.get("provider"), "model": provider.get("deep_model"), "summary": payload.get("summary"), "error": error})
+    write_heartbeat(str(result.get("status") or status), {"provider": provider.get("provider"), "model": provider.get("deep_model"), "summary": payload.get("summary"), "error": result.get("error")})
     return result
 
 def write_heartbeat(status: str, payload: dict | None = None) -> None:
     row = {"ts": utc_now(), "pid": os.getpid(), "status": status, **(payload or {})}
     write_json(HEARTBEAT_PATH, row)
-    safe_upsert_heartbeat("llm_reasoning_agent", status, row, ts=row["ts"])
+    try:
+        safe_upsert_heartbeat("llm_reasoning_agent", status, row, ts=row["ts"])
+    except Exception as exc:
+        event_error = f"{type(exc).__name__}: {exc}"
+        row["event_store_error"] = event_error
+        row["error"] = event_error if not row.get("error") else f"{row.get('error')} | heartbeat: {event_error}"
+        write_json(HEARTBEAT_PATH, row)
 
 def read_pid(path: Path) -> int | None:
     try:

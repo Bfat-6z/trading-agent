@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "chart_model_version": "chart_intelligence_v1",
+  "contract": "ChartCandleBatch.v1",
+  "symbol": "BTCUSDT",
+  "timeframe": "1m",
+  "closed_only": true,
+  "source_ids": ["binance_usdm_klines_fixture"],
+  "input_event_ids": ["fixture_event_btcusdt_1m_001"],
+  "decision_cutoff": "2026-06-21T00:01:05+00:00",
+  "cutoff_proof": {
+    "ok": true,
+    "decision_cutoff": "2026-06-21T00:01:05+00:00",
+    "errors": []
+  },
+  "degradation_state": "ok",
+  "bars": [
+    {
+      "open_time": "2026-06-21T00:00:00+00:00",
+      "close_time": "2026-06-21T00:01:00+00:00",
+      "open": "65000",
+      "high": "65080",
+      "low": "64920",
+      "close": "65020",
+      "volume": "1200",
+      "is_final": true,
+      "available_at": "2026-06-21T00:01:01+00:00",
+      "known_at": "2026-06-21T00:01:01+00:00",
+      "ingested_at": "2026-06-21T00:01:02+00:00",
+      "finalized_at": "2026-06-21T00:01:00+00:00"
+    }
+  ]
+}

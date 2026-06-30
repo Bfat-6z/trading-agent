@@ -59,6 +59,7 @@ def test_paper_brain_does_not_add_invalid_margin_when_allocation_blocks(monkeypa
     monkeypatch.setattr(brain, "BRAIN_LATEST", tmp_path / "brain.json")
     monkeypatch.setattr(brain, "BRAIN_HISTORY", tmp_path / "brain.jsonl")
     monkeypatch.setattr(brain, "PAPER_RISK_STATE", tmp_path / "risk.json")
+    monkeypatch.setattr(brain, "paper_opens_paused_by_runtime", lambda: {"paused": False, "reason": "ok", "replay_required": False, "promotion_window_valid": True})
     monkeypatch.setattr(brain, "run_preflight", lambda *args, **kwargs: {"allowed": True, "errors": []})
     monkeypatch.setattr(brain, "evaluate_candidate", lambda candidate: {"blocked": False})
     monkeypatch.setattr(brain, "rank_setups", lambda rows: {"rankings": [{"setup_id": "s1", "evidence_expectancy": -0.1, "expectancy": -0.1, "allocation_hint": "reduced", "risk_multiplier": 0.35}]})
@@ -208,7 +209,7 @@ def test_preflight_reads_actual_market_and_news_latest_paths(monkeypatch, tmp_pa
     memory.mkdir(parents=True)
     monkeypatch.setattr(pfg, "STATE_DIR", state)
     monkeypatch.setattr(pfg, "MEMORY_DIR", memory)
-    pfg.write_json_atomic(state / "market_updates_latest.json", {"ts": pfg.utc_now(), "hot": [{"symbol": "BTCUSDT"}]})
+    pfg.write_json_atomic(state / "market_updates_latest.json", {"ts": pfg.utc_now(), "source": "market_observer", "source_ids": ["market_observer"], "hot": [{"symbol": "BTCUSDT"}]})
     pfg.write_json_atomic(memory / "news_latest.json", {"ts": pfg.utc_now(), "macro_risk_score": 0.2})
     pfg.write_json_atomic(memory / "trade_lifecycle_latest.json", {"ts": pfg.utc_now(), "learning_allowed": True})
 
@@ -253,6 +254,29 @@ def test_daily_exam_prioritizes_self_model_gaps(monkeypatch, tmp_path: Path):
     inputs = dea.load_inputs(max_log_lines=50)
 
     assert dea.choose_exam_type(inputs, "2026-06-21") == "risk_gate_review"
+
+def test_daily_exam_prioritizes_ranked_test_memory_gaps(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(dea, "SELF_MODEL", tmp_path / "self_model.json")
+    monkeypatch.setattr(dea, "TEST_RESULT_MEMORY", tmp_path / "test_result_memory.json")
+    dea.write_json(dea.SELF_MODEL, {"known_gaps": []})
+    dea.write_json(
+        dea.TEST_RESULT_MEMORY,
+        {
+            "priority_curriculum": [
+                {
+                    "gap": "counterfactual_coverage_low",
+                    "priority_score": 9,
+                    "occurrences": 3,
+                    "task": "raise replay coverage",
+                    "action": "run replay",
+                    "source": "counterfactual",
+                }
+            ],
+        },
+    )
+    inputs = dea.load_inputs(max_log_lines=50)
+
+    assert dea.choose_exam_type(inputs, "2026-06-21") == "setup_defense"
 
 def test_daily_exam_scores_objective_performance_improvement():
     inputs = {

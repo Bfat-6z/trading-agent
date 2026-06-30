@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 REGIME_VERSION = "regime_v1"
+DECISION_REGIME_VERSION = "decision_regime_v1"
 
 
 def label_regime(features: dict[str, Any]) -> dict[str, Any]:
@@ -27,4 +28,25 @@ def label_regime(features: dict[str, Any]) -> dict[str, Any]:
         "participation": participation,
         "label": f"{direction}:{volatility}:{participation}",
         "confidence": round(confidence, 4),
+    }
+
+
+def label_decision_regime(
+    features: dict[str, Any],
+    *,
+    decision_cutoff: str,
+    input_event_ids: list[str] | None = None,
+    finalized_candle_lag: int | float = 0,
+) -> dict[str, Any]:
+    label = label_regime(features)
+    return {
+        **label,
+        "regime_version": DECISION_REGIME_VERSION,
+        "labeler_version": DECISION_REGIME_VERSION,
+        "allowed_inputs": ["pre_cutoff_feature_row"],
+        "horizon": "decision_time",
+        "decision_cutoff": decision_cutoff,
+        "finalized_candle_lag_seconds": float(finalized_candle_lag or 0),
+        "input_event_ids": input_event_ids or [],
+        "post_trade_outcome": False,
     }

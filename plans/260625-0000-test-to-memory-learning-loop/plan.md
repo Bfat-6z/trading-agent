@@ -109,11 +109,31 @@ venv\Scripts\python.exe self_model.py --once
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8090/api/status -TimeoutSec 15
 ```
 
+## Phase 5: History-Aware Test Prioritization
+
+Make test memory more useful across days by ranking repeated failure modes and feeding the ranked queue back into exam selection.
+
+Scope:
+
+- group lessons by `gap` and `source`
+- count repeated failures from `test_result_memory_history.jsonl`
+- expose a ranked `priority_curriculum`
+- let `self_model.py` surface the ranked learning queue
+- let `daily_exam_agent.py` prefer the highest-priority gaps when choosing the next exam type
+
+Acceptance criteria:
+
+- repeated failures outrank one-off lessons
+- the same failure mode across multiple sources gets higher priority
+- `daily_exam_agent.py` can pick an exam from the ranked gaps instead of only the static gap list
+- all outputs remain paper/shadow only
+
 ## Done
 
 - The agent can say what tests/exams it failed.
 - The agent can convert those failures into learning tasks.
 - The self-model can see these tasks.
+- The agent can rank repeated failures and reuse them in the next exam cycle.
 - No live order permission is introduced.
 
 ## Progress Log

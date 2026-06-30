@@ -75,8 +75,8 @@ def test_disabled_setup_does_not_match():
 def test_record_setup_outcome_updates_global_and_regime_stats():
     library = ssl.default_library()
 
-    ssl.record_setup_outcome(library, "momentum_continuation", 0.12, "risk_on", "SOLUSDT", "LONG")
-    skill = ssl.record_setup_outcome(library, "momentum_continuation", -0.04, "risk_on", "SOLUSDT", "LONG")
+    ssl.record_setup_outcome(library, "momentum_continuation", 0.12, "risk_on", "SOLUSDT", "LONG", evidence_id="paper_close_1")
+    skill = ssl.record_setup_outcome(library, "momentum_continuation", -0.04, "risk_on", "SOLUSDT", "LONG", evidence_id="paper_close_2")
 
     stats = skill["stats"]
     assert stats["trades"] == 2
@@ -86,6 +86,14 @@ def test_record_setup_outcome_updates_global_and_regime_stats():
     assert stats["win_rate"] == 0.5
     assert stats["expectancy"] == 0.04
     assert stats["by_regime"]["risk_on"]["trades"] == 2
+
+def test_manual_setup_outcome_without_evidence_does_not_change_stats():
+    library = ssl.default_library()
+
+    skill = ssl.record_setup_outcome(library, "momentum_continuation", 0.12, "risk_on", "SOLUSDT", "LONG")
+
+    assert skill["stats"]["trades"] == 0
+    assert library["history"][-1]["event"] == "setup_outcome_rejected"
 
 
 def test_record_unknown_setup_raises():
@@ -97,7 +105,7 @@ def test_load_save_merges_defaults_with_persisted_stats(tmp_path: Path, monkeypa
     monkeypatch.setattr(ssl, "safe_append_snapshot", lambda *args, **kwargs: None)
     path = tmp_path / "setup_skills.json"
     library = ssl.default_library()
-    ssl.record_setup_outcome(library, "funding_squeeze", 0.2, "mixed", "REUSDT", "LONG")
+    ssl.record_setup_outcome(library, "funding_squeeze", 0.2, "mixed", "REUSDT", "LONG", evidence_id="paper_close_1")
     library["skills"]["false_breakout"]["enabled"] = False
     ssl.save_library(library, path=path)
 

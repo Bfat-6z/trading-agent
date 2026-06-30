@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import urllib.request
 
 import llm_reasoning_agent as lra
 
@@ -10,11 +11,16 @@ def write_json(path: Path, payload: dict) -> None:
 def test_sanitize_reasoning_forces_read_only_contract():
     payload = {
         "summary": "ok",
+        "can_place_live_orders": True,
+        "can_loosen_risk": True,
         "risk_proposal": {"can_place_live_orders": True, "can_loosen_risk": True, "mode": "risk_on"},
     }
 
     result = lra.sanitize_reasoning(payload, {"provider": "9router", "deep_model": "gpt-5.5"}, "raw")
 
+    assert result["can_place_live_orders"] is False
+    assert result["can_loosen_risk"] is False
+    assert result["live_permission"] is False
     assert result["risk_proposal"]["mode"] == "tighten_only"
     assert result["risk_proposal"]["can_place_live_orders"] is False
     assert result["risk_proposal"]["can_loosen_risk"] is False
@@ -57,7 +63,7 @@ def test_run_once_calls_large_model_and_writes_outputs(tmp_path: Path, monkeypat
     monkeypatch.setattr(lra, "provider_snapshot", lambda: {"provider": "9router", "deep_model": "gpt-5.5", "quick_model": "gpt-5.5", "judge_model": "gpt-5.5"})
     monkeypatch.setattr(lra, "safe_append_snapshot", lambda *args, **kwargs: None)
     monkeypatch.setattr(lra, "safe_append_event", lambda *args, **kwargs: None)
-    monkeypatch.setattr(lra, "safe_upsert_heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_upsert_heartbeat", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("heartbeat store down")))
     monkeypatch.setattr(
         lra,
         "call_large_model",
@@ -79,6 +85,8 @@ def test_run_once_calls_large_model_and_writes_outputs(tmp_path: Path, monkeypat
     assert result["provider"]["provider"] == "9router"
     assert result["reasoning"]["risk_proposal"]["can_place_live_orders"] is False
     assert result["reasoning"]["risk_proposal"]["can_loosen_risk"] is False
+    assert result["can_place_live_orders"] is False
+    assert result["can_loosen_risk"] is False
     assert lra.LATEST_JSON.exists()
     assert lra.HISTORY_JSONL.exists()
     assert lra.REPORT_MD.exists()
@@ -101,4 +109,114 @@ def test_run_once_degrades_when_model_call_fails(tmp_path: Path, monkeypatch):
 
     assert result["status"] == "degraded"
     assert result["reasoning"]["risk_proposal"]["can_place_live_orders"] is False
+    assert result["can_place_live_orders"] is False
+    assert result["can_loosen_risk"] is False
     assert "timeout" in result["error"]
+
+def test_run_once_budget_block_does_not_call_provider(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "memory"
+    monkeypatch.setenv("MODEL_BUDGET_EXHAUSTED", "true")
+    monkeypatch.setenv("NINEROUTER_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setattr(lra, "LATEST_JSON", memory / "latest.json")
+    monkeypatch.setattr(lra, "HISTORY_JSONL", memory / "history.jsonl")
+    monkeypatch.setattr(lra, "REPORT_MD", memory / "latest.md")
+    monkeypatch.setattr(lra, "HEARTBEAT_PATH", tmp_path / "hb.json")
+    monkeypatch.setattr(lra, "collect_context", lambda max_log_lines=80: {"market": {"price": 100}})
+    monkeypatch.setattr(lra, "call_large_model", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider should not be called")))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network discovery should not be called")))
+    monkeypatch.setattr(lra, "safe_append_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_upsert_heartbeat", lambda *args, **kwargs: None)
+
+    result = lra.run_once()
+
+    assert result["status"] == "degraded"
+    assert result["model_route"]["allowed"] is False
+    assert result["model_usage"]["fallback_reason"] == "budget_exhausted"
+    assert result["can_place_live_orders"] is False
+    assert result["can_loosen_risk"] is False
+    assert "model_route_blocked" in result["error"]
+
+def test_run_once_daily_token_budget_block_does_not_call_provider(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "memory"
+    monkeypatch.delenv("MODEL_BUDGET_EXHAUSTED", raising=False)
+    monkeypatch.setenv("MODEL_DAILY_TOKEN_BUDGET", "10")
+    monkeypatch.setenv("MODEL_DAILY_TOKENS_USED", "9")
+    monkeypatch.setattr(lra, "LATEST_JSON", memory / "latest.json")
+    monkeypatch.setattr(lra, "HISTORY_JSONL", memory / "history.jsonl")
+    monkeypatch.setattr(lra, "REPORT_MD", memory / "latest.md")
+    monkeypatch.setattr(lra, "HEARTBEAT_PATH", tmp_path / "hb.json")
+    monkeypatch.setattr(lra, "collect_context", lambda max_log_lines=80: {"market": {"price": 100}})
+    monkeypatch.setattr(lra, "provider_snapshot", lambda: (_ for _ in ()).throw(AssertionError("provider discovery should not be called")))
+    monkeypatch.setattr(lra, "call_large_model", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider should not be called")))
+    monkeypatch.setattr(lra, "safe_append_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_upsert_heartbeat", lambda *args, **kwargs: None)
+
+    result = lra.run_once()
+
+    assert result["status"] == "degraded"
+    assert result["model_route"]["allowed"] is False
+    assert result["model_route"]["degraded_reason"] == "token_budget_exhausted"
+    assert result["model_usage"]["fallback_reason"] == "token_budget_exhausted"
+    assert "model_budget_blocked" in result["error"]
+
+def test_run_once_degraded_quality_records_degraded_usage(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "memory"
+    monkeypatch.delenv("MODEL_BUDGET_EXHAUSTED", raising=False)
+    monkeypatch.setattr(lra, "LATEST_JSON", memory / "latest.json")
+    monkeypatch.setattr(lra, "HISTORY_JSONL", memory / "history.jsonl")
+    monkeypatch.setattr(lra, "REPORT_MD", memory / "latest.md")
+    monkeypatch.setattr(lra, "HEARTBEAT_PATH", tmp_path / "hb.json")
+    monkeypatch.setattr(lra, "provider_snapshot", lambda: {"provider": "9router", "deep_model": "gpt-5.5", "quick_model": "gpt-5.5"})
+    monkeypatch.setattr(lra, "collect_context", lambda max_log_lines=80: {"market": {"price": 100}})
+    monkeypatch.setattr(
+        lra,
+        "call_large_model",
+        lambda *args, **kwargs: json.dumps({
+            "summary": "call create_order now",
+            "risk_proposal": {"mode": "tighten_only", "can_place_live_orders": False, "can_loosen_risk": False},
+        }),
+    )
+    monkeypatch.setattr(lra, "safe_append_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_upsert_heartbeat", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("heartbeat store down")))
+
+    result = lra.run_once()
+
+    assert result["status"] == "degraded"
+    assert result["quality_gate"]["ok"] is False
+    assert result["model_usage"]["status"] == "degraded"
+    assert result["model_usage"]["quality_gate_ok"] is False
+    assert result["can_place_live_orders"] is False
+
+def test_run_once_event_store_failure_still_writes_heartbeat(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "memory"
+    heartbeat = tmp_path / "hb.json"
+    monkeypatch.delenv("MODEL_BUDGET_EXHAUSTED", raising=False)
+    monkeypatch.setattr(lra, "LATEST_JSON", memory / "latest.json")
+    monkeypatch.setattr(lra, "HISTORY_JSONL", memory / "history.jsonl")
+    monkeypatch.setattr(lra, "REPORT_MD", memory / "latest.md")
+    monkeypatch.setattr(lra, "HEARTBEAT_PATH", heartbeat)
+    monkeypatch.setattr(lra, "provider_snapshot", lambda: {"provider": "9router", "deep_model": "gpt-5.5", "quick_model": "gpt-5.5"})
+    monkeypatch.setattr(lra, "collect_context", lambda max_log_lines=80: {"market": {"price": 100}})
+    monkeypatch.setattr(
+        lra,
+        "call_large_model",
+        lambda *args, **kwargs: json.dumps({
+            "summary": "observe only",
+            "risk_proposal": {"mode": "tighten_only", "can_place_live_orders": False, "can_loosen_risk": False},
+        }),
+    )
+    monkeypatch.setattr(lra, "safe_append_snapshot", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event store down")))
+    monkeypatch.setattr(lra, "safe_append_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lra, "safe_upsert_heartbeat", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("heartbeat store down")))
+
+    result = lra.run_once()
+    heartbeat_payload = json.loads(heartbeat.read_text(encoding="utf-8"))
+
+    assert result["status"] == "degraded"
+    assert "event store down" in result["error"]
+    assert heartbeat_payload["status"] == "degraded"
+    assert "event store down" in heartbeat_payload["error"]
+    assert "heartbeat store down" in heartbeat_payload["error"]

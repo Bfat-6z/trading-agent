@@ -9,11 +9,12 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
 from agent_data_contracts import SCHEMA_VERSION
-from atomic_state import append_jsonl, read_json, write_json_atomic
+from atomic_state import append_jsonl, read_json, read_jsonl, write_json_atomic
 from episodic_task_ledger import record_episode
 from timebase import utc_now
 
@@ -25,6 +26,7 @@ HISTORY_PATH = MEMORY_DIR / "test_result_memory_history.jsonl"
 HEARTBEAT_PATH = STATE_DIR / "test_result_memory_agent_heartbeat.json"
 PID_FILE = STATE_DIR / "test_result_memory_agent.pid"
 STOP_FILE = STATE_DIR / "STOP_TEST_RESULT_MEMORY_AGENT"
+HISTORY_LIMIT = 200
 
 SOURCE_FILES = {
     "daily_exam": MEMORY_DIR / "daily_exam_latest.json",
@@ -51,6 +53,9 @@ def threshold_breach(source: str, value: float, threshold: float, direction: str
 
 def load_sources() -> dict[str, dict[str, Any]]:
     return {name: read_json(path, default={}) for name, path in SOURCE_FILES.items()}
+
+def load_history(path: Path = HISTORY_PATH, limit: int = HISTORY_LIMIT) -> list[dict[str, Any]]:
+    return read_jsonl(path, limit=limit)
 
 def build_test_memory_lessons(sources: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     lessons: list[dict[str, Any]] = []
@@ -142,13 +147,95 @@ def build_test_memory_lessons(sources: dict[str, dict[str, Any]]) -> list[dict[s
             })
     return lessons
 
-def build_payload(sources: dict[str, dict[str, Any]], lessons: list[dict[str, Any]]) -> dict[str, Any]:
+def build_gap_stats(lessons: list[dict[str, Any]], history_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {}
+
+    def touch(row: dict[str, Any], run_index: int, from_history: bool) -> None:
+        gap = str(row.get("gap") or "unknown")
+        entry = stats.setdefault(
+            gap,
+            {
+                "gap": gap,
+                "occurrences": 0,
+                "high_severity_count": 0,
+                "medium_severity_count": 0,
+                "source_counts": Counter(),
+                "latest_lesson": None,
+                "latest_next_action": None,
+                "latest_source": None,
+                "last_seen_run_index": -1,
+            },
+        )
+        entry["occurrences"] += 1
+        if row.get("severity") == "high":
+            entry["high_severity_count"] += 1
+        if row.get("severity") == "medium":
+            entry["medium_severity_count"] += 1
+        source = str(row.get("source") or "unknown")
+        entry["source_counts"][source] += 1
+        if not from_history or run_index >= int(entry["last_seen_run_index"]):
+            entry["latest_lesson"] = row.get("lesson")
+            entry["latest_next_action"] = row.get("next_action")
+            entry["latest_source"] = source
+            entry["last_seen_run_index"] = run_index
+
+    for row in lessons:
+        touch(row, 0, False)
+    for run_index, payload in enumerate(history_rows, start=1):
+        for row in payload.get("lessons") if isinstance(payload.get("lessons"), list) else []:
+            if isinstance(row, dict):
+                touch(row, run_index, True)
+
+    ranked: list[dict[str, Any]] = []
+    for gap, entry in stats.items():
+        source_counts = entry["source_counts"]
+        source_count = len(source_counts)
+        occurrences = int(entry["occurrences"])
+        severity_score = entry["high_severity_count"] * 3 + entry["medium_severity_count"] * 2
+        repetition_score = max(0, occurrences - 1) * 2
+        breadth_bonus = max(0, source_count - 1) * 2
+        priority_score = severity_score + repetition_score + breadth_bonus + occurrences
+        ranked.append(
+            {
+                "gap": gap,
+                "priority_score": priority_score,
+                "occurrences": occurrences,
+                "source_count": source_count,
+                "high_severity_count": entry["high_severity_count"],
+                "medium_severity_count": entry["medium_severity_count"],
+                "source_breakdown": dict(source_counts.most_common()),
+                "latest_lesson": entry["latest_lesson"],
+                "latest_next_action": entry["latest_next_action"],
+                "latest_source": entry["latest_source"],
+            }
+        )
+    ranked.sort(key=lambda row: (-row["priority_score"], -row["occurrences"], row["gap"]))
+    return ranked
+
+def build_payload(sources: dict[str, dict[str, Any]], lessons: list[dict[str, Any]], history_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    history_rows = history_rows or []
     high_count = sum(1 for row in lessons if row.get("severity") == "high")
     medium_count = sum(1 for row in lessons if row.get("severity") == "medium")
     curriculum = [
         {"priority": "high" if row.get("severity") == "high" else "medium", "task": row.get("lesson"), "action": row.get("next_action"), "source": row.get("source"), "lesson_id": row.get("lesson_id")}
         for row in lessons
     ]
+    gap_stats = build_gap_stats(lessons, history_rows)
+    priority_curriculum = []
+    for row in gap_stats[:20]:
+        priority_curriculum.append(
+            {
+                "priority": "high" if row.get("priority_score", 0) >= 6 else "medium",
+                "gap": row.get("gap"),
+                "priority_score": row.get("priority_score", 0),
+                "occurrences": row.get("occurrences", 0),
+                "source_count": row.get("source_count", 0),
+                "task": row.get("latest_lesson"),
+                "action": row.get("latest_next_action"),
+                "source": row.get("latest_source"),
+                "source_breakdown": row.get("source_breakdown") or {},
+            }
+        )
     episode_rows = []
     for row in lessons:
         episode_rows.append(
@@ -174,6 +261,9 @@ def build_payload(sources: dict[str, dict[str, Any]], lessons: list[dict[str, An
         "medium_severity_count": medium_count,
         "lessons": lessons,
         "curriculum": curriculum[:20],
+        "gap_stats": gap_stats,
+        "priority_curriculum": priority_curriculum,
+        "history_count": len(history_rows),
         "episode_snapshots": episode_rows[-10:],
         "known_gaps": sorted({row["gap"] for row in lessons if row.get("gap")}),
         "can_place_live_orders": False,
@@ -187,7 +277,8 @@ def write_heartbeat(status: str, payload: dict[str, Any] | None = None) -> None:
 def run_once(output_path: Path = LATEST_PATH, history_path: Path = HISTORY_PATH) -> dict[str, Any]:
     sources = load_sources()
     lessons = build_test_memory_lessons(sources)
-    payload = build_payload(sources, lessons)
+    history_rows = load_history(history_path)
+    payload = build_payload(sources, lessons, history_rows=history_rows)
     write_json_atomic(output_path, payload)
     append_jsonl(history_path, payload)
     write_heartbeat("ok", {"lesson_count": payload["lesson_count"], "high_severity_count": payload["high_severity_count"]})

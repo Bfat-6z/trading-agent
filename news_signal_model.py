@@ -9,10 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable
+
+from data_trust import sanitize_external_text, source_policy
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
@@ -164,37 +166,64 @@ def event_direction(text: str) -> tuple[float, float, list[str]]:
     return bullish, bearish, reasons
 
 def normalize_event(raw: dict, now: str | None = None) -> dict:
-    title = str(raw.get("title") or raw.get("headline") or "").strip()
+    raw_title = str(raw.get("title") or raw.get("headline") or "").strip()
+    raw_summary = str(raw.get("summary") or "")
+    title_clean = sanitize_external_text(raw_title, max_chars=240)
+    summary_clean = sanitize_external_text(raw_summary, max_chars=800)
+    title = title_clean["text"]
     source = str(raw.get("source") or raw.get("publisher") or raw.get("domain") or "unknown").strip()
     published_at = str(raw.get("published_at") or raw.get("pub_date") or raw.get("created_at") or raw.get("ts") or "")
     url = str(raw.get("url") or raw.get("link") or "").strip()
-    text = f"{title} {raw.get('summary') or ''}"
+    text = f"{title} {summary_clean['text']}"
     topics = sorted(set(raw.get("topics") or classify_topics(text)))
     symbols = extract_symbols(text, raw.get("symbols") or raw.get("currencies") or [])
     event_id = str(raw.get("event_id") or stable_event_id(title, source, url, published_at))
+    policy = source_policy(str(raw.get("source_type") or "news"))
     return {
         "event_id": event_id,
         "ts_seen": str(raw.get("ts_seen") or now or utc_now()),
+        "available_at": str(raw.get("available_at") or raw.get("ts_seen") or now or utc_now()),
+        "known_at": str(raw.get("known_at") or raw.get("available_at") or raw.get("ts_seen") or now or utc_now()),
+        "ingested_at": str(raw.get("ingested_at") or raw.get("known_at") or raw.get("available_at") or raw.get("ts_seen") or now or utc_now()),
         "published_at": published_at,
         "source": source,
         "source_type": str(raw.get("source_type") or "news"),
         "title": title,
-        "summary": str(raw.get("summary") or "")[:800],
+        "summary": summary_clean["text"],
         "url": url,
         "symbols": symbols,
         "topics": topics,
         "raw_sentiment": str(raw.get("raw_sentiment") or raw.get("sentiment") or ""),
         "raw_importance": raw.get("raw_importance") if raw.get("raw_importance") is not None else raw.get("importance"),
         "fetch_status": str(raw.get("fetch_status") or "ok"),
+        "text_hash": title_clean["content_hash"],
+        "summary_hash": summary_clean["content_hash"],
+        "sanitize_flags": sorted(set(title_clean["flags"] + summary_clean["flags"])),
+        "taint_class": policy["taint_class"],
+        "allowed_effect": policy["allowed_effect"],
+        "source_identity": {"provider": source, "url": url, "published_at": published_at},
+        "parse_confidence": 0.8 if not title_clean["flags"] else 0.55,
     }
 
-def score_events(events: Iterable[dict], now: datetime | None = None, source_health: list[dict] | None = None) -> dict:
+def event_before_cutoff(event: dict, decision_cutoff: datetime, latency_buffer_seconds: int = 0) -> bool:
+    deadline = decision_cutoff - timedelta(seconds=max(0, int(latency_buffer_seconds)))
+    times = [parse_ts(event.get(field)) for field in ("available_at", "known_at", "ingested_at", "ts_seen")]
+    clean = [ts for ts in times if ts is not None]
+    return bool(clean) and max(clean) <= deadline
+
+
+def score_events(events: Iterable[dict], now: datetime | None = None, source_health: list[dict] | None = None, decision_cutoff: object | None = None, latency_buffer_seconds: int = 0) -> dict:
     current = now or datetime.now(timezone.utc)
     normalized = [normalize_event(event, now=current.isoformat(timespec="seconds")) for event in events if isinstance(event, dict)]
+    cutoff_dt = parse_ts(decision_cutoff) if decision_cutoff else None
+    cutoff_filtered_count = 0
     seen: set[str] = set()
     unique = []
     for event in normalized:
         if not event["title"] or event["event_id"] in seen:
+            continue
+        if cutoff_dt and not event_before_cutoff(event, cutoff_dt, latency_buffer_seconds):
+            cutoff_filtered_count += 1
             continue
         seen.add(event["event_id"])
         unique.append(event)
@@ -236,6 +265,12 @@ def score_events(events: Iterable[dict], now: datetime | None = None, source_hea
                 "source_quality": round(quality, 4),
                 "reasons": reasons[:8],
                 "url": event.get("url", ""),
+                "text_hash": event.get("text_hash"),
+                "summary_hash": event.get("summary_hash"),
+                "taint_class": event.get("taint_class"),
+                "allowed_effect": event.get("allowed_effect"),
+                "sanitize_flags": event.get("sanitize_flags", []),
+                "source_identity": event.get("source_identity", {}),
             }
         )
         for symbol in event.get("symbols", []):
@@ -261,6 +296,9 @@ def score_events(events: Iterable[dict], now: datetime | None = None, source_hea
     return {
         "ts": current.isoformat(timespec="seconds"),
         "event_count": count,
+        "cutoff_filtered_event_count": cutoff_filtered_count,
+        "decision_cutoff": cutoff_dt.isoformat(timespec="seconds") if cutoff_dt else None,
+        "latency_buffer_seconds": latency_buffer_seconds if cutoff_dt else 0,
         "macro_risk_score": round(clamp(macro), 4),
         "crypto_regulatory_risk": round(clamp(regulatory), 4),
         "catalyst_score": round(clamp(catalyst), 4),

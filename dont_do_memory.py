@@ -31,18 +31,22 @@ def save_rules(payload: dict[str, Any], path: Path = DONT_DO_PATH) -> dict[str, 
     return payload
 
 
-def add_or_update_rule(condition: str, scope: str = "global", severity: str = "medium", evidence_delta: int = 1, expires_at: str | None = None, path: Path = DONT_DO_PATH) -> dict[str, Any]:
+def add_or_update_rule(condition: str, scope: str = "global", severity: str = "medium", evidence_delta: int = 1, expires_at: str | None = None, path: Path = DONT_DO_PATH, evidence_ids: list[str] | None = None) -> dict[str, Any]:
     payload = load_rules(path)
     rid = rule_id(condition, scope)
+    clean_evidence = sorted({str(item) for item in (evidence_ids or []) if item})
     for row in payload["rules"]:
         if row.get("rule_id") == rid:
             row["evidence_count"] = int(row.get("evidence_count") or 0) + evidence_delta
             row["severity"] = severity
             row["expires_at"] = expires_at
+            if clean_evidence:
+                existing = [str(item) for item in row.get("evidence_ids", []) if item] if isinstance(row.get("evidence_ids"), list) else []
+                row["evidence_ids"] = sorted(set(existing + clean_evidence))[-100:]
             row["updated_at"] = utc_now()
             save_rules(payload, path)
             return row
-    row = {"schema_version": SCHEMA_VERSION, "rule_id": rid, "condition": condition, "scope": scope, "severity": severity, "evidence_count": evidence_delta, "counter_evidence_count": 0, "expires_at": expires_at, "created_at": utc_now(), "updated_at": utc_now()}
+    row = {"schema_version": SCHEMA_VERSION, "rule_id": rid, "condition": condition, "scope": scope, "severity": severity, "evidence_count": evidence_delta, "evidence_ids": clean_evidence, "counter_evidence_count": 0, "expires_at": expires_at, "created_at": utc_now(), "updated_at": utc_now()}
     payload["rules"].append(row)
     save_rules(payload, path)
     return row

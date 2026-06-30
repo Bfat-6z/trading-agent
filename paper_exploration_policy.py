@@ -6,7 +6,7 @@ from typing import Any
 
 from agent_data_contracts import SCHEMA_VERSION
 from atomic_state import read_json, write_json_atomic
-from live_permission_firewall import evaluate_live_permission
+from live_permission_firewall import evaluate_live_permission, paper_action_allowed
 from timebase import utc_now
 
 ROOT = Path(__file__).resolve().parent
@@ -39,7 +39,7 @@ def evaluate_exploration_request(
     requested_margin = safe_float(signal.get("margin"), max_margin)
     errors: list[str] = []
     warnings: list[str] = []
-    if not firewall.get("allowed"):
+    if not paper_action_allowed(firewall):
         errors.extend(firewall.get("errors") or [])
     if used_exploration_loss >= budget:
         errors.append("exploration_budget_exhausted")

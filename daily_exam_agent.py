@@ -37,6 +37,7 @@ POST_TRADE_LEARNING = MEMORY_DIR / "post_trade_learning_latest.json"
 COUNTERFACTUAL_LATEST = MEMORY_DIR / "counterfactual_latest.json"
 WALK_FORWARD_LATEST = MEMORY_DIR / "walk_forward_latest.json"
 PROMOTION_BOARD = MEMORY_DIR / "promotion_board_latest.json"
+TEST_RESULT_MEMORY = MEMORY_DIR / "test_result_memory_latest.json"
 
 LATEST_JSON = MEMORY_DIR / "daily_exam_latest.json"
 HISTORY_JSONL = MEMORY_DIR / "daily_exam_history.jsonl"
@@ -144,6 +145,7 @@ def load_inputs(max_log_lines: int = 1500) -> dict:
         "counterfactual": read_json(COUNTERFACTUAL_LATEST),
         "walk_forward": read_json(WALK_FORWARD_LATEST),
         "promotion": read_json(PROMOTION_BOARD),
+        "test_memory": read_json(TEST_RESULT_MEMORY),
         "setups": skill_summary(library).get("skills") or [],
         "paper": summarize_paper(read_jsonl_tail(SCALP_LOG, max_log_lines)),
         "previous_exam": read_json(LATEST_JSON),
@@ -384,11 +386,32 @@ def grade_letter(score: float) -> str:
 def deterministic_rng(local_date: str) -> random.Random:
     return random.Random(f"daily_exam:{local_date}")
 
+def exam_type_for_gap(gap: str | None) -> str | None:
+    mapping = {
+        "trade_lifecycle_not_clean": "risk_gate_review",
+        "no_post_trade_reviews_yet": "setup_defense",
+        "no_counterfactual_replays_yet": "setup_defense",
+        "counterfactual_coverage_low": "setup_defense",
+        "shadow_edge_weak": "shadow_edge_review",
+        "walk_forward_not_done": "risk_gate_review",
+        "promotion_blocked": "risk_gate_review",
+        "daily_exam_quality_low": "setup_defense",
+        "scenario_mismatch": "shadow_edge_review",
+    }
+    if not gap:
+        return None
+    return mapping.get(str(gap))
+
 def choose_exam_type(inputs: dict, local_date: str) -> str:
     rng = deterministic_rng(local_date)
     gaps = set(inputs.get("self_model", {}).get("known_gaps") or [])
     if "trade_lifecycle_not_clean" in gaps:
         return "risk_gate_review"
+    priority_queue = inputs.get("test_memory", {}).get("priority_curriculum") if isinstance(inputs.get("test_memory", {}).get("priority_curriculum"), list) else []
+    top_priority = priority_queue[0] if priority_queue and isinstance(priority_queue[0], dict) else {}
+    prioritized_exam = exam_type_for_gap(top_priority.get("gap"))
+    if prioritized_exam and (safe_float(top_priority.get("priority_score")) >= 5 or int(top_priority.get("occurrences") or 0) >= 2):
+        return prioritized_exam
     if "no_post_trade_reviews_yet" in gaps or "no_counterfactual_replays_yet" in gaps:
         return "setup_defense"
     weak = sorted(((name, row.get("score", 0.0)) for name, row in quality_rubric(inputs)["scores"].items()), key=lambda item: item[1])
@@ -424,6 +447,8 @@ def build_exam_task(exam_type: str, inputs: dict, local_date: str) -> dict:
     change = safe_float(symbol_row.get("change_pct") or symbol_row.get("change_24h_pct"))
     side = "SHORT" if change >= 15 else "LONG" if change <= -15 else "OBSERVE"
     setup = weakest_setup(inputs["setups"])
+    priority_queue = inputs.get("test_memory", {}).get("priority_curriculum") if isinstance(inputs.get("test_memory", {}).get("priority_curriculum"), list) else []
+    top_priority = priority_queue[0] if priority_queue and isinstance(priority_queue[0], dict) else {}
     if exam_type == "paper_trade_candidate":
         return {
             "prompt": "Choose whether to record one paper/shadow trade candidate from the hottest market symbol.",
@@ -431,6 +456,7 @@ def build_exam_task(exam_type: str, inputs: dict, local_date: str) -> dict:
             "side": side,
             "setup_id": "exhaustion_fade" if abs(change) >= 15 else "observe_only",
             "change_pct": round(change, 4),
+            "test_memory_focus": top_priority.get("gap"),
             "constraints": ["paper_or_shadow_only", "no_live_order", "must_name_invalidation", "must_respect_min_signal_score"],
         }
     if exam_type == "risk_gate_review":
@@ -439,6 +465,7 @@ def build_exam_task(exam_type: str, inputs: dict, local_date: str) -> dict:
             "min_signal_score": inputs["bias"].get("min_signal_score"),
             "risk_posture": inputs["bias"].get("risk_posture"),
             "self_model_gaps": inputs.get("self_model", {}).get("known_gaps") or [],
+            "test_memory_focus": top_priority.get("gap"),
             "constraints": ["tighten_only_without_human_review", "no_live_promotion"],
         }
     if exam_type == "setup_defense":
@@ -449,6 +476,7 @@ def build_exam_task(exam_type: str, inputs: dict, local_date: str) -> dict:
             "win_rate": setup.get("win_rate", 0.0),
             "expectancy": setup.get("expectancy", 0.0),
             "self_model_curriculum": inputs.get("self_model", {}).get("curriculum") or [],
+            "test_memory_focus": top_priority.get("gap"),
             "constraints": ["do_not_promote_under_sampled_setup", "produce_next_sample_target"],
         }
     if exam_type == "news_market_context":
@@ -458,12 +486,14 @@ def build_exam_task(exam_type: str, inputs: dict, local_date: str) -> dict:
             "headline_chaos": inputs["news"].get("headline_chaos"),
             "market_ts": inputs["market"].get("ts"),
             "news_ts": inputs["news"].get("ts"),
+            "test_memory_focus": top_priority.get("gap"),
             "constraints": ["stale_data_blocks_confidence", "headline_chaos_tightens_risk"],
         }
     return {
         "prompt": "Review shadow edge and decide whether the agent deserves any promotion.",
         "shadow_overall": inputs["shadow"].get("overall") or {},
         "data_quality": inputs["shadow"].get("data_quality") or {},
+        "test_memory_focus": top_priority.get("gap"),
         "constraints": ["positive_expectancy_required", "sample_size_required", "data_quality_required"],
     }
 

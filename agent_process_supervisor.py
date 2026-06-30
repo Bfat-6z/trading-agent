@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from agent_runtime_contract import specs_from_supervisor, validate_agents
+from alert_manager import open_incident
 from event_store import safe_append_event, safe_upsert_heartbeat
 
 ROOT = Path(__file__).resolve().parent
@@ -28,6 +30,66 @@ STOP_FILE = STATE_DIR / "STOP_AGENT_PROCESS_SUPERVISOR"
 LOG_FILE = STATE_DIR / "agent_process_supervisor.jsonl"
 HEARTBEAT_PATH = STATE_DIR / "agent_process_supervisor_heartbeat.json"
 SUPERVISOR_SCRIPT = "agent_process_supervisor.py"
+RESTART_STATE_PATH = STATE_DIR / "agent_restart_state.json"
+RESTART_WINDOW_SECONDS = 900
+RESTART_MAX_PER_WINDOW = 3
+RESTART_BASE_BACKOFF_SECONDS = 5
+CHILD_ENV_ALLOWLIST = {
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "ANTHROPIC_API_KEY",
+    "BASESCAN_API_KEY",
+    "COMSPEC",
+    "CRYPTOPANIC_API_KEY",
+    "GOPLUS_API_KEY",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "LOG_LEVEL",
+    "LUNARCRUSH_API_KEY",
+    "MORALIS_API_KEY",
+    "NINEROUTER_API_KEY",
+    "NINEROUTER_BASE_URL",
+    "OPENAI_API_KEY",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PYTHONIOENCODING",
+    "PYTHONPATH",
+    "STATE_DIR",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TRADINGAGENTS_DEEP_THINK_LLM",
+    "TRADINGAGENTS_JUDGE_LLM",
+    "TRADINGAGENTS_LLM_PROVIDER",
+    "TRADINGAGENTS_QUICK_THINK_LLM",
+    "TRADING_AGENT_MODE",
+    "TRADING_AGENT_PAPER_ACCOUNT_USDT",
+    "TRADING_AGENT_PAPER_EXPLORATION",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+}
+LIVE_ENV_DENYLIST = {
+    "BINANCE_API_KEY",
+    "BINANCE_API_SECRET",
+    "BINANCE_FUTURES_API_KEY",
+    "BINANCE_FUTURES_API_SECRET",
+    "BYBIT_API_KEY",
+    "BYBIT_API_SECRET",
+    "OKX_API_KEY",
+    "OKX_API_SECRET",
+    "PRIVATE_KEY",
+    "WALLET_PRIVATE_KEY",
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +105,7 @@ class AgentSpec:
 def specs() -> list[AgentSpec]:
     return [
         AgentSpec("dashboard", "agent_status_dashboard.py", ("--host", "127.0.0.1", "--port", "8090"), STATE_DIR / "agent_status_dashboard.pid", None, None),
+        AgentSpec("host_runtime_monitor", "host_runtime_monitor.py", ("--interval-seconds", "300"), STATE_DIR / "host_runtime_monitor.pid", STATE_DIR / "host_runtime_monitor_heartbeat.json", 900),
         AgentSpec("market_observer", "market_observer.py", tuple(), STATE_DIR / "market_observer.pid", STATE_DIR / "market_observer_heartbeat.json", 420),
         AgentSpec("news_observer", "news_observer.py", tuple(), STATE_DIR / "news_observer.pid", STATE_DIR / "news_observer_heartbeat.json", 900),
         AgentSpec("dream_cycle", "dream_cycle.py", tuple(), STATE_DIR / "dream_cycle.pid", STATE_DIR / "dream_cycle_heartbeat.json", 2400),
@@ -53,12 +116,16 @@ def specs() -> list[AgentSpec]:
         AgentSpec("autonomous_paper_trading_loop", "autonomous_paper_trading_loop.py", ("--interval-seconds", "60"), STATE_DIR / "autonomous_paper_trading_loop.pid", STATE_DIR / "autonomous_paper_trading_loop_heartbeat.json", 180),
         AgentSpec("paper_execution_lifecycle_loop", "paper_execution_lifecycle_loop.py", ("--interval-seconds", "30"), STATE_DIR / "paper_execution_lifecycle_loop.pid", STATE_DIR / "paper_execution_lifecycle_loop_heartbeat.json", 120),
         AgentSpec("microstructure_observer_loop", "microstructure_observer_loop.py", ("--interval-seconds", "60"), STATE_DIR / "microstructure_observer_loop.pid", STATE_DIR / "microstructure_observer_loop_heartbeat.json", 180),
+        AgentSpec("microstructure_flow_factory", "microstructure_flow_factory.py", ("--interval-seconds", "60"), STATE_DIR / "microstructure_flow_factory.pid", STATE_DIR / "microstructure_flow_factory_heartbeat.json", 180),
+        AgentSpec("whale_flow_observer", "whale_flow_observer.py", ("--interval-seconds", "180"), STATE_DIR / "whale_flow_observer.pid", STATE_DIR / "whale_flow_observer_heartbeat.json", 600),
         AgentSpec("counterfactual_replay_agent", "counterfactual_replay_agent.py", ("--interval-seconds", "300"), STATE_DIR / "counterfactual_replay_agent.pid", STATE_DIR / "counterfactual_replay_agent_heartbeat.json", 900),
         AgentSpec("learning_exam_benchmark", "learning_exam_benchmark.py", ("--interval-seconds", "3600"), STATE_DIR / "learning_exam_benchmark.pid", STATE_DIR / "learning_exam_benchmark_heartbeat.json", 4500),
         AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),
         AgentSpec("shadow_trade_evaluator_loop", "shadow_trade_evaluator_loop.py", ("--interval-seconds", "600", "--max-age-hours", "24", "--max-trades", "100"), STATE_DIR / "shadow_trade_evaluator_loop.pid", STATE_DIR / "shadow_trade_evaluator_loop_heartbeat.json", 1800),
         AgentSpec("promotion_evaluator_loop", "promotion_evaluator_loop.py", ("--interval-seconds", "300"), STATE_DIR / "promotion_evaluator_loop.pid", STATE_DIR / "promotion_evaluator_loop_heartbeat.json", 600),
         AgentSpec("self_model", "self_model.py", ("--interval-minutes", "10"), STATE_DIR / "self_model.pid", STATE_DIR / "self_model_heartbeat.json", 900),
+        AgentSpec("memory_consolidation_agent", "memory_consolidation_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "memory_consolidation_agent.pid", STATE_DIR / "memory_consolidation_agent_heartbeat.json", 2700),
+        AgentSpec("skill_forge_agent", "skill_forge_agent.py", ("--interval-seconds", "1800", "--apply"), STATE_DIR / "skill_forge_agent.pid", STATE_DIR / "skill_forge_agent_heartbeat.json", 2700),
         AgentSpec("self_improvement_agent", "self_improvement_agent.py", ("--interval-hours", "6"), STATE_DIR / "self_improvement_agent.pid", STATE_DIR / "self_improvement_agent_heartbeat.json", 28800),
         AgentSpec("daily_exam_agent", "daily_exam_agent.py", ("--check-seconds", "300"), STATE_DIR / "daily_exam_agent.pid", STATE_DIR / "daily_exam_agent_heartbeat.json", 900),
     ]
@@ -81,6 +148,14 @@ def default_python() -> str:
             return str(venv_pythonw)
     venv_python = ROOT / "venv" / "Scripts" / "python.exe"
     return str(venv_python if venv_python.exists() else Path(sys.executable))
+
+
+def scrub_child_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    source = dict(env or os.environ)
+    clean = {key: value for key, value in source.items() if key.upper() in CHILD_ENV_ALLOWLIST and key.upper() not in LIVE_ENV_DENYLIST}
+    clean["TRADING_AGENT_LIVE_ORDERS"] = "false"
+    clean["TRADING_AGENT_CHILD_ENV_SCRUBBED"] = "1"
+    return clean
 
 
 def append_jsonl(event: str, payload: dict) -> None:
@@ -238,6 +313,12 @@ def read_json(path: Path) -> dict:
     except Exception:
         return {}
 
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
 
 def heartbeat_age_seconds(path: Path | None) -> float | None:
     if not path:
@@ -253,6 +334,89 @@ def stale(spec: AgentSpec) -> bool:
         return False
     age = heartbeat_age_seconds(spec.heartbeat_file)
     return age is None or age > spec.max_heartbeat_age_seconds
+
+def restart_gate(agent: str, *, now: datetime | None = None, state_path: Path = RESTART_STATE_PATH) -> dict:
+    current = now or datetime.now(timezone.utc)
+    state = read_json(state_path)
+    agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    row = agents.get(agent) if isinstance(agents.get(agent), dict) else {}
+    if row.get("state") == "quarantined":
+        return {
+            "allowed": False,
+            "reason": "restart_quarantined",
+            "original_reason": row.get("reason") or "restart_circuit_breaker",
+            "restart_count_window": int(row.get("restart_count_window") or 0),
+            "backoff_seconds": None,
+            "quarantined_at": row.get("quarantined_at"),
+        }
+    attempts = []
+    for value in row.get("attempts", []) if isinstance(row.get("attempts"), list) else []:
+        parsed = parse_ts(value)
+        if parsed and (current - parsed).total_seconds() <= RESTART_WINDOW_SECONDS:
+            attempts.append(parsed.isoformat(timespec="seconds"))
+    if len(attempts) >= RESTART_MAX_PER_WINDOW:
+        row.update(
+            {
+                "state": "quarantined",
+                "quarantined_at": current.isoformat(timespec="seconds"),
+                "reason": "restart_circuit_breaker",
+                "restart_count_window": len(attempts),
+            }
+        )
+        agents[agent] = row
+        state["agents"] = agents
+        state["updated_at"] = current.isoformat(timespec="seconds")
+        write_json(state_path, state)
+        return {"allowed": False, "reason": "restart_circuit_breaker", "restart_count_window": len(attempts), "backoff_seconds": None}
+    backoff_seconds = min(300, RESTART_BASE_BACKOFF_SECONDS * (2 ** max(0, len(attempts) - 1)))
+    if attempts:
+        last = parse_ts(attempts[-1])
+        elapsed = (current - last).total_seconds() if last else backoff_seconds
+        if elapsed < backoff_seconds:
+            return {
+                "allowed": False,
+                "reason": "restart_backoff_active",
+                "restart_count_window": len(attempts),
+                "backoff_seconds": backoff_seconds,
+                "retry_after_seconds": round(backoff_seconds - elapsed, 3),
+            }
+    return {"allowed": True, "reason": "ok", "restart_count_window": len(attempts), "backoff_seconds": backoff_seconds}
+
+def record_restart_attempt(agent: str, *, now: datetime | None = None, state_path: Path = RESTART_STATE_PATH) -> dict:
+    current = now or datetime.now(timezone.utc)
+    state = read_json(state_path)
+    agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    row = agents.get(agent) if isinstance(agents.get(agent), dict) else {}
+    attempts = []
+    for value in row.get("attempts", []) if isinstance(row.get("attempts"), list) else []:
+        parsed = parse_ts(value)
+        if parsed and (current - parsed).total_seconds() <= RESTART_WINDOW_SECONDS:
+            attempts.append(parsed.isoformat(timespec="seconds"))
+    attempts.append(current.isoformat(timespec="seconds"))
+    row.update({"state": row.get("state") if row.get("state") == "quarantined" else "active", "attempts": attempts, "restart_count_window": len(attempts), "last_restart_at": attempts[-1]})
+    agents[agent] = row
+    state["schema_version"] = 1
+    state["updated_at"] = attempts[-1]
+    state["window_seconds"] = RESTART_WINDOW_SECONDS
+    state["max_per_window"] = RESTART_MAX_PER_WINDOW
+    state["agents"] = agents
+    write_json(state_path, state)
+    return row
+
+def open_restart_incident(spec: AgentSpec, gate: dict) -> None:
+    try:
+        open_incident(
+            "Sev2",
+            "agent restart circuit breaker",
+            {"agent": spec.name, "script": spec.script, **gate},
+            source="agent_process_supervisor",
+            owner="operator",
+            runbook_id="runbook_restart_circuit_breaker",
+            dedupe_key=f"restart_circuit:{spec.name}",
+            action_required="quarantine_and_review_before_restart",
+        )
+    except Exception as exc:
+        append_jsonl("incident_emit_error", {"agent": spec.name, "error": str(exc)[:200]})
 
 
 def stop_pid(pid: int | None, expected_script: str) -> None:
@@ -353,7 +517,9 @@ def stop_other_supervisors() -> None:
         return
     duplicates = [pid for pid in supervisor_loop_pids() if pid != current]
     if duplicates:
-        append_jsonl("supervisor_duplicate_detected", {"pids": duplicates, "owner_pid": current, "action": "cleanup_required"})
+        for pid in duplicates:
+            stop_pid(pid, SUPERVISOR_SCRIPT)
+        append_jsonl("supervisor_duplicate_detected", {"pids": duplicates, "owner_pid": current, "action": "stopped"})
 
 
 def start_agent(spec: AgentSpec) -> int:
@@ -369,7 +535,7 @@ def start_agent(spec: AgentSpec) -> int:
         except Exception:
             pass
     with out_path.open("ab") as out_fh, err_path.open("ab") as err_fh:
-        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out_fh, stderr=err_fh, creationflags=creationflags)
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out_fh, stderr=err_fh, creationflags=creationflags, env=scrub_child_env())
     if spec.heartbeat_file is None:
         write_pid(spec.pid_file, proc.pid)
     append_jsonl("agent_start", {"agent": spec.name, "pid": proc.pid, "cmd": cmd})
@@ -387,7 +553,30 @@ def ensure_agent(spec: AgentSpec) -> dict:
         return {"agent": spec.name, "pid": pid, "running": True, "stale": False, "action": "ok"}
     if running and is_stale:
         stop_pid(pid, spec.script)
-    new_pid = start_agent(spec)
+    restart_state_path = spec.pid_file.parent / "agent_restart_state.json"
+    gate = restart_gate(spec.name, state_path=restart_state_path)
+    if not gate.get("allowed"):
+        if gate.get("reason") == "restart_circuit_breaker":
+            append_jsonl("agent_restart_quarantined", {"agent": spec.name, **gate})
+            open_restart_incident(spec, gate)
+            action = "quarantined"
+        elif gate.get("reason") == "restart_quarantined":
+            append_jsonl("agent_restart_quarantined", {"agent": spec.name, **gate})
+            action = "quarantined"
+        else:
+            append_jsonl("agent_restart_deferred", {"agent": spec.name, **gate})
+            action = "restart_deferred"
+        return {"agent": spec.name, "pid": pid, "running": bool(running), "stale": is_stale, "action": action, "restart_gate": gate}
+    try:
+        new_pid = start_agent(spec)
+    except Exception as exc:
+        attempt = record_restart_attempt(spec.name, state_path=restart_state_path)
+        failure_gate = restart_gate(spec.name, state_path=restart_state_path)
+        append_jsonl("agent_start_failed", {"agent": spec.name, "error": str(exc)[:240], "restart_count_window": attempt.get("restart_count_window"), "restart_gate": failure_gate})
+        if failure_gate.get("reason") == "restart_circuit_breaker":
+            open_restart_incident(spec, failure_gate)
+        return {"agent": spec.name, "pid": pid, "running": False, "stale": is_stale, "action": "start_failed", "restart_gate": failure_gate, "error": str(exc)[:240]}
+    record_restart_attempt(spec.name, state_path=restart_state_path)
     return {"agent": spec.name, "pid": new_pid, "running": True, "stale": is_stale, "action": "restarted" if running else "started"}
 
 
@@ -399,7 +588,9 @@ def write_heartbeat(rows: list[dict]) -> None:
 
 def run_once() -> list[dict]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    rows = [ensure_agent(spec) for spec in specs()]
+    current_specs = specs()
+    rows = [ensure_agent(spec) for spec in current_specs]
+    validate_agents(specs_from_supervisor(current_specs), output_path=STATE_DIR / "agent_registry.json")
     write_heartbeat(rows)
     return rows
 

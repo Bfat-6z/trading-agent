@@ -6,6 +6,11 @@ when a small mechanical edge is visible after fees/slippage.
 """
 from __future__ import annotations
 
+# PHASE00_LEGACY_DIRECT_RUN_GUARD
+if __name__ == "__main__":
+    from legacy_live_blocker import block_file_if_legacy as _phase00_block_file
+    _phase00_block_file(__file__, "direct_exec")
+
 import argparse
 import json
 import os
@@ -287,6 +292,24 @@ class ScalpAutoTrader:
 
     def write_paper_account(self, equity: Decimal, reason: str) -> None:
         if self.args.live:
+            return
+        existing: dict = {}
+        if self.paper_account_path.exists():
+            try:
+                payload = json.loads(self.paper_account_path.read_text(encoding="utf-8", errors="ignore"))
+                existing = payload if isinstance(payload, dict) else {}
+            except Exception:
+                existing = {}
+        modern_account = any(key in existing for key in ("cash", "open_margin", "open_positions", "realized_pnl"))
+        if modern_account and reason not in {"reset", "manual_reset"}:
+            payload = {
+                **existing,
+                "legacy_scalp_equity": str(equity),
+                "legacy_scalp_reason": reason,
+                "legacy_scalp_updated_at": utc_now(),
+            }
+            self.paper_account_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            self.log("legacy_paper_account_write_preserved_modern_account", {"equity": str(equity), "reason": reason})
             return
         payload = {
             "updated_at": utc_now(),

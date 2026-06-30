@@ -1,6 +1,11 @@
 """EDEN LONG breakout order @ $0.0967 (reclaim level).
 After fill: SL $0.0950, TP $0.1020.
 Sizing $1 margin × 20x = $20 notional (max lev for EDEN)."""
+# PHASE00_LEGACY_DIRECT_RUN_GUARD
+if __name__ == "__main__":
+    from legacy_live_blocker import block_file_if_legacy as _phase00_block_file
+    _phase00_block_file(__file__, "direct_exec")
+
 from dotenv import load_dotenv
 load_dotenv()
 from tradingagents.binance.client import spot_client

@@ -6,6 +6,7 @@ rules and outcome stats. It does not place trades and it does not rely on LLMs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,10 @@ def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
+def contract_hash(payload: dict) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def empty_stats() -> dict:
     return {
         "trades": 0,
@@ -62,9 +67,35 @@ def skill(
     expected_hold_seconds: int,
     enabled: bool = True,
 ) -> dict:
+    contract = {
+        "setup_id": setup_id,
+        "semver": "1.0.0",
+        "matcher_version": "setup_matcher_v1",
+        "ranker_version": "setup_ranker_v1",
+        "risk_version": "paper_risk_policy_v1",
+        "allowed_sides": ["LONG", "SHORT"],
+        "allowed_timeframes": ["1m", "3m", "5m"],
+        "required_features": ["symbol", "side", "price", "liquidity", "spread"],
+        "entry_pattern": entry_pattern,
+        "stop_template": stop_template,
+        "target_template": target_template,
+        "invalidations": invalidations,
+        "no_trade_criteria": invalidations,
+        "setup_quality_tier": "unrated",
+    }
     return {
         "setup_id": setup_id,
         "version": 1,
+        "setup_version": "1.0.0",
+        "setup_contract_id": f"{setup_id}.contract.v1",
+        "setup_contract_hash": contract_hash(contract),
+        "matcher_version": contract["matcher_version"],
+        "ranker_version": contract["ranker_version"],
+        "risk_version": contract["risk_version"],
+        "allowed_sides": contract["allowed_sides"],
+        "allowed_timeframes": contract["allowed_timeframes"],
+        "required_features": contract["required_features"],
+        "setup_quality_tier": contract["setup_quality_tier"],
         "name": name,
         "description": description,
         "enabled": enabled,
@@ -331,11 +362,17 @@ def record_setup_outcome(
     symbol: str | None = None,
     side: str | None = None,
     ts: str | None = None,
+    evidence_id: str | None = None,
+    evidence_source: str = "manual",
 ) -> dict:
     skills = library.setdefault("skills", {})
     if setup_id not in skills:
         raise KeyError(f"unknown setup_id: {setup_id}")
     row_ts = ts or utc_now()
+    if not evidence_id:
+        append_history(library, "setup_outcome_rejected", {"setup_id": setup_id, "reason": "missing_objective_evidence_id", "regime": regime, "symbol": symbol, "side": side}, row_ts)
+        safe_append_event("setup_skill_library", "setup_outcome_rejected", {"setup_id": setup_id, "reason": "missing_objective_evidence_id", "regime": regime, "symbol": symbol, "side": side}, ts=row_ts)
+        return skills[setup_id]
     value = safe_float(net)
     skill_row = skills[setup_id]
     stats = skill_row.setdefault("stats", empty_stats())
@@ -355,11 +392,11 @@ def record_setup_outcome(
         bucket["losses"] += 1
     finalize_stats(bucket)
     recent = list(stats.get("recent") or [])
-    recent.append({"ts": row_ts, "symbol": symbol, "side": side, "regime": regime, "net": round(value, 8)})
+    recent.append({"ts": row_ts, "symbol": symbol, "side": side, "regime": regime, "net": round(value, 8), "evidence_id": evidence_id, "evidence_source": evidence_source})
     stats["recent"] = recent[-100:]
     finalize_stats(stats)
-    append_history(library, "setup_outcome", {"setup_id": setup_id, "net": round(value, 8), "regime": regime, "symbol": symbol, "side": side}, row_ts)
-    safe_append_event("setup_skill_library", "setup_outcome", {"setup_id": setup_id, "net": round(value, 8), "regime": regime, "symbol": symbol, "side": side}, ts=row_ts)
+    append_history(library, "setup_outcome", {"setup_id": setup_id, "net": round(value, 8), "regime": regime, "symbol": symbol, "side": side, "evidence_id": evidence_id, "evidence_source": evidence_source}, row_ts)
+    safe_append_event("setup_skill_library", "setup_outcome", {"setup_id": setup_id, "net": round(value, 8), "regime": regime, "symbol": symbol, "side": side, "evidence_id": evidence_id, "evidence_source": evidence_source}, ts=row_ts)
     return skill_row
 
 
@@ -401,6 +438,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--regime", default="unknown")
     parser.add_argument("--symbol")
     parser.add_argument("--side")
+    parser.add_argument("--evidence-id")
+    parser.add_argument("--evidence-source", default="manual")
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -409,7 +448,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     library = load_library()
     changed = False
     if args.record_setup:
-        record_setup_outcome(library, args.record_setup, args.net, args.regime, args.symbol, args.side)
+        record_setup_outcome(library, args.record_setup, args.net, args.regime, args.symbol, args.side, evidence_id=args.evidence_id, evidence_source=args.evidence_source)
         changed = True
     if args.init or changed:
         save_library(library)

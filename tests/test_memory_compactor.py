@@ -27,8 +27,8 @@ def test_compacts_event_rows_into_deterministic_summary():
 
 def test_does_not_duplicate_promoted_beliefs(tmp_path: Path):
     rows = [
-        {"source": "reflection_agent", "event": "lesson", "lesson": "Repeated lesson should become one belief."},
-        {"source": "reflection_agent", "event": "lesson", "lesson": "Repeated lesson should become one belief."},
+        {"source": "reflection_agent", "event": "lesson", "lesson": "Repeated lesson should become one belief.", "trade_id": "paper_close_1"},
+        {"source": "reflection_agent", "event": "lesson", "lesson": "Repeated lesson should become one belief.", "trade_id": "paper_close_2"},
     ]
     semantic_path = tmp_path / "semantic_memory.json"
     ledger_path = tmp_path / "belief_ledger.json"

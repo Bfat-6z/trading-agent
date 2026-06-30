@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import atomic_state
 import test_result_memory_agent as trm
 
 def test_test_result_memory_rules_create_curriculum_from_runtime_failures():
@@ -55,3 +56,47 @@ def test_test_result_memory_run_once_writes_latest_and_episodes(monkeypatch, tmp
     assert result["can_place_live_orders"] is False
     assert (memory / "test_result_memory_latest.json").exists()
     assert trm.HEARTBEAT_PATH.exists()
+
+def test_test_result_memory_prioritizes_repeated_failures_from_history(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    state = tmp_path
+    memory.mkdir()
+    monkeypatch.setattr(trm, "MEMORY_DIR", memory)
+    monkeypatch.setattr(trm, "STATE_DIR", state)
+    monkeypatch.setattr(
+        trm,
+        "SOURCE_FILES",
+        {
+            "daily_exam": memory / "daily_exam_latest.json",
+            "counterfactual": memory / "counterfactual_latest.json",
+            "shadow": memory / "shadow_performance_latest.json",
+            "walk_forward": memory / "walk_forward_latest.json",
+            "promotion": memory / "promotion_board_latest.json",
+            "learning_benchmark": memory / "learning_exam_benchmark_latest.json",
+        },
+    )
+    monkeypatch.setattr(trm, "HEARTBEAT_PATH", state / "test_result_memory_agent_heartbeat.json")
+    monkeypatch.setattr(trm, "record_episode", lambda **kwargs: {"last_episode": kwargs, "last_inserted": True})
+    atomic_state.write_json_atomic(memory / "daily_exam_latest.json", {"quality_score": 40})
+    atomic_state.write_json_atomic(memory / "counterfactual_latest.json", {"coverage_pct": 0.15})
+    atomic_state.write_json_atomic(memory / "shadow_performance_latest.json", {"overall": {"expectancy": -0.02, "profit_factor": 0.6}})
+    atomic_state.write_json_atomic(memory / "walk_forward_latest.json", {"status": "running"})
+    atomic_state.write_json_atomic(memory / "promotion_board_latest.json", {"state": "paper_learning", "passed": False})
+    atomic_state.write_json_atomic(memory / "learning_exam_benchmark_latest.json", {"score": 1.0})
+    atomic_state.append_jsonl(
+        memory / "test_result_memory_history.jsonl",
+        {
+            "lesson_count": 2,
+            "lessons": [
+                {"gap": "counterfactual_coverage_low", "severity": "high", "source": "daily_exam", "lesson": "raise replay coverage", "next_action": "run replay"},
+                {"gap": "promotion_blocked", "severity": "medium", "source": "promotion", "lesson": "keep paper only", "next_action": "stay blocked"},
+            ],
+        },
+    )
+
+    result = trm.run_once(output_path=memory / "test_result_memory_latest.json", history_path=memory / "test_result_memory_history.jsonl")
+
+    assert result["history_count"] == 1
+    assert result["priority_curriculum"][0]["gap"] == "counterfactual_coverage_low"
+    assert result["priority_curriculum"][0]["occurrences"] >= 2
+    assert result["gap_stats"][0]["gap"] == "counterfactual_coverage_low"

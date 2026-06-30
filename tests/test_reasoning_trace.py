@@ -28,6 +28,11 @@ def test_sleep_mode_blocks_paper_and_preserves_next_actions():
     )
 
     assert trace["decision"]["mode"] == "sleep_observe_and_shadow"
+    assert trace["schema_version"] == 1
+    assert trace["trace_schema_version"] == "reasoning_trace.v2"
+    assert trace["trace_id"].startswith("reasoning_trace_")
+    assert trace["input_hashes"]["market_snapshot"].startswith("sha256:")
+    assert "2026-06-20T00:00:00+00:00" in trace["evidence_ids"]
     assert trace["decision"]["allow_paper_entry"] is False
     assert "do_not_open_paper_until_sleep_expires" in trace["next_actions"]
     assert "dream_has_paper_candidates_while_executor_is_asleep" in trace["contradictions"]
@@ -57,6 +62,39 @@ def test_blocked_side_hypothesis_creates_contradiction():
 
     assert trace["decision"]["mode"] == "resolve_contradictions_first"
     assert "hypothesis_side_LONG_is_currently_blocked" in trace["contradictions"]
+
+def test_replay_ts_controls_sleep_state_and_trace_id_stability():
+    before = build_reasoning_trace(
+        _base_state(),
+        {"ts": "2026-06-20T00:00:00+00:00"},
+        {"sleep_until": "2026-06-21T00:00:00+00:00", "min_signal_score": 8, "blocked_sides": []},
+        {"bias_patch": {}},
+        {"hypotheses": []},
+        {"latest": {"event_count": 1}},
+        ts="2026-06-20T12:00:00+00:00",
+    )
+    replay = build_reasoning_trace(
+        _base_state(),
+        {"ts": "2026-06-20T00:00:00+00:00"},
+        {"sleep_until": "2026-06-21T00:00:00+00:00", "min_signal_score": 8, "blocked_sides": []},
+        {"bias_patch": {}},
+        {"hypotheses": []},
+        {"latest": {"event_count": 1}},
+        ts="2026-06-20T12:00:00+00:00",
+    )
+    after = build_reasoning_trace(
+        _base_state(),
+        {"ts": "2026-06-20T00:00:00+00:00"},
+        {"sleep_until": "2026-06-21T00:00:00+00:00", "min_signal_score": 8, "blocked_sides": []},
+        {"bias_patch": {}},
+        {"hypotheses": []},
+        {"latest": {"event_count": 1}},
+        ts="2026-06-22T00:00:00+00:00",
+    )
+
+    assert before["decision"]["mode"] == "sleep_observe_and_shadow"
+    assert before["trace_id"] == replay["trace_id"]
+    assert after["decision"]["mode"] != "sleep_observe_and_shadow"
 
 
 def test_save_trace_writes_json_markdown_and_history(tmp_path: Path, monkeypatch):

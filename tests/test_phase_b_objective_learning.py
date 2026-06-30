@@ -271,7 +271,7 @@ def test_counterfactual_blocked_winner_is_evidence_only(tmp_path: Path, monkeypa
     monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
     monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
 
-    signal = {"signal_id": "s1", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "sl": "99", "tp": "101", "qty": "1", "leverage": "2", "blocked": True}
+    signal = {"signal_id": "s1", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "sl": "99", "tp": "101", "qty": "1", "leverage": "2", "blocked": True, "source_available_at_max": "2026-06-21T00:03:00+00:00"}
     result = cf.replay_signal(signal, candles(), append=True)
 
     assert result["status"] == "complete"
@@ -309,6 +309,7 @@ def test_counterfactual_run_once_appends_unresolved_for_paper_close_without_cand
     monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
     monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
     monkeypatch.setattr(cf, "PAPER_BRAIN_HISTORY_JSONL", tmp_path / "paper_brain_history.jsonl")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
 
     row = {
         "event": "paper_close",
@@ -376,6 +377,7 @@ def test_counterfactual_unresolved_can_retry_when_cache_appears(tmp_path: Path, 
     monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
     monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
     monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
     monkeypatch.setattr(mdl, "MARKET_CACHE_DIR", tmp_path / "market_cache")
     monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
 
@@ -423,6 +425,7 @@ def test_counterfactual_run_once_ingests_blocked_brain_decision(tmp_path: Path, 
     monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
     monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
     monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
 
     decision = {
         "action": "skip",
@@ -451,6 +454,301 @@ def test_counterfactual_summary_reports_complete_and_unresolved_coverage():
     assert summary["complete_count"] == 1
     assert summary["unresolved_count"] == 1
     assert summary["coverage_pct"] == 0.5
+
+def test_counterfactual_phase10_preserves_original_base_signal(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
+
+    signal = {"signal_id": "base_1", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "sl": "99", "tp": "103", "qty": "1", "leverage": "2"}
+    result = cf.replay_signal(signal, candles(), append=True)
+    variants = {row["variant"] for row in result["variants"]}
+
+    assert result["status"] == "complete"
+    assert result["base_signal"]["tp"] == "103"
+    assert result["base_variant"]["variant"] == "base_original"
+    assert result["base_variant"]["entry"] == 100.0
+    assert result["base_variant"]["sl"] == 99.0
+    assert result["base_variant"]["tp"] == 103.0
+    assert "sl1_tp1" in variants
+    assert "higher_leverage" in variants
+    assert "time_exit" in variants
+    assert "trailing_1r" in variants
+    assert "no_trade" in variants
+
+def test_counterfactual_phase10_candidate_census_counts_denominator(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "PAPER_TRADES_JSONL", tmp_path / "paper_trades.jsonl")
+    monkeypatch.setattr(cf, "PAPER_BRAIN_HISTORY_JSONL", tmp_path / "paper_brain_history.jsonl")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
+    cf.PAPER_CANDIDATE_HISTORY_JSONL.write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-06-21T00:00:00+00:00",
+                "market_ts": "2026-06-21T00:00:00+00:00",
+                "candidates": [
+                    {"candidate_id": "census_complete", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "sl": "99", "tp": "101", "source_available_at_max": "2026-06-21T00:03:00+00:00", "candles": candles()},
+                    {"candidate_id": "census_missing", "symbol": "ETHUSDT", "side": "SHORT", "entry": "100", "sl": "101", "tp": "98"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = cf.run_once(limit=10)
+    rows = cf.read_jsonl(cf.REPLAYS_JSONL)
+
+    assert result["eligible_scanned"] == 2
+    assert {row["signal_id"] for row in rows} == {"census_complete", "census_missing"}
+    assert result["summary"]["eligible_count"] == 2
+    assert result["summary"]["latest_complete_count"] == 1
+    assert result["summary"]["latest_unresolved_count"] == 1
+    assert result["summary"]["coverage_pct"] == 0.5
+
+def test_counterfactual_phase10_empty_candidate_scan_stays_in_denominator(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "PAPER_TRADES_JSONL", tmp_path / "paper_trades.jsonl")
+    monkeypatch.setattr(cf, "PAPER_BRAIN_HISTORY_JSONL", tmp_path / "paper_brain_history.jsonl")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    cf.PAPER_CANDIDATE_HISTORY_JSONL.write_text(
+        json.dumps({"updated_at": "2026-06-21T00:00:00+00:00", "market_ts": "2026-06-21T00:00:00+00:00", "reason": "rate_limited_universe_slice", "candidates": []}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = cf.run_once(limit=10)
+    rows = cf.read_jsonl(cf.REPLAYS_JSONL)
+
+    assert result["eligible_scanned"] == 1
+    assert result["summary"]["eligible_count"] == 1
+    assert result["summary"]["coverage_pct"] == 0.0
+    assert rows[0]["status"] == "unresolved"
+    assert rows[0]["eligible_reason"] == "rate_limited_universe_slice"
+
+def test_counterfactual_phase10_backfilled_shadow_is_marked_not_online(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
+    signal = {
+        "signal_id": "shadow_backfill_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "sl": "99",
+        "tp": "101",
+        "qty": "1",
+        "backfilled": True,
+        "first_computed_at": "2026-06-21T00:10:00+00:00",
+        "source_available_at_max": "2026-06-21T00:10:00+00:00",
+    }
+
+    result = cf.replay_signal(signal, candles(), append=True)
+
+    assert result["status"] == "complete"
+    assert result["shadow_online"] is False
+    assert result["first_computed_at"] == "2026-06-21T00:10:00+00:00"
+    summary = cf.write_latest_summary(eligible_count=1, eligible_ids={"shadow_backfill_1"})
+    assert summary["coverage_pct"] == 1.0
+    assert summary["readiness_coverage_pct"] == 0.0
+    assert summary["backfill_latest_count"] == 1
+
+def test_counterfactual_phase10_runtime_candidate_without_cutoff_fails_closed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    signal = {
+        "signal_id": "missing_cutoff_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "sl": "99",
+        "tp": "101",
+        "qty": "1",
+        "blocked": True,
+        "eligible_source": "paper_candidate_census",
+    }
+
+    result = cf.replay_signal(signal, candles(), append=True)
+
+    assert result["status"] == "unresolved"
+    assert result["reason"] == "missing_replay_cutoff"
+
+def test_counterfactual_phase10_paper_close_missing_cutoff_fails_closed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    signal = {
+        "signal_id": "paper_missing_cutoff_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "sl": "99",
+        "tp": "101",
+        "qty": "1",
+        "eligible_source": "paper_close",
+    }
+
+    result = cf.replay_signal(signal, candles(), append=True)
+
+    assert result["status"] == "unresolved"
+    assert result["reason"] == "missing_replay_cutoff"
+
+def test_counterfactual_phase10_late_ingested_or_finalized_data_is_blocked(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    signal = {
+        "signal_id": "late_ingest_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "sl": "99",
+        "tp": "101",
+        "qty": "1",
+        "trial_seq_cutoff": "2026-06-21T00:03:00+00:00",
+    }
+    replay_candles = [{**row, "known_at": row["ts"], "available_at": row["ts"], "ingested_at": row["ts"], "finalized_at": row["ts"]} for row in candles()]
+    replay_candles[1]["ingested_at"] = "2026-06-21T00:04:00+00:00"
+    replay_candles[2]["finalized_at"] = "2026-06-21T00:05:00+00:00"
+
+    result = cf.replay_signal(signal, replay_candles, append=True)
+
+    assert result["status"] == "unresolved"
+    assert result["reason"] == "future_data_violation"
+    assert any("future_ingested_at" in item or "future_finalized_at" in item for item in result["errors"])
+
+def test_counterfactual_phase10_complete_signal_replays_when_source_signature_changes(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "PAPER_TRADES_JSONL", tmp_path / "paper_trades.jsonl")
+    monkeypatch.setattr(cf, "PAPER_BRAIN_HISTORY_JSONL", tmp_path / "paper_brain_history.jsonl")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
+    row = {
+        "event": "paper_close",
+        "trade_id": "signature_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "exit": "101",
+        "qty": "1",
+        "sl": "99",
+        "tp": "101",
+        "net": "1",
+        "source_available_at_max": "2026-06-21T00:03:00+00:00",
+        "open_ts": "2026-06-21T00:00:00+00:00",
+        "close_ts": "2026-06-21T00:03:00+00:00",
+        "candles": candles(),
+    }
+    cf.PAPER_TRADES_JSONL.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    first = cf.run_once(limit=5)
+    late = dict(row)
+    late["source_available_at_max"] = "2026-06-21T00:01:00+00:00"
+    late["trial_seq_cutoff"] = "2026-06-21T00:01:00+00:00"
+    cf.PAPER_TRADES_JSONL.write_text(json.dumps(late) + "\n", encoding="utf-8")
+    second = cf.run_once(limit=5)
+    rows = cf.read_jsonl(cf.REPLAYS_JSONL)
+
+    assert first["summary"]["coverage_pct"] == 1.0
+    assert second["summary"]["coverage_pct"] == 0.0
+    assert rows[-1]["status"] == "unresolved"
+    assert rows[-1]["reason"] == "future_data_violation"
+    assert rows[-1]["is_correction_event"] is True
+
+def test_counterfactual_phase10_latest_summary_is_not_raw_order_dependent():
+    older = {
+        "signal_id": "shuffle_1",
+        "replay_id": "old",
+        "status": "unresolved",
+        "reason": "insufficient_candle_coverage",
+        "created_at": "2026-06-21T00:00:00+00:00",
+        "created_at_ns": 1,
+    }
+    newer = {
+        "signal_id": "shuffle_1",
+        "replay_id": "new",
+        "status": "complete",
+        "conclusion": "no_change",
+        "created_at": "2026-06-21T00:01:00+00:00",
+        "created_at_ns": 2,
+    }
+
+    summary = cf.summarize_replays([newer, older], eligible_count=1, eligible_ids={"shuffle_1"})
+
+    assert summary["coverage_pct"] == 1.0
+    assert summary["latest_complete_count"] == 1
+    assert summary["latest_unresolved_count"] == 0
+
+def test_counterfactual_phase10_future_data_violation_is_unresolved(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    signal = {
+        "signal_id": "future_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "sl": "99",
+        "tp": "101",
+        "qty": "1",
+        "trial_seq_cutoff": "2026-06-21T00:01:30+00:00",
+    }
+    future_candles = [
+        {**row, "known_at": "2026-06-21T00:01:00+00:00", "available_at": "2026-06-21T00:01:00+00:00"}
+        for row in candles()
+    ]
+    future_candles[-1]["available_at"] = "2026-06-21T00:05:00+00:00"
+
+    result = cf.replay_signal(signal, future_candles, append=True)
+
+    assert result["status"] == "unresolved"
+    assert result["reason"] == "future_data_violation"
+    assert any("future_" in item for item in result["errors"])
+
+def test_counterfactual_phase10_unresolved_to_complete_correction_updates_latest(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cf, "PAPER_TRADES_JSONL", tmp_path / "paper_trades.jsonl")
+    monkeypatch.setattr(cf, "PAPER_BRAIN_HISTORY_JSONL", tmp_path / "paper_brain_history.jsonl")
+    monkeypatch.setattr(cf, "PAPER_CANDIDATE_HISTORY_JSONL", tmp_path / "paper_candidate_history.jsonl")
+    monkeypatch.setattr(cf, "REPLAYS_JSONL", tmp_path / "counterfactual_replays.jsonl")
+    monkeypatch.setattr(cf, "LATEST_JSON", tmp_path / "counterfactual_latest.json")
+    monkeypatch.setattr(cf, "HEARTBEAT_PATH", tmp_path / "counterfactual_heartbeat.json")
+    monkeypatch.setattr(mdl, "MARKET_CACHE_DIR", tmp_path / "market_cache")
+    monkeypatch.setattr(pes, "PAPER_ORDERS", tmp_path / "paper_orders.jsonl")
+
+    row = {
+        "event": "paper_close",
+        "trade_id": "correction_1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": "100",
+        "exit": "101",
+        "qty": "1",
+        "sl": "99",
+        "tp": "101",
+        "net": "1",
+        "data_quality": "mark_only_snapshot",
+        "open_ts": "2026-06-21T00:00:00+00:00",
+        "close_ts": "2026-06-21T00:03:00+00:00",
+    }
+    cf.PAPER_TRADES_JSONL.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    first = cf.run_once(limit=5)
+    cached = mdl.store_candles("BTCUSDT", "1m", candles(), source_id="test")
+    row["data_quality"] = "mark_sequence"
+    row["candle_cache_id"] = cached["cache_id"]
+    cf.PAPER_TRADES_JSONL.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    second = cf.run_once(limit=5)
+
+    assert first["summary"]["coverage_pct"] == 0.0
+    assert second["summary"]["coverage_pct"] == 1.0
+    assert second["summary"]["correction_count"] == 1
+    assert second["summary"]["signal_count"] == 1
+    rows = cf.read_jsonl(cf.REPLAYS_JSONL)
+    complete = [row for row in rows if row["status"] == "complete"][0]
+    assert complete["is_correction_event"] is True
+    assert complete["previous_status"] == "unresolved"
+    assert complete["supersedes_replay_id"]
 
 def test_derivatives_missing_data_degrades_confidence(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(dob, "DERIVATIVES_LATEST", tmp_path / "derivatives_latest.json")

@@ -334,7 +334,7 @@ def test_status_reports_duplicate_process_counts(tmp_path: Path, monkeypatch, ca
     assert payload["agents"][0]["duplicate_count"] == 2
     assert payload["agents"][0]["matching_pids"] == [20, 21, 22]
 
-def test_stop_other_supervisors_logs_duplicates_without_killing(tmp_path: Path, monkeypatch):
+def test_stop_other_supervisors_stops_duplicates(tmp_path: Path, monkeypatch):
     pid_file = tmp_path / "supervisor.pid"
     pid_file.write_text("99", encoding="ascii")
     events = []
@@ -343,7 +343,10 @@ def test_stop_other_supervisors_logs_duplicates_without_killing(tmp_path: Path, 
     monkeypatch.setattr(aps.os, "getpid", lambda: 99)
     monkeypatch.setattr(aps, "supervisor_loop_pids", lambda: [10, 11])
     monkeypatch.setattr(aps, "append_jsonl", lambda event, payload: events.append((event, payload)))
+    stopped = []
+    monkeypatch.setattr(aps, "stop_pid", lambda pid, script: stopped.append((pid, script)))
 
     aps.stop_other_supervisors()
 
-    assert events == [("supervisor_duplicate_detected", {"pids": [10, 11], "owner_pid": 99, "action": "cleanup_required"})]
+    assert stopped == [(10, aps.SUPERVISOR_SCRIPT), (11, aps.SUPERVISOR_SCRIPT)]
+    assert events == [("supervisor_duplicate_detected", {"pids": [10, 11], "owner_pid": 99, "action": "stopped"})]

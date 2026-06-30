@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable
 
 from belief_ledger import load_ledger, save_ledger, upsert_belief
+from data_trust import evaluate_evidence_for_learning
 from event_store import query_recent_events, safe_append_event, safe_append_snapshot
 from market_learner import safe_float, valid_paper_close, valid_paper_open
 
@@ -96,7 +97,7 @@ def summarize_events(events: list[dict], ts: str | None = None, window_hours: fl
                 paper["losses"] += 1
         elif event == "risk_block":
             risk_blocks[str(row.get("reason") or "unknown")] += 1
-        elif event == "lesson" and row.get("lesson"):
+        elif event == "lesson" and row.get("lesson") and evaluate_evidence_for_learning(row, requested_effect="memory_promotion").get("ok"):
             lessons[" ".join(str(row["lesson"]).split())] += 1
 
     closes = max(1, int(paper["closes"]))

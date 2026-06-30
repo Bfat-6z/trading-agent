@@ -55,7 +55,7 @@ def test_shadow_trade_evaluator_loop_writes_latest_and_heartbeat(monkeypatch, tm
     _patch_paths(monkeypatch, tmp_path)
     ev.append_jsonl(ev.SHADOW_JSONL, [_shadow()])
 
-    result = loop.run_once(max_age_hours=24, max_trades=5, fetcher=lambda *args: [_candle(ENTRY_MS)])
+    result = loop.run_once(max_age_hours=None, max_trades=5, fetcher=lambda *args: [_candle(ENTRY_MS)])
 
     assert result["status"] == "ok"
     assert result["evaluated"] == 1
@@ -76,7 +76,7 @@ def test_shadow_trade_evaluator_loop_retries_after_api_error_without_double_coun
     ev.append_jsonl(ev.SHADOW_JSONL, [shadow])
     ev.append_jsonl(ev.SHADOW_CLOSE_JSONL, [previous])
 
-    result = loop.run_once(max_age_hours=24, max_trades=5, fetcher=lambda *args: [_candle(ENTRY_MS)])
+    result = loop.run_once(max_age_hours=None, max_trades=5, fetcher=lambda *args: [_candle(ENTRY_MS)])
     performance = ev.read_json(ev.SHADOW_PERFORMANCE_JSON)
 
     assert result["filter_stats"]["retryable_selected"] == 1
@@ -94,7 +94,7 @@ def test_shadow_trade_evaluator_loop_respects_rate_limit_backoff(monkeypatch, tm
     def fail_fetcher(*args):
         raise AssertionError("fetcher should not be called during active backoff")
 
-    result = loop.run_once(max_age_hours=24, max_trades=5, fetcher=fail_fetcher)
+    result = loop.run_once(max_age_hours=None, max_trades=5, fetcher=fail_fetcher)
 
     assert result["status"] == "rate_limited_backoff"
     assert result["evaluated"] == 1

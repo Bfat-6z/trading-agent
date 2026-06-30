@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from agent_data_contracts import SCHEMA_VERSION, validate_contract
-from atomic_state import read_jsonl, write_json_atomic
+from atomic_state import read_json, read_jsonl, write_json_atomic
 from timebase import parse_utc, seconds_between, utc_now, validate_event_order
 
 ROOT = Path(__file__).resolve().parent
@@ -26,11 +26,14 @@ DEFAULT_EVENT_PATHS = [
     MEMORY_DIR / "shadow_closes.jsonl",
 ]
 LATEST_PATH = MEMORY_DIR / "trade_lifecycle_latest.json"
+TRADE_LIFECYCLE_QUARANTINE = MEMORY_DIR / "trade_lifecycle_quarantine.jsonl"
+PAPER_ACCOUNT = STATE_DIR / "paper_account.json"
 
 OPEN_EVENTS = {"paper_open", "paper_trade_open", "trade_open", "open"}
 CLOSE_EVENTS = {"paper_close", "paper_trade_close", "trade_close", "shadow_close", "close"}
 OPEN_STATUSES = {"open", "opened"}
 CLOSE_STATUSES = {"closed", "close", "tp", "sl", "timeout", "liquidated"}
+ACTIVE_QUARANTINE_STATUSES = {"active", "approved"}
 
 
 def safe_decimal(value: Any) -> Decimal | None:
@@ -56,6 +59,42 @@ def infer_kind(row: dict[str, Any]) -> str | None:
         return "open"
     if event in CLOSE_EVENTS or status in CLOSE_STATUSES or row.get("close_ts") or row.get("exit"):
         return "close"
+    return None
+
+def active_quarantined_trade_ids(entries: Iterable[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "").lower() not in ACTIVE_QUARANTINE_STATUSES:
+            continue
+        trade_id = row.get("trade_id")
+        if trade_id:
+            ids.add(str(trade_id))
+    return ids
+
+def quarantine_match(event: dict[str, Any], kind: str, entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    trade_id = str(event.get("trade_id") or "")
+    if not trade_id:
+        return None
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "").lower() not in ACTIVE_QUARANTINE_STATUSES:
+            continue
+        if str(row.get("trade_id") or "") != trade_id:
+            continue
+        kinds = row.get("kinds") if isinstance(row.get("kinds"), list) else []
+        kind_value = str(row.get("kind") or "")
+        scope = str(row.get("scope") or "trade")
+        if scope == "event" and kinds and kind not in {str(item) for item in kinds}:
+            continue
+        if scope == "event" and kind_value and kind_value != kind:
+            continue
+        open_ts = row.get("open_ts")
+        if open_ts and str(open_ts) != str(event.get("open_ts") or ""):
+            continue
+        return row
     return None
 
 
@@ -158,12 +197,15 @@ def validate_trade_events(
     max_snapshot_age_seconds: int = 15 * 60,
     min_open_ts: Any = None,
     now: datetime | None = None,
+    quarantine_entries: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
     min_open = parse_utc(min_open_ts)
+    quarantines = list(quarantine_entries or [])
     open_trades: dict[str, dict[str, Any]] = {}
     close_trades: set[str] = set()
     invalid_events: list[dict[str, Any]] = []
+    quarantined_events: list[dict[str, Any]] = []
     valid_events = 0
     ignored_events = 0
     duplicate_opens = 0
@@ -180,6 +222,18 @@ def validate_trade_events(
             ignored_events += 1
             continue
         trade_id = event.get("trade_id")
+        quarantine = quarantine_match(event, kind, quarantines)
+        if quarantine:
+            quarantined_events.append(
+                {
+                    "index": index,
+                    "trade_id": trade_id,
+                    "kind": kind,
+                    "reason": quarantine.get("reason") or "quarantined_trade_lifecycle",
+                    "quarantine_id": quarantine.get("quarantine_id"),
+                }
+            )
+            continue
         errors: list[str] = []
         warnings: list[str] = []
         contract = validate_contract("paper_close_event" if kind == "close" else "paper_trade_event", event)
@@ -224,17 +278,20 @@ def validate_trade_events(
     return {
         "schema_version": SCHEMA_VERSION,
         "validated_at": utc_now(),
+        "min_open_ts": min_open_ts,
         "status": status,
         "trade_lifecycle_completeness": completeness,
         "total_rows": len(rows),
         "considered_events": considered,
         "valid_events": valid_events,
         "invalid_events_count": len(invalid_events),
+        "quarantined_events_count": len(quarantined_events),
         "ignored_events": ignored_events,
         "duplicate_opens": duplicate_opens,
         "orphan_closes": orphan_closes,
         "stale_open_trades": stale_open_trades,
         "invalid_events": invalid_events[:100],
+        "quarantined_events": quarantined_events[:100],
         "learning_allowed": completeness >= 0.99 and not stale_open_trades,
     }
 
@@ -246,8 +303,17 @@ def read_trade_rows(paths: Iterable[Path]) -> list[dict[str, Any]]:
     return rows
 
 
-def write_latest_report(paths: Iterable[Path] = DEFAULT_EVENT_PATHS, output_path: Path = LATEST_PATH, min_open_ts: Any = None) -> dict[str, Any]:
-    report = validate_trade_events(read_trade_rows(paths), min_open_ts=min_open_ts)
+def write_latest_report(
+    paths: Iterable[Path] = DEFAULT_EVENT_PATHS,
+    output_path: Path = LATEST_PATH,
+    min_open_ts: Any = None,
+    quarantine_path: Path | None = None,
+) -> dict[str, Any]:
+    report = validate_trade_events(
+        read_trade_rows(paths),
+        min_open_ts=min_open_ts,
+        quarantine_entries=read_jsonl(quarantine_path or TRADE_LIFECYCLE_QUARANTINE),
+    )
     write_json_atomic(output_path, report)
     return report
 
@@ -255,6 +321,8 @@ def write_latest_report(paths: Iterable[Path] = DEFAULT_EVENT_PATHS, output_path
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate paper/shadow trade lifecycle rows")
     parser.add_argument("--output", default=str(LATEST_PATH))
+    parser.add_argument("--min-open-ts")
+    parser.add_argument("--all-history", action="store_true")
     parser.add_argument("paths", nargs="*")
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -262,7 +330,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     paths = [Path(item) for item in args.paths] if args.paths else DEFAULT_EVENT_PATHS
-    report = write_latest_report(paths, Path(args.output))
+    min_open_ts = None if args.all_history else args.min_open_ts or read_json(PAPER_ACCOUNT, default={}).get("created_at")
+    report = write_latest_report(paths, Path(args.output), min_open_ts=min_open_ts)
     print(report)
     return 0 if report["status"] != "blocked_for_learning" else 2
 

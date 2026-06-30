@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -20,6 +22,20 @@ DEFAULT_STALE_SECONDS = 24 * 60 * 60
 def registry_version(payload: dict[str, Any] | None = None) -> str:
     payload = payload or {}
     return str(payload.get("registry_version") or payload.get("updated_at") or "unversioned")
+
+
+def canonical_instrument_id(symbol: str, contract_type: str = "PERPETUAL", venue: str = "binance_usdm") -> str:
+    return f"{venue}:{normalize_symbol(symbol)}:{str(contract_type or 'PERPETUAL').upper()}"
+
+
+def instrument_snapshot_id(symbol: str, registry: dict[str, Any], row: dict[str, Any] | None = None) -> str:
+    material = {
+        "registry_version": registry_version(registry),
+        "symbol": normalize_symbol(symbol),
+        "row": row or (registry.get("instruments") or {}).get(normalize_symbol(symbol)) or {},
+    }
+    raw = json.dumps(material, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":"))
+    return "instrument_snapshot_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:18]
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -77,7 +93,7 @@ def can_trade_paper(symbol: str, registry: dict[str, Any] | None = None, allow_m
     errors: list[str] = []
     warnings: list[str] = []
     if is_registry_stale(registry):
-        warnings.append("instrument_registry_stale")
+        errors.append("instrument_registry_stale")
     if row is None:
         if allow_missing:
             warnings.append("instrument_missing_allowed_for_shadow")
@@ -93,6 +109,9 @@ def can_trade_paper(symbol: str, registry: dict[str, Any] | None = None, allow_m
         "checked_at": utc_now(),
         "symbol": symbol_up,
         "registry_version": registry_version(registry),
+        "canonical_instrument_id": canonical_instrument_id(symbol_up, str((row or {}).get("contract_type") or "PERPETUAL")),
+        "instrument_snapshot_id": instrument_snapshot_id(symbol_up, registry, row),
+        "price_basis_contract": {"fills": "BOOK_MID/LAST+slippage", "mark": "MARK", "candles": "CANDLE_CLOSE"},
         "can_trade_paper": not errors,
         "errors": sorted(set(errors)),
         "warnings": sorted(set(warnings)),
@@ -127,8 +146,11 @@ def instruments_from_exchange_info(exchange_info: dict[str, Any], leverage_brack
         row = {
             "schema_version": SCHEMA_VERSION,
             "symbol": symbol,
+            "canonical_instrument_id": canonical_instrument_id(symbol, str(raw.get("contractType") or raw.get("contract_type") or "PERPETUAL")),
+            "contract_type": str(raw.get("contractType") or raw.get("contract_type") or "PERPETUAL").upper(),
             "base_asset": raw.get("baseAsset") or raw.get("base_asset"),
             "quote_asset": raw.get("quoteAsset") or raw.get("quote_asset"),
+            "margin_asset": raw.get("marginAsset") or raw.get("margin_asset") or raw.get("quoteAsset") or raw.get("quote_asset"),
             "status": str(raw.get("status") or "unknown").lower(),
             "tick_size": filter_value(filters, "PRICE_FILTER", "tickSize", raw.get("tick_size") or "0"),
             "step_size": filter_value(filters, "LOT_SIZE", "stepSize", raw.get("step_size") or "0"),

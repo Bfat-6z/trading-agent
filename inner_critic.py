@@ -12,6 +12,7 @@ from pathlib import Path
 from event_store import safe_append_event
 from market_learner import safe_float
 from dont_do_memory import evaluate_candidate as evaluate_dont_do_candidate
+from memory_retrieval import active_recall_for_decision
 from setup_skill_library import load_library, match_setup
 
 ROOT = Path(__file__).resolve().parent
@@ -117,6 +118,7 @@ def verdict_payload(
     min_score: int | None = None,
     stale_data: list[dict] | None = None,
     news_context: dict | None = None,
+    active_recall: dict | None = None,
 ) -> dict:
     if verdict not in VERDICTS:
         verdict = "block"
@@ -129,6 +131,8 @@ def verdict_payload(
         "hypothesis_ids": [row.get("hypothesis_id") for row in hypotheses[:5]],
         "stale_data": stale_data or [],
         "news_context": news_context or {},
+        "active_recall": active_recall or {},
+        "memory_ids_used": (active_recall or {}).get("memory_ids_used") or [],
         "tighten_min_signal_score": min_score,
         "can_loosen": False,
     }
@@ -186,6 +190,7 @@ def evaluate_signal(
     library: dict | None = None,
     hypotheses_result: dict | None = None,
     news_context: dict | None = None,
+    active_recall_result: dict | None = None,
     now: datetime | None = None,
 ) -> dict:
     bias = bias if bias is not None else read_json(BIAS_PATH)
@@ -210,14 +215,20 @@ def evaluate_signal(
         verdict = verdict_payload("block", ["stale_market_snapshot"], [], [], min_score, stale_data)
         safe_append_event("inner_critic", "critic_block", {"symbol": symbol, "side": side, "signal": signal, "critic": verdict})
         return verdict
+    active_recall = active_recall_result if active_recall_result is not None else active_recall_for_decision(signal, decision_cutoff=(now or datetime.now(timezone.utc)).isoformat(timespec="seconds"))
+    recall_delta = active_recall.get("decision_delta") if isinstance(active_recall.get("decision_delta"), dict) else {}
     dont_do = evaluate_dont_do_candidate(signal)
     if dont_do.get("action") == "block_paper":
-        verdict = verdict_payload("block", ["dont_do_memory_match"], [], [], min_score, stale_data, {"dont_do": dont_do})
+        verdict = verdict_payload("block", ["dont_do_memory_match"], [], [], min_score, stale_data, {"dont_do": dont_do}, active_recall)
+        safe_append_event("inner_critic", "critic_block", {"symbol": symbol, "side": side, "signal": signal, "critic": verdict})
+        return verdict
+    if recall_delta.get("action") == "block":
+        verdict = verdict_payload("block", ["active_recall_block"], [], [], min_score, stale_data, {"active_recall_reason": recall_delta.get("reason")}, active_recall)
         safe_append_event("inner_critic", "critic_block", {"symbol": symbol, "side": side, "signal": signal, "critic": verdict})
         return verdict
     news_eval = news_verdict_context(news_context, symbol, side, now)
     if news_eval.get("hard_reasons"):
-        verdict = verdict_payload("block", list(news_eval["hard_reasons"]), [], [], min_score, stale_data, news_eval)
+        verdict = verdict_payload("block", list(news_eval["hard_reasons"]), [], [], min_score, stale_data, news_eval, active_recall)
         safe_append_event("inner_critic", "critic_block", {"symbol": symbol, "side": side, "signal": signal, "critic": verdict})
         return verdict
     if is_sleep_active(bias, now):
@@ -231,7 +242,7 @@ def evaluate_signal(
 
     hard_reasons = list(reasons)
     if hard_reasons:
-        verdict = verdict_payload("block", hard_reasons, [], [], min_score, stale_data, news_eval)
+        verdict = verdict_payload("block", hard_reasons, [], [], min_score, stale_data, news_eval, active_recall)
         safe_append_event("inner_critic", "critic_block", {"symbol": symbol, "side": side, "signal": signal, "critic": verdict})
         return verdict
 
@@ -241,7 +252,7 @@ def evaluate_signal(
     }
     setup_matches = match_setup(signal, snapshot, context=context, library=library)
     if not setup_matches:
-        verdict = verdict_payload("block", ["no_setup_match"], [], [], min_score, stale_data, news_eval)
+        verdict = verdict_payload("block", ["no_setup_match"], [], [], min_score, stale_data, news_eval, active_recall)
         safe_append_event("inner_critic", "critic_block", {"symbol": symbol, "side": side, "signal": signal, "critic": verdict})
         return verdict
 
@@ -255,9 +266,11 @@ def evaluate_signal(
         reasons.append("spread_too_wide")
     if dont_do.get("action") == "shadow_only":
         reasons.append("dont_do_memory_shadow_only")
+    if recall_delta.get("action") == "tighten":
+        reasons.append("active_recall_tighten")
     reasons.extend(news_eval.get("tighten_reasons", []))
 
     verdict = "tighten" if reasons else "allow_paper"
-    payload = verdict_payload(verdict, reasons or ["critic_passed"], setup_matches, supporting, max(min_score, 7) if verdict == "tighten" else min_score, stale_data, news_eval)
+    payload = verdict_payload(verdict, reasons or ["critic_passed"], setup_matches, supporting, max(min_score, 7) if verdict == "tighten" else min_score, stale_data, news_eval, active_recall)
     safe_append_event("inner_critic", "critic_verdict", {"symbol": symbol, "side": side, "signal": signal, "critic": payload})
     return payload

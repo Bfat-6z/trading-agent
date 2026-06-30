@@ -14,6 +14,7 @@ from timebase import parse_utc, seconds_between, utc_now
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 DEFAULT_DB = STATE_DIR / "agent_jobs.sqlite"
+EVENT_DB = STATE_DIR / "agent_state.db"
 
 
 def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
@@ -47,7 +48,24 @@ def stable_job_id(job_type: str, payload: dict[str, Any], explicit_id: str | Non
     return "job_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
-def enqueue_job(job_type: str, payload: dict[str, Any], priority: int | None = None, job_id: str | None = None, db_path: Path = DEFAULT_DB, model_health: dict[str, Any] | None = None) -> dict[str, Any]:
+def emit_job_lifecycle(job_id: str, job_type: str, status: str, payload: dict[str, Any] | None = None, event_db_path: Path = EVENT_DB) -> None:
+    try:
+        from event_store import append_event_envelope
+
+        append_event_envelope(
+            "job.lifecycle",
+            {"job_id": job_id, "job_type": job_type, "status": status, **(payload or {})},
+            "agent_work_queue",
+            "agent_work_queue",
+            job_id,
+            db_path=event_db_path,
+            sequence=status,
+        )
+    except Exception:
+        pass
+
+
+def enqueue_job(job_type: str, payload: dict[str, Any], priority: int | None = None, job_id: str | None = None, db_path: Path = DEFAULT_DB, model_health: dict[str, Any] | None = None, event_db_path: Path = EVENT_DB) -> dict[str, Any]:
     ok, error = validate_job_type(job_type)
     if not ok:
         return {"ok": False, "error": error, "job_id": None}
@@ -63,10 +81,12 @@ def enqueue_job(job_type: str, payload: dict[str, Any], priority: int | None = N
             (jid, job_type, row_priority, json.dumps(payload, ensure_ascii=True, sort_keys=True), utc_now()),
         )
         inserted = conn.total_changes > before
+    if inserted:
+        emit_job_lifecycle(jid, job_type, "queued", {"priority": row_priority}, event_db_path=event_db_path)
     return {"ok": True, "job_id": jid, "inserted": inserted, "priority": row_priority}
 
 
-def claim_next(worker_id: str, db_path: Path = DEFAULT_DB) -> dict[str, Any] | None:
+def claim_next(worker_id: str, db_path: Path = DEFAULT_DB, event_db_path: Path = EVENT_DB) -> dict[str, Any] | None:
     now = utc_now()
     with connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -77,9 +97,10 @@ def claim_next(worker_id: str, db_path: Path = DEFAULT_DB) -> dict[str, Any] | N
         job_id, job_type, priority, payload_json = row
         conn.execute("UPDATE jobs SET status='running', locked_by=?, locked_at=? WHERE job_id=? AND status='queued'", (worker_id, now, job_id))
         conn.commit()
+    emit_job_lifecycle(job_id, job_type, "running", {"worker_id": worker_id}, event_db_path=event_db_path)
     return {"schema_version": SCHEMA_VERSION, "job_id": job_id, "job_type": job_type, "priority": priority, "payload": json.loads(payload_json), "locked_by": worker_id, "locked_at": now}
 
-def claim_next_of_types(worker_id: str, job_types: list[str], db_path: Path = DEFAULT_DB) -> dict[str, Any] | None:
+def claim_next_of_types(worker_id: str, job_types: list[str], db_path: Path = DEFAULT_DB, event_db_path: Path = EVENT_DB) -> dict[str, Any] | None:
     allowed = [job_type for job_type in job_types if validate_job_type(job_type)[0]]
     if not allowed:
         return None
@@ -97,6 +118,7 @@ def claim_next_of_types(worker_id: str, job_types: list[str], db_path: Path = DE
         job_id, job_type, priority, payload_json = row
         conn.execute("UPDATE jobs SET status='running', locked_by=?, locked_at=? WHERE job_id=? AND status='queued'", (worker_id, now, job_id))
         conn.commit()
+    emit_job_lifecycle(job_id, job_type, "running", {"worker_id": worker_id}, event_db_path=event_db_path)
     return {"schema_version": SCHEMA_VERSION, "job_id": job_id, "job_type": job_type, "priority": priority, "payload": json.loads(payload_json), "locked_by": worker_id, "locked_at": now}
 
 
@@ -112,10 +134,13 @@ def recover_stale_locks(max_lock_age_seconds: int = 900, db_path: Path = DEFAULT
     return len(rows)
 
 
-def complete_job(job_id: str, ok: bool = True, error: str | None = None, db_path: Path = DEFAULT_DB) -> None:
+def complete_job(job_id: str, ok: bool = True, error: str | None = None, db_path: Path = DEFAULT_DB, event_db_path: Path = EVENT_DB) -> None:
     status = "done" if ok else "failed"
     with connect(db_path) as conn:
+        row = conn.execute("SELECT job_type FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         conn.execute("UPDATE jobs SET status=?, completed_at=?, error=? WHERE job_id=?", (status, utc_now(), error, job_id))
+    if row:
+        emit_job_lifecycle(job_id, str(row[0]), status, {"error": error} if error else {}, event_db_path=event_db_path)
 
 
 def queue_summary(db_path: Path = DEFAULT_DB) -> dict[str, Any]:

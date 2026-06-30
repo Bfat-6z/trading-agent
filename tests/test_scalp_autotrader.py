@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from argparse import Namespace
@@ -230,6 +231,33 @@ def test_write_paper_account_persists_equity(tmp_path: Path):
     payload = bot.paper_account_path.read_text(encoding="utf-8")
     assert '"equity": "101.25"' in payload
     assert '"starting_equity": "100.0"' in payload
+
+def test_write_paper_account_preserves_modern_account_schema(tmp_path: Path):
+    bot = ScalpAutoTrader.__new__(ScalpAutoTrader)
+    bot.args = Namespace(live=False, paper_equity=100.0)
+    bot.paper_account_path = tmp_path / "paper_account.json"
+    bot.log = lambda event, payload: None
+    bot.paper_account_path.write_text(
+        json.dumps(
+            {
+                "starting_equity": "100",
+                "equity": "100",
+                "cash": "95",
+                "open_margin": "5",
+                "open_positions": [{"position_id": "p1", "margin": "5"}],
+                "realized_pnl": "0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bot.write_paper_account(Decimal("82"), "paper_close")
+
+    payload = json.loads(bot.paper_account_path.read_text(encoding="utf-8"))
+    assert payload["equity"] == "100"
+    assert payload["cash"] == "95"
+    assert payload["open_positions"][0]["position_id"] == "p1"
+    assert payload["legacy_scalp_equity"] == "82"
 
 def test_reset_paper_account_only_writes_100_and_logs(tmp_path: Path):
     args = parse_args(["--state-dir", str(tmp_path), "--paper-equity", "100", "--reset-paper-account-only"])

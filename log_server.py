@@ -1,5 +1,10 @@
 """Tiny FastAPI server serving bot log + position status. Mobile-friendly HTML.
 Real-time log via Server-Sent Events (SSE)."""
+# PHASE00_LEGACY_DIRECT_RUN_GUARD
+if __name__ == "__main__":
+    from legacy_live_blocker import block_file_if_legacy as _phase00_block_file
+    _phase00_block_file(__file__, "direct_exec")
+
 import asyncio
 import hmac
 import os

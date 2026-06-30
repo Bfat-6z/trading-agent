@@ -2,6 +2,7 @@ from pathlib import Path
 
 import autonomous_paper_trading_loop as paper_loop
 import autonomous_paper_trading_brain as brain
+import agent_process_supervisor as aps
 import paper_candidate_feeder as feeder
 import promotion_evaluator_loop as promo_loop
 
@@ -89,10 +90,11 @@ def test_candidate_feeder_bootstraps_paper_instrument_registry(tmp_path: Path, m
     result = feeder.bootstrap_paper_instrument_registry(market, path=tmp_path / "registry.json")
 
     row = result["registry"]["instruments"]["ABCUSDT"]
-    assert row["status"] == "paper_allowed"
+    assert row["status"] == "shadow_only"
+    assert row["allowed_effect"] == "shadow_only"
     assert row["min_notional"] == "0.01"
 
-def test_paper_loop_allows_candidate_marked_exploration(monkeypatch, tmp_path: Path):
+def test_paper_loop_ignores_candidate_marked_exploration_and_untrusted_candidate(monkeypatch, tmp_path: Path):
     memory = tmp_path / "agent_memory"
     memory.mkdir()
     monkeypatch.setattr(paper_loop, "MEMORY_DIR", memory)
@@ -109,10 +111,12 @@ def test_paper_loop_allows_candidate_marked_exploration(monkeypatch, tmp_path: P
 
     result = paper_loop.run_once()
 
-    assert result["exploration_allowed"] is True
-    assert result["decision"]["exploration_allowed"] is True
+    assert result["exploration_allowed"] is False
+    assert result["decision"]["action"] == "skip"
+    assert result["decision"]["reason"] == "no_trusted_candidates"
+    assert "untrusted_candidate_producer" in result["decision"]["rejected_candidates"][0]["errors"]
 
-def test_paper_loop_merges_batch_stats_without_losing_evidence(monkeypatch, tmp_path: Path):
+def test_paper_loop_ignores_batch_stats_without_losing_library_evidence(monkeypatch, tmp_path: Path):
     memory = tmp_path / "agent_memory"
     memory.mkdir()
     monkeypatch.setattr(paper_loop, "MEMORY_DIR", memory)
@@ -129,7 +133,7 @@ def test_paper_loop_merges_batch_stats_without_losing_evidence(monkeypatch, tmp_
         "load_queue_candidate_batch",
         lambda worker_id: (
             {
-                "candidates": [{"symbol": "ABCUSDT", "side": "SHORT", "setup_id": "exhaustion_fade", "entry": 10, "sl": 11, "tp": 9, "score": 8}],
+                "candidates": [{"symbol": "ABCUSDT", "side": "SHORT", "setup_id": "exhaustion_fade", "entry": 10, "sl": 11, "tp": 9, "score": 8, "source": "paper_candidate_feeder", "producer_id": "paper_candidate_feeder", "allowed_effect": "feature_input"}],
                 "setup_stats": [{"setup_id": "exhaustion_fade", "expectancy": 0.1}],
             },
             None,
@@ -149,7 +153,7 @@ def test_paper_loop_merges_batch_stats_without_losing_evidence(monkeypatch, tmp_
     paper_loop.run_once()
 
     row = captured["setup_stats"][0]
-    assert row["expectancy"] == 0.1
+    assert "expectancy" not in row
     assert row["evidence_expectancy"] == -0.2
     assert row["metadata"]["paper_only_min_score_adjustment"] == 1.0
 
@@ -165,3 +169,10 @@ def test_promotion_evaluator_loop_writes_latest(monkeypatch, tmp_path: Path):
 
     assert result["promotion"]["state"] == "paper_learning"
     assert result["can_place_live_orders"] is False
+
+def test_supervisor_includes_memory_and_skill_forge_agents():
+    names = {spec.name for spec in aps.specs()}
+
+    assert "memory_consolidation_agent" in names
+    assert "skill_forge_agent" in names
+    assert "whale_flow_observer" in names

@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import backtest_harness as bh
 import capital_allocation_policy as cap
 import experiment_registry as exp
+import promotion_board as pb
 import setup_ranker
 import skill_forge_agent as sfa
 import walk_forward_validator as wfv
@@ -10,6 +12,7 @@ def review_row(setup_id: str, ts: str, net: float, review_id: str) -> dict:
     return {
         "review_id": review_id,
         "reviewed_at": ts,
+        "decision_ts": ts,
         "source_trade": {"setup_id": setup_id, "close_ts": ts, "net": str(net)},
         "costs": {"net": str(net)},
     }
@@ -133,6 +136,466 @@ def test_walk_forward_latest_ignores_non_walk_forward_experiments(tmp_path: Path
     assert result["by_status"] == {"running": 1}
     assert result["rows"][0]["experiment_id"] == "wf_p1"
 
+def test_walk_forward_window_spec_id_is_reproducible_and_boundaries_immutable():
+    spec = wfv.build_walk_forward_window_spec(
+        train_start="2026-06-01T00:00:00+00:00",
+        train_end="2026-06-10T00:00:00+00:00",
+        test_start="2026-06-11T00:00:00+00:00",
+        test_end="2026-06-15T00:00:00+00:00",
+        holdout_start="2026-06-16T00:00:00+00:00",
+        holdout_end="2026-06-20T00:00:00+00:00",
+        embargo_seconds=3600,
+    )
+    same = wfv.build_walk_forward_window_spec(
+        train_start="2026-06-01T00:00:00+00:00",
+        train_end="2026-06-10T00:00:00+00:00",
+        test_start="2026-06-11T00:00:00+00:00",
+        test_end="2026-06-15T00:00:00+00:00",
+        holdout_start="2026-06-16T00:00:00+00:00",
+        holdout_end="2026-06-20T00:00:00+00:00",
+        embargo_seconds=3600,
+    )
+    tampered = {**spec, "test": {"start": "2026-06-12T00:00:00+00:00", "end": "2026-06-15T00:00:00+00:00"}}
+
+    assert spec["window_id"] == same["window_id"]
+    assert wfv.validate_walk_forward_window_spec(spec) == []
+    assert "window_id_digest_mismatch" in wfv.validate_walk_forward_window_spec(tampered)
+
+def test_walk_forward_rejects_review_with_feature_ts_after_decision_time():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    bad = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    bad["decision_ts"] = "2026-06-24T10:00:00+00:00"
+    bad["feature_ts"] = "2026-06-24T10:01:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [bad], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "feature_ts_after_decision" in result["errors"]
+
+def test_walk_forward_rejects_feature_rows_missing_decision_time():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    bad = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    bad.pop("decision_ts", None)
+    bad["feature_ts"] = "2026-06-24T10:01:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [bad], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "missing_decision_time" in result["errors"]
+
+def test_walk_forward_rejects_feature_end_after_decision_time():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    bad = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    bad["decision_ts"] = "2026-06-24T10:00:00+00:00"
+    bad["feature_end_at"] = "2026-06-24T10:01:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [bad], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "feature_end_at_after_decision" in result["errors"]
+
+def test_walk_forward_splits_by_decision_time_not_close_time():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["decision_ts"] = "2026-06-24T09:55:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "running"
+    assert result["test_metrics"]["trades"] == 0
+    assert "insufficient_future_trades" in result["errors"]
+
+def test_walk_forward_purge_embargo_removes_overlapping_label_intervals():
+    rows = [
+        {"review_id": "safe", "label_start_at": "2026-06-01T00:00:00+00:00", "label_end_at": "2026-06-02T00:00:00+00:00"},
+        {"review_id": "overlap", "label_start_at": "2026-06-09T23:30:00+00:00", "label_end_at": "2026-06-10T01:00:00+00:00"},
+    ]
+
+    kept, purged = wfv.purge_samples_for_window(rows, {"start": "2026-06-10T00:00:00+00:00", "end": "2026-06-12T00:00:00+00:00"}, embargo_seconds=3600)
+
+    assert [row["review_id"] for row in kept] == ["safe"]
+    assert purged == ["overlap"]
+
+def test_walk_forward_purges_test_labels_overlapping_audit_holdout():
+    spec = wfv.build_walk_forward_window_spec(
+        train_start="2026-06-01T00:00:00+00:00",
+        train_end="2026-06-09T00:00:00+00:00",
+        test_start="2026-06-10T00:00:00+00:00",
+        test_end="2026-06-11T00:00:00+00:00",
+        holdout_start="2026-06-12T00:00:00+00:00",
+        holdout_end="2026-06-14T00:00:00+00:00",
+    )
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-09T00:00:00+00:00", "walk_forward_window_spec": spec}
+    row = review_row("fade", "2026-06-10T01:00:00+00:00", 0.2, "r1")
+    row["label_start_at"] = "2026-06-10T01:00:00+00:00"
+    row["label_end_at"] = "2026-06-12T01:00:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["test_metrics"]["trades"] == 0
+    assert result["partition_meta"]["purged_test_for_holdout"] == ["r1"]
+
+def test_walk_forward_censors_or_fails_immature_labels_until_outcome_known():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["outcome_known_at"] = "2999-01-01T00:00:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "immature_or_unresolved_labels" in result["errors"]
+    assert result["test_metrics"]["trades"] == 0
+
+def test_walk_forward_censors_future_label_end_without_outcome_known():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["label_end_at"] = "2999-01-01T00:00:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "immature_or_unresolved_labels" in result["errors"]
+
+def test_walk_forward_censors_future_review_without_explicit_label_fields():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2999-01-01T00:00:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "immature_or_unresolved_labels" in result["errors"]
+
+def test_walk_forward_censors_future_review_even_when_label_end_is_past():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2999-01-01T00:00:00+00:00", 0.2, "r1")
+    row["label_end_at"] = "2026-06-24T10:10:00+00:00"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "immature_or_unresolved_labels" in result["errors"]
+
+def test_walk_forward_rejects_current_active_universe_for_promotion_evidence():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["universe_manifest"] = {"current_survivor_only": True}
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "current_survivor_universe_diagnostic_only" in result["errors"]
+
+def test_walk_forward_holdout_peek_consumes_budget_and_reuse_fails():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "uses_audit_holdout": True, "audit_holdout_id": "h1"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1, holdout_registry_rows=[{"audit_holdout_id": "h1", "sealed": True}])
+
+    assert result["status"] == "failed"
+    assert "audit_holdout_budget_exhausted" in result["errors"]
+
+def test_walk_forward_run_once_consumes_audit_holdout_budget(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(wfv, "HOLDOUT_REGISTRY", memory / "holdout.jsonl")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_HEARTBEAT", tmp_path / "walk_forward_heartbeat.json")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_PID", tmp_path / "walk_forward_validator.pid")
+    applied = tmp_path / "applied.jsonl"
+    pending = tmp_path / "pending.jsonl"
+    reviews = tmp_path / "reviews.jsonl"
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "uses_audit_holdout": True, "audit_holdout_id": "h1"}
+    wfv.append_jsonl(applied, patch)
+    wfv.append_jsonl(reviews, review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1"))
+
+    first = wfv.run_once(applied_path=applied, pending_path=pending, reviews_path=reviews, history_path=tmp_path / "history.jsonl", latest_path=tmp_path / "latest.json", walk_forward_path=tmp_path / "wf.json", min_test_trades=1)
+    second = wfv.run_once(applied_path=applied, pending_path=pending, reviews_path=reviews, history_path=tmp_path / "history2.jsonl", latest_path=tmp_path / "latest2.json", walk_forward_path=tmp_path / "wf2.json", min_test_trades=1)
+
+    assert first["by_status"]["passed"] == 1
+    assert second["by_status"]["failed"] == 1
+    assert "audit_holdout_budget_exhausted" in second["rows"][0]["errors"]
+
+def test_walk_forward_spec_holdout_consumes_budget_even_without_flag(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(wfv, "HOLDOUT_REGISTRY", memory / "holdout.jsonl")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_HEARTBEAT", tmp_path / "walk_forward_heartbeat.json")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_PID", tmp_path / "walk_forward_validator.pid")
+    applied = tmp_path / "applied.jsonl"
+    pending = tmp_path / "pending.jsonl"
+    reviews = tmp_path / "reviews.jsonl"
+    spec = wfv.build_walk_forward_window_spec(
+        train_start="2026-06-01T00:00:00+00:00",
+        train_end="2026-06-10T00:00:00+00:00",
+        test_start="2026-06-11T00:00:00+00:00",
+        test_end="2026-06-12T00:00:00+00:00",
+        holdout_start="2026-06-13T00:00:00+00:00",
+        holdout_end="2026-06-14T00:00:00+00:00",
+    )
+    wfv.append_jsonl(applied, {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-10T00:00:00+00:00", "walk_forward_window_spec": spec})
+    wfv.append_jsonl(reviews, review_row("fade", "2026-06-11T00:05:00+00:00", 0.2, "r1"))
+
+    wfv.run_once(applied_path=applied, pending_path=pending, reviews_path=reviews, history_path=tmp_path / "history.jsonl", latest_path=tmp_path / "latest.json", walk_forward_path=tmp_path / "wf.json", min_test_trades=1)
+    second = wfv.run_once(applied_path=applied, pending_path=pending, reviews_path=reviews, history_path=tmp_path / "history2.jsonl", latest_path=tmp_path / "latest2.json", walk_forward_path=tmp_path / "wf2.json", min_test_trades=1)
+
+    assert second["by_status"]["failed"] == 1
+    assert "audit_holdout_budget_exhausted" in second["rows"][0]["errors"]
+
+def test_walk_forward_two_same_holdout_patches_in_one_run_do_not_both_pass(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(wfv, "HOLDOUT_REGISTRY", memory / "holdout.jsonl")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_HEARTBEAT", tmp_path / "walk_forward_heartbeat.json")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_PID", tmp_path / "walk_forward_validator.pid")
+    applied = tmp_path / "applied.jsonl"
+    pending = tmp_path / "pending.jsonl"
+    reviews = tmp_path / "reviews.jsonl"
+    for patch_id in ("p1", "p2"):
+        wfv.append_jsonl(applied, {"patch_id": patch_id, "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "uses_audit_holdout": True, "audit_holdout_id": "h1"})
+    wfv.append_jsonl(reviews, review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1"))
+
+    result = wfv.run_once(applied_path=applied, pending_path=pending, reviews_path=reviews, history_path=tmp_path / "history.jsonl", latest_path=tmp_path / "latest.json", walk_forward_path=tmp_path / "wf.json", min_test_trades=1)
+
+    assert result["by_status"]["passed"] == 1
+    assert result["by_status"]["failed"] == 1
+    assert "audit_holdout_budget_exhausted" in result["rows"][1]["errors"]
+
+def test_walk_forward_contaminated_family_cannot_use_final_holdout():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "hypothesis_source_partition": "holdout"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "test_holdout_derived_hypothesis_contaminates_family" in result["errors"]
+
+def test_walk_forward_requires_effect_size_and_confidence_not_just_positive_mean():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    rows = [
+        review_row("fade", "2026-06-24T10:05:00+00:00", 0.01, "r1"),
+        review_row("fade", "2026-06-24T10:10:00+00:00", 0.01, "r2"),
+    ]
+
+    result = wfv.evaluate_patch_walk_forward(patch, rows, min_test_trades=2, min_effect_size=0.05)
+
+    assert result["status"] == "failed"
+    assert "effect_size_too_small" in result["errors"]
+    assert result["test_metrics"]["confidence_interval"]["n"] == 2
+
+def test_walk_forward_family_alpha_blocks_best_of_many_false_positive_variants():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "family_variant_count": 10, "p_value": 0.02}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "multiple_test_penalty_failed" in result["errors"]
+    assert result["family_correction"]["corrected_alpha"] == 0.005
+
+def test_walk_forward_family_alpha_requires_p_value_for_many_variants():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "family_variant_count": 100}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "missing_p_value_for_family_correction" in result["errors"]
+
+def test_walk_forward_family_alpha_uses_family_registry_variant_count():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "experiment_family_id": "fam1"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    registry = [{"experiment_family_id": "fam1", "variant_hash": f"v{i}"} for i in range(3)]
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1, family_registry_rows=registry)
+
+    assert result["status"] == "failed"
+    assert "missing_p_value_for_family_correction" in result["errors"]
+    assert result["family_correction"]["family_variant_count"] == 3
+
+def test_walk_forward_rejects_invalid_negative_p_value():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "family_variant_count": 100, "p_value": -1}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "invalid_p_value" in result["errors"]
+
+def test_walk_forward_group_validation_fails_single_symbol_or_single_cluster_edge():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "requires_grouped_validation": True}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["symbol"] = "BTCUSDT"
+    row["sector"] = "majors"
+    row["beta_cluster"] = "btc_beta"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1, grouped_requirements={"min_unique_symbols": 2, "min_unique_beta_clusters": 2})
+
+    assert result["status"] == "failed"
+    assert "unique_symbols_below_minimum" in result["errors"]
+    assert "unique_beta_clusters_below_minimum" in result["errors"]
+
+def test_walk_forward_regime_labels_must_have_cutoff_at_or_before_decision_time():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["decision_ts"] = "2026-06-24T10:00:00+00:00"
+    row["regime_label_cutoff_proof"] = {"max_input_ts": "2026-06-24T10:02:00+00:00"}
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "regime_max_input_ts_after_decision" in result["errors"]
+
+def test_walk_forward_returns_inconclusive_when_required_regime_bucket_missing():
+    patch = {
+        "patch_id": "p1",
+        "setup_id": "fade",
+        "applied_at": "2026-06-24T10:00:00+00:00",
+        "regime_distribution_manifest": {"required_buckets": ["risk_on", "risk_off"], "min_effective_n_per_bucket": 1},
+    }
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["market_regime"] = "risk_on"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "inconclusive"
+    assert "required_regime_bucket_absent" in result["errors"]
+
+def test_walk_forward_rejects_full_history_fitted_transform_digest():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+    row["transform_fit_partition"] = "full_history"
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "transform_fit_outside_train" in result["errors"]
+
+def test_decision_time_backtest_blocks_future_entry_request(tmp_path: Path):
+    rows = [
+        {"ts": "2026-06-21T00:00:00+00:00", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": "2026-06-21T00:01:00+00:00", "open": 100, "high": 101, "low": 99, "close": 101, "volume": 1},
+        {"ts": "2026-06-21T00:02:00+00:00", "open": 101, "high": 102, "low": 100, "close": 102, "volume": 1},
+    ]
+
+    try:
+        bh.run_decision_time_backtest("bad", rows, lambda visible: {"index": len(visible) + 5, "side": "LONG"}, output_dir=tmp_path)
+    except ValueError as exc:
+        assert str(exc) == "strategy_must_enter_next_candle"
+    else:
+        raise AssertionError("future entry request should fail")
+
+def test_decision_time_backtest_requires_next_candle_entry(tmp_path: Path):
+    rows = [
+        {"ts": "2026-06-21T00:00:00+00:00", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": "2026-06-21T00:01:00+00:00", "open": 100, "high": 101, "low": 99, "close": 101, "volume": 1},
+        {"ts": "2026-06-21T00:02:00+00:00", "open": 101, "high": 102, "low": 100, "close": 102, "volume": 1},
+    ]
+
+    try:
+        bh.run_decision_time_backtest("same", rows, lambda visible: {"index": len(visible) - 1, "side": "LONG"}, output_dir=tmp_path)
+    except ValueError as exc:
+        assert str(exc) == "strategy_must_enter_next_candle"
+    else:
+        raise AssertionError("same-candle entry should fail")
+
+def test_promotion_board_blocks_stale_walk_forward_latest(tmp_path: Path):
+    metrics = pb.walk_forward_metrics({"updated_at": "2000-01-01T00:00:00+00:00", "stale_sla_seconds": 60, "by_status": {"passed": 1}, "rows": [{"patch_id": "p1", "status": "passed", "walk_forward_window_spec": {"window_id": "w1"}, "family_correction": {"corrected_alpha": 0.01}}]}, ["p1"])
+
+    result = pb.evaluate_promotion({**metrics, "paper_trades": 999, "shadow_closes": 9999, "lifecycle_completeness": 1.0, "daily_exam_avg": 100, "trial_days": 99}, output_path=tmp_path / "promotion.json")
+
+    assert "walk_forward_stale" in result["failures"]
+
+def test_promotion_board_requires_candidate_manifest_wf_window_and_metric_digests(tmp_path: Path):
+    metrics = pb.walk_forward_metrics(
+        {
+            "updated_at": "2999-01-01T00:00:00+00:00",
+            "stale_sla_seconds": 60,
+            "by_status": {"passed": 1},
+            "rows": [{"patch_id": "p1", "status": "passed", "metric_manifest_digest": "a", "cited_metric_manifest_digest": "b"}],
+        },
+        ["p1"],
+    )
+
+    result = pb.evaluate_promotion({**metrics, "paper_trades": 999, "shadow_closes": 9999, "lifecycle_completeness": 1.0, "daily_exam_avg": 100, "trial_days": 99}, output_path=tmp_path / "promotion.json")
+
+    assert "walk_forward_manifest_digest_mismatch" in result["failures"]
+
+def test_promotion_board_requires_cited_metric_digest(tmp_path: Path):
+    metrics = pb.walk_forward_metrics(
+        {
+            "updated_at": "2999-01-01T00:00:00+00:00",
+            "stale_sla_seconds": 60,
+            "by_status": {"passed": 1},
+            "rows": [{"patch_id": "p1", "status": "passed", "walk_forward_window_spec": {"window_id": "w1"}, "family_correction": {"corrected_alpha": 0.01}, "metric_manifest_digest": "m", "code_config_digest": "c", "candidate_policy_digest": "p", "frozen_partition_digest": "f"}],
+        },
+        ["p1"],
+    )
+
+    result = pb.evaluate_promotion({**metrics, "paper_trades": 999, "shadow_closes": 9999, "lifecycle_completeness": 1.0, "daily_exam_avg": 100, "trial_days": 99}, output_path=tmp_path / "promotion.json")
+
+    assert result["passed"] is False
+    assert "walk_forward_manifest_digest_mismatch" in result["failures"]
+
+def test_promotion_board_handles_null_walk_forward_spec_as_digest_failure(tmp_path: Path):
+    metrics = pb.walk_forward_metrics(
+        {
+            "updated_at": "2999-01-01T00:00:00+00:00",
+            "stale_sla_seconds": 60,
+            "by_status": {"passed": 1},
+            "rows": [{"patch_id": "p1", "status": "passed", "walk_forward_window_spec": None, "family_correction": {"corrected_alpha": 0.01}}],
+        },
+        ["p1"],
+    )
+
+    result = pb.evaluate_promotion({**metrics, "paper_trades": 999, "shadow_closes": 9999, "lifecycle_completeness": 1.0, "daily_exam_avg": 100, "trial_days": 99}, output_path=tmp_path / "promotion.json")
+
+    assert result["passed"] is False
+    assert "walk_forward_manifest_digest_mismatch" in result["failures"]
+
+def test_walk_forward_run_once_writes_review_watermark_and_heartbeat(tmp_path: Path, monkeypatch):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(wfv, "WALK_FORWARD_HEARTBEAT", tmp_path / "walk_forward_heartbeat.json")
+    monkeypatch.setattr(wfv, "WALK_FORWARD_PID", tmp_path / "walk_forward_validator.pid")
+    monkeypatch.setattr(wfv, "HOLDOUT_REGISTRY", memory / "holdout.jsonl")
+    applied = tmp_path / "applied.jsonl"
+    pending = tmp_path / "pending.jsonl"
+    reviews = tmp_path / "reviews.jsonl"
+    wfv.append_jsonl(applied, {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00"})
+    wfv.append_jsonl(reviews, review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1"))
+
+    result = wfv.run_once(applied_path=applied, pending_path=pending, reviews_path=reviews, history_path=tmp_path / "history.jsonl", latest_path=tmp_path / "latest.json", walk_forward_path=tmp_path / "wf.json", min_test_trades=1)
+
+    assert result["review_watermark"]
+    assert wfv.WALK_FORWARD_HEARTBEAT.exists()
+    assert wfv.WALK_FORWARD_PID.exists()
+
+def test_walk_forward_result_propagates_manifest_digests_for_promotion():
+    patch = {
+        "patch_id": "p1",
+        "setup_id": "fade",
+        "applied_at": "2026-06-24T10:00:00+00:00",
+        "metric_manifest_digest": "m",
+        "code_config_digest": "c",
+        "candidate_policy_digest": "p",
+        "frozen_partition_digest": "f",
+    }
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["metric_manifest_digest"] == "m"
+    assert result["cited_metric_manifest_digest"] == "m"
+    assert result["code_config_digest"] == "c"
+
+def test_walk_forward_migration_patch_requires_rollback_and_compatibility_proof():
+    patch = {"patch_id": "p1", "setup_id": "fade", "applied_at": "2026-06-24T10:00:00+00:00", "migration_backed": True}
+    row = review_row("fade", "2026-06-24T10:05:00+00:00", 0.2, "r1")
+
+    result = wfv.evaluate_patch_walk_forward(patch, [row], min_test_trades=1)
+
+    assert result["status"] == "failed"
+    assert "missing_rollback_rehearsal" in result["errors"]
+
 
 def test_setup_ranker_penalizes_high_winrate_bad_expectancy(tmp_path: Path):
     rows = [
@@ -184,7 +647,7 @@ def test_allocation_allows_tiny_exploration_for_undersampled(tmp_path: Path):
 
     assert result["allowed"] is True
     assert result["tier"] == "exploration_paper"
-    assert result["max_loss_usdt"] == 1.5
+    assert result["max_loss_usdt"] == 2.92
     assert result["can_trade_live"] is False
 
 
@@ -195,8 +658,32 @@ def test_allocation_uses_reduced_hint_multiplier(tmp_path: Path):
 
     assert result["allowed"] is True
     assert result["tier"] == "reduced_paper"
-    assert result["max_loss_usdt"] == 0.35
+    assert result["max_loss_usdt"] == 2.69
+    assert result["risk_fraction"] == 0.0269
+    assert result["sizing_mode"] == "adaptive_paper"
     assert result["rank_reasons"] == ["bad_loss_cluster"]
+
+
+def test_allocation_caps_strong_setup_at_five_percent_paper_risk(tmp_path: Path):
+    rankings = [{"setup_id": "strong", "under_sampled": False, "evidence_expectancy": 0.2, "rank_score": 4.0, "allocation_hint": "normal", "risk_multiplier": 1.0, "sample_confidence": 1.0}]
+
+    result = cap.allocate_capital("strong", rankings, {"equity": "100"}, output_path=tmp_path / "alloc.json")
+
+    assert result["allowed"] is True
+    assert result["tier"] == "normal_paper"
+    assert result["risk_fraction"] == 0.05
+    assert result["max_loss_usdt"] == 5.0
+    assert result["can_trade_live"] is False
+
+
+def test_allocation_reduces_size_when_exposure_is_high(tmp_path: Path):
+    rankings = [{"setup_id": "strong", "under_sampled": False, "evidence_expectancy": 0.2, "rank_score": 4.0, "allocation_hint": "normal", "risk_multiplier": 1.0, "sample_confidence": 1.0}]
+
+    result = cap.allocate_capital("strong", rankings, {"equity": "100", "open_margin": "46"}, output_path=tmp_path / "alloc.json")
+
+    assert result["allowed"] is True
+    assert result["risk_fraction"] < 0.05
+    assert result["sizing_factors"]["exposure_penalty"] > 0
 
 
 def test_skill_forge_rejects_patch_missing_invalidation(tmp_path: Path):
@@ -288,6 +775,30 @@ def test_skill_forge_run_once_proposes_from_reviews(tmp_path: Path):
     assert result["candidate_count"] == 1
     assert result["accepted_count"] == 1
     assert result["can_place_live_orders"] is False
+
+def test_skill_forge_main_once_writes_daemon_heartbeat(monkeypatch, tmp_path: Path):
+    memory = tmp_path / "agent_memory"
+    memory.mkdir()
+    monkeypatch.setattr(sfa, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(sfa, "MEMORY_DIR", memory)
+    monkeypatch.setattr(sfa, "PID_FILE", tmp_path / "skill_forge_agent.pid")
+    monkeypatch.setattr(sfa, "HEARTBEAT_PATH", tmp_path / "skill_forge_agent_heartbeat.json")
+    monkeypatch.setattr(sfa, "STOP_FILE", tmp_path / "STOP_SKILL_FORGE_AGENT")
+    monkeypatch.setattr(sfa, "POST_TRADE_REVIEWS", memory / "post_trade_reviews.jsonl")
+    monkeypatch.setattr(sfa, "PATCHES_PENDING", memory / "skill_patches_pending.jsonl")
+    monkeypatch.setattr(sfa, "PATCHES_APPLIED", memory / "skill_patches_applied.jsonl")
+    monkeypatch.setattr(sfa, "PATCHES_REVERTED", memory / "skill_patches_reverted.jsonl")
+    monkeypatch.setattr(sfa, "PATCH_REVIEWS", memory / "skill_patch_reviews.jsonl")
+    monkeypatch.setattr(sfa, "SKILL_FORGE_LATEST", memory / "skill_forge_latest.json")
+    monkeypatch.setattr(sfa, "SKILL_FORGE_HISTORY", memory / "skill_forge_history.jsonl")
+    monkeypatch.setattr(sfa, "SKILL_PATCH_INTEGRATION_LATEST", memory / "skill_patch_integration_latest.json")
+
+    code = sfa.main(["--once", "--min-sample", "9999", "--interval-seconds", "1"])
+
+    assert code == 0
+    assert sfa.PID_FILE.exists()
+    assert sfa.HEARTBEAT_PATH.exists()
+    assert sfa.SKILL_FORGE_LATEST.exists()
 
 
 def test_skill_forge_applies_patch_as_paper_only_lifecycle(monkeypatch, tmp_path: Path):

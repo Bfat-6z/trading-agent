@@ -10,6 +10,11 @@ Halt: create file state/kill_switch (or run `trading-agent.bat kill`)
 """
 from __future__ import annotations
 
+# PHASE00_LEGACY_DIRECT_RUN_GUARD
+if __name__ == "__main__":
+    from legacy_live_blocker import block_file_if_legacy as _phase00_block_file
+    _phase00_block_file(__file__, "direct_exec")
+
 import math
 import os
 import sys

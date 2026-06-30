@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "chart_model_version": "chart_intelligence_v1",
+  "contract": "ChartCandleBatch.v1",
+  "symbol": "ETHUSDT",
+  "timeframe": "5m",
+  "closed_only": true,
+  "source_ids": ["binance_usdm_klines_fixture"],
+  "input_event_ids": ["fixture_event_ethusdt_5m_001"],
+  "decision_cutoff": "2026-06-21T00:05:05+00:00",
+  "cutoff_proof": {
+    "ok": true,
+    "decision_cutoff": "2026-06-21T00:05:05+00:00",
+    "errors": []
+  },
+  "degradation_state": "ok",
+  "bars": [
+    {
+      "open_time": "2026-06-21T00:00:00+00:00",
+      "close_time": "2026-06-21T00:05:00+00:00",
+      "open": "3500",
+      "high": "3518",
+      "low": "3492",
+      "close": "3510",
+      "volume": "9000",
+      "is_final": true,
+      "available_at": "2026-06-21T00:05:01+00:00",
+      "known_at": "2026-06-21T00:05:01+00:00",
+      "ingested_at": "2026-06-21T00:05:02+00:00",
+      "finalized_at": "2026-06-21T00:05:00+00:00"
+    }
+  ]
+}

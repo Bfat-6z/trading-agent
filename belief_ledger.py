@@ -350,6 +350,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evidence-weight", type=float, default=1.0)
     parser.add_argument("--evidence-source", default="manual")
     parser.add_argument("--evidence-summary")
+    parser.add_argument("--evidence-id")
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -366,6 +367,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             raise SystemExit("--belief-id is required when adding evidence")
         if not args.evidence_side or not args.evidence_summary:
             raise SystemExit("--evidence-side and --evidence-summary are required")
+        if args.evidence_source == "manual" and not args.evidence_id:
+            raise SystemExit("--evidence-id is required for manual evidence")
         belief = add_evidence(
             ledger,
             args.belief_id,
@@ -373,6 +376,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.evidence_weight,
             args.evidence_source,
             args.evidence_summary,
+            event_id=args.evidence_id,
         )
         print(json.dumps(belief, ensure_ascii=True, indent=2, sort_keys=True))
         changed = True

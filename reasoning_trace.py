@@ -7,12 +7,14 @@ paper/shadow decisions and learn from missing evidence.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 from event_store import safe_append_event, safe_append_snapshot
+from agent_data_contracts import SCHEMA_VERSION
 from market_learner import safe_float
 
 ROOT = Path(__file__).resolve().parent
@@ -52,6 +54,15 @@ def append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n")
+
+def canonical_json(payload: object) -> str:
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":"))
+
+def payload_hash(payload: object) -> str:
+    return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+def trace_id_for(payload: object) -> str:
+    return "reasoning_trace_" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:20]
 
 
 def parse_ts(value: object) -> datetime | None:
@@ -116,7 +127,7 @@ def hypothesis_quality(hypothesis: dict) -> dict:
     }
 
 
-def build_observations(cognitive_state: dict, snapshot: dict, bias: dict, dream: dict, semantic_memory: dict) -> dict:
+def build_observations(cognitive_state: dict, snapshot: dict, bias: dict, dream: dict, semantic_memory: dict, now: datetime | None = None) -> dict:
     latest_memory = semantic_memory.get("latest") if isinstance(semantic_memory.get("latest"), dict) else {}
     return {
         "market": summarize_market(snapshot),
@@ -125,7 +136,7 @@ def build_observations(cognitive_state: dict, snapshot: dict, bias: dict, dream:
             "risk_posture": bias.get("risk_posture"),
             "min_signal_score": bias.get("min_signal_score"),
             "sleep_until": bias.get("sleep_until"),
-            "sleep_active": sleep_active(bias),
+            "sleep_active": sleep_active(bias, now=now),
             "blocked_sides": bias.get("blocked_sides", []),
             "blocked_symbols_count": len(bias.get("blocked_symbols", []) or []),
         },
@@ -228,13 +239,48 @@ def build_reasoning_trace(
     ts: str | None = None,
 ) -> dict:
     row_ts = ts or utc_now()
+    replay_now = parse_ts(row_ts)
     hypotheses = hypotheses_result.get("hypotheses") if isinstance(hypotheses_result.get("hypotheses"), list) else []
-    observations = build_observations(cognitive_state, snapshot, bias, dream, semantic_memory)
+    observations = build_observations(cognitive_state, snapshot, bias, dream, semantic_memory, now=replay_now)
     contradictions = find_contradictions(observations, hypotheses)
     missing = missing_evidence(observations, hypotheses)
     decision = decide_next_action(observations, contradictions, missing)
+    latest_memory = semantic_memory.get("latest") if isinstance(semantic_memory.get("latest"), dict) else {}
+    evidence_ids = sorted(
+        set(
+            str(item)
+            for item in [
+                snapshot.get("snapshot_id") or snapshot.get("event_id") or snapshot.get("ts"),
+                cognitive_state.get("cognitive_state_id") or cognitive_state.get("event_id"),
+                dream.get("dream_id") or dream.get("cycle_id"),
+                hypotheses_result.get("hypothesis_run_id") or hypotheses_result.get("event_id"),
+                semantic_memory.get("memory_id") or latest_memory.get("memory_id"),
+            ]
+            if item
+        )
+    )
+    input_hashes = {
+        "cognitive_state": payload_hash(cognitive_state),
+        "market_snapshot": payload_hash(snapshot),
+        "bias": payload_hash(bias),
+        "dream": payload_hash(dream),
+        "hypotheses": payload_hash(hypotheses_result),
+        "semantic_memory": payload_hash(semantic_memory),
+    }
     trace = {
+        "schema_version": SCHEMA_VERSION,
+        "trace_schema_version": "reasoning_trace.v2",
         "ts": row_ts,
+        "run_id": trace_id_for({"ts": row_ts, "input_hashes": input_hashes}),
+        "trace_id": trace_id_for({"ts": row_ts, "observations": observations, "decision": decision}),
+        "parent_id": cognitive_state.get("parent_trace_id"),
+        "event_id": cognitive_state.get("event_id") or snapshot.get("event_id"),
+        "source_ids": evidence_ids,
+        "provenance_ids": sorted(set(str(item) for item in [snapshot.get("provenance_id"), cognitive_state.get("provenance_id")] if item)),
+        "evidence_ids": evidence_ids,
+        "input_hashes": input_hashes,
+        "prompt_regression_case_id": "reasoning_trace_core_v2",
+        "grounding_score": 1.0 if evidence_ids else 0.0,
         "focus": cognitive_state.get("focus", {}),
         "question": (cognitive_state.get("experiment_plan") or {}).get("mode", "observe"),
         "observations": observations,

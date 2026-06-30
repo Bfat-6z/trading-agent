@@ -25,10 +25,12 @@ RISK_STATE_PATH = MEMORY_DIR / "paper_risk_state.json"
 POSITION_HISTORY_PATH = MEMORY_DIR / "paper_position_history.jsonl"
 
 DEFAULT_EQUITY = Decimal("100")
-DEFAULT_MAX_MARGIN_FRACTION = Decimal("0.25")
-DEFAULT_MAX_RISK_FRACTION = Decimal("0.02")
-DEFAULT_MAX_LEVERAGE = Decimal("20")
+DEFAULT_MAX_MARGIN_FRACTION = Decimal("0.45")
+DEFAULT_MAX_RISK_FRACTION = Decimal("0.05")
+DEFAULT_MAX_LEVERAGE = Decimal("50")
 EXCHANGE_SANITY_MAX_LEVERAGE = Decimal("125")
+DEFAULT_TAKER_FEE_RATE = Decimal("0.0005")
+MAINTENANCE_MARGIN_RATE = Decimal("0.005")
 
 
 def dec(value: Any, default: str = "0") -> Decimal:
@@ -41,8 +43,54 @@ def dec(value: Any, default: str = "0") -> Decimal:
 
 
 def dec_str(value: Decimal, places: str = "0.00000001") -> str:
-    return str(value.quantize(Decimal(places), rounding=ROUND_DOWN).normalize())
+    normalized = dec(value).quantize(Decimal(places), rounding=ROUND_DOWN).normalize()
+    if normalized == normalized.to_integral():
+        return format(normalized, "f")
+    return format(normalized, "f").rstrip("0").rstrip(".")
 
+
+def position_unrealized_pnl(position: dict[str, Any]) -> Decimal:
+    side = str(position.get("side") or "").upper()
+    entry = dec(position.get("entry"))
+    qty = dec(position.get("qty"))
+    candles = position.get("replay_candles") if isinstance(position.get("replay_candles"), list) else []
+    mark = entry
+    if candles and isinstance(candles[-1], dict):
+        mark = dec(candles[-1].get("close"), str(entry))
+    if entry <= 0 or qty <= 0 or mark <= 0:
+        return Decimal("0")
+    if side == "LONG":
+        return (mark - entry) * qty
+    if side == "SHORT":
+        return (entry - mark) * qty
+    return Decimal("0")
+
+def normalize_account(account: dict[str, Any], original: dict[str, Any] | None = None) -> dict[str, Any]:
+    original = original or account
+    starting = dec(account.get("starting_equity"), "100")
+    positions = [row for row in account.get("open_positions", []) if isinstance(row, dict)] if isinstance(account.get("open_positions"), list) else []
+    open_margin = sum(dec(row.get("margin")) for row in positions)
+    unrealized = sum(position_unrealized_pnl(row) for row in positions)
+    if original.get("cash") not in (None, ""):
+        cash = dec(account.get("cash"), str(starting - open_margin))
+    elif original.get("equity") not in (None, ""):
+        cash = dec(original.get("equity")) - open_margin - unrealized
+    elif original.get("realized_pnl") not in (None, ""):
+        cash = starting + dec(account.get("realized_pnl")) - open_margin
+    else:
+        cash = starting - open_margin
+    realized = dec(account.get("realized_pnl")) if original.get("realized_pnl") not in (None, "") else cash + open_margin - starting
+    equity = cash + open_margin + unrealized
+    return {
+        **account,
+        "starting_equity": dec_str(starting),
+        "cash": dec_str(cash),
+        "equity": dec_str(equity),
+        "realized_pnl": dec_str(realized),
+        "open_margin": dec_str(max(Decimal("0"), open_margin)),
+        "unrealized_pnl": dec_str(unrealized),
+        "open_positions": positions,
+    }
 
 def default_account(equity: Decimal = DEFAULT_EQUITY) -> dict[str, Any]:
     now = utc_now()
@@ -62,6 +110,7 @@ def default_account(equity: Decimal = DEFAULT_EQUITY) -> dict[str, Any]:
         "losses": 0,
         "trial_days": 0,
         "open_margin": "0",
+        "unrealized_pnl": "0",
         "open_positions": [],
         "updated_at": now,
     }
@@ -71,11 +120,12 @@ def load_account(path: Path = ACCOUNT_PATH) -> dict[str, Any]:
     payload = read_json(path, default={})
     if not isinstance(payload, dict) or not payload:
         return default_account()
-    return {**default_account(dec(payload.get("starting_equity"), "100")), **payload}
+    merged = {**default_account(dec(payload.get("starting_equity"), "100")), **payload}
+    return normalize_account(merged, original=payload)
 
 
 def save_account(account: dict[str, Any], path: Path = ACCOUNT_PATH) -> dict[str, Any]:
-    account = {**account, "updated_at": utc_now()}
+    account = normalize_account({**account, "updated_at": utc_now()}, original=account)
     write_json_atomic(path, account)
     return account
 
@@ -93,6 +143,18 @@ def side_risk_distance(side: str, entry: Decimal, sl: Decimal) -> Decimal:
     if side == "SHORT":
         return max(Decimal("0"), (sl - entry) / entry)
     return Decimal("0")
+
+def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+def estimate_liquidation_price(entry: Decimal, side: str, leverage: Decimal) -> Decimal:
+    lev = max(Decimal("1"), leverage)
+    move = (Decimal("1") / lev) - MAINTENANCE_MARGIN_RATE
+    if str(side or "").upper() == "LONG":
+        return entry * (Decimal("1") - move)
+    return entry * (Decimal("1") + move)
 
 
 def choose_requested_margin(equity: Decimal, requested_margin: Any = None) -> Decimal:
@@ -131,6 +193,12 @@ def evaluate_paper_order(
     risk_distance = side_risk_distance(side_up, entry_dec, sl_dec)
     notional = margin * leverage
     qty = notional / entry_dec if entry_dec > 0 else Decimal("0")
+    step_size = dec(inst.get("step_size"), "0")
+    if step_size > 0:
+        qty = round_down_to_step(qty, step_size)
+        notional = qty * entry_dec
+        if leverage > 0:
+            margin = notional / leverage
     estimated_loss = notional * risk_distance
     max_loss = equity * DEFAULT_MAX_RISK_FRACTION
     errors: list[str] = []
@@ -159,8 +227,10 @@ def evaluate_paper_order(
     if estimated_loss > max_loss:
         errors.append("estimated_loss_above_risk_cap")
     min_notional = dec(inst.get("min_notional"), "0")
+    if step_size > 0 and qty <= 0:
+        errors.append("quantity_zero_after_step_rounding")
     if min_notional > 0 and notional < min_notional:
-        warnings.append("notional_below_exchange_minimum")
+        errors.append("notional_below_exchange_minimum")
     if inst.get("status") and str(inst.get("status")).lower() not in {"trading", "paper_allowed"}:
         errors.append("instrument_not_trading")
 
@@ -183,6 +253,7 @@ def evaluate_paper_order(
         "symbol": str(symbol or "").upper(),
         "side": side_up,
         "setup_id": str(setup_id or "unknown"),
+        "can_place_live_orders": False,
         "can_open_paper": not errors,
         "reason": "ok" if not errors else ";".join(errors),
         "errors": errors,
@@ -196,9 +267,13 @@ def evaluate_paper_order(
         "leverage": dec_str(leverage, "0.01"),
         "notional": dec_str(notional),
         "qty": dec_str(qty),
+        "fee_to_close_reserve": dec_str(abs(notional) * DEFAULT_TAKER_FEE_RATE),
         "estimated_loss": dec_str(estimated_loss),
         "max_loss": dec_str(max_loss),
         "risk_distance": dec_str(risk_distance),
+        "instrument_snapshot_id": inst.get("instrument_snapshot_id"),
+        "canonical_instrument_id": inst.get("canonical_instrument_id"),
+        "price_basis": inst.get("price_basis_contract") or {"fills": "BOOK_MID/LAST+slippage"},
     }
     contract = validate_contract("risk_decision", payload)
     if not contract.ok:
@@ -232,7 +307,7 @@ def open_paper_position(risk_decision: dict[str, Any], account: dict[str, Any] |
     margin = dec(risk_decision.get("margin"))
     entry_fee_dec = dec(entry_fee)
     cash = dec(account.get("cash"), "100")
-    if margin <= 0 or margin > cash:
+    if margin <= 0 or margin + entry_fee_dec > cash:
         return {"ok": False, "reason": "insufficient_paper_cash", "account": account, "can_place_live_orders": False}
     position_id = "paper_pos_" + hashlib.sha256(f"{risk_decision.get('risk_decision_id')}:{utc_now()}".encode("utf-8")).hexdigest()[:20]
     position = {
@@ -251,18 +326,31 @@ def open_paper_position(risk_decision: dict[str, Any], account: dict[str, Any] |
         "leverage": risk_decision.get("leverage"),
         "notional": risk_decision.get("notional"),
         "entry_fee": dec_str(entry_fee_dec),
+        "entry_fee_paid_at_open": True,
+        "fee_to_close_reserve": risk_decision.get("fee_to_close_reserve") or dec_str(dec(risk_decision.get("notional")) * DEFAULT_TAKER_FEE_RATE),
+        "liquidation_price": dec_str(estimate_liquidation_price(dec(risk_decision.get("entry")), str(risk_decision.get("side") or ""), dec(risk_decision.get("leverage"), "1"))),
+        "maintenance_margin_rate": dec_str(MAINTENANCE_MARGIN_RATE),
+        "execution_assumptions": {
+            "venue": "binance_usdm_paper",
+            "fee_model": "maker_taker_v1",
+            "entry_fee_paid_at_open": True,
+            "fee_to_close_reserved": True,
+            "liquidation_model": "isolated_maintenance_margin_v1",
+            "live_execution": False,
+        },
         "risk_decision_id": risk_decision.get("risk_decision_id"),
         "can_place_live_orders": False,
     }
     positions = [row for row in account.get("open_positions", []) if isinstance(row, dict)]
     updated = {
         **account,
-        "cash": dec_str(cash - margin),
+        "cash": dec_str(cash - margin - entry_fee_dec),
+        "fees_paid": dec_str(dec(account.get("fees_paid")) + entry_fee_dec),
         "open_margin": dec_str(dec(account.get("open_margin")) + margin),
         "open_positions": positions + [position],
         "updated_at": utc_now(),
     }
-    save_account(updated, path)
+    updated = save_account(updated, path)
     append_jsonl(POSITION_HISTORY_PATH, {"event": "paper_position_open", **position})
     return {"ok": True, "position": position, "account": updated, "can_place_live_orders": False}
 
@@ -280,13 +368,16 @@ def close_paper_position(position_id: str, exit_price: Any, fee: Any = "0", reas
     entry_fee_dec = dec(position.get("entry_fee"))
     exit_fee_dec = dec(fee)
     funding_dec = dec(funding_payment)
+    entry_fee_paid_at_open = bool(position.get("entry_fee_paid_at_open"))
     total_fee_dec = entry_fee_dec + exit_fee_dec
     gross = (exit_dec - entry) * qty if side == "LONG" else (entry - exit_dec) * qty
     net_before_funding = gross - total_fee_dec
     net = net_before_funding + funding_dec
     remaining = [row for row in positions if row.get("position_id") != position_id]
-    equity = dec(account.get("equity"), "100") + net
-    cash = dec(account.get("cash"), str(equity)) + margin + net
+    cash_delta = margin + gross - exit_fee_dec + funding_dec
+    if not entry_fee_paid_at_open:
+        cash_delta -= entry_fee_dec
+    cash = dec(account.get("cash"), "100") + cash_delta
     now = utc_now()
     closed_trades = int(account.get("closed_trades") or account.get("trades") or 0) + 1
     wins = int(account.get("wins") or 0) + (1 if net > 0 else 0)
@@ -307,23 +398,28 @@ def close_paper_position(position_id: str, exit_price: Any, fee: Any = "0", reas
         "net_before_funding": dec_str(net_before_funding),
         "net": dec_str(net),
         "reason": reason,
+        "execution_assumptions": {
+            **(position.get("execution_assumptions") if isinstance(position.get("execution_assumptions"), dict) else {}),
+            "entry_fee_paid_at_open": entry_fee_paid_at_open,
+            "exit_fee_paid_on_close": True,
+            "funding_applied_on_close": funding_dec != 0,
+        },
     }
     updated = {
         **account,
-        "equity": dec_str(equity),
         "cash": dec_str(cash),
         "realized_pnl": dec_str(dec(account.get("realized_pnl")) + net),
-        "fees_paid": dec_str(dec(account.get("fees_paid")) + total_fee_dec),
+        "fees_paid": dec_str(dec(account.get("fees_paid")) + (exit_fee_dec if entry_fee_paid_at_open else total_fee_dec)),
         "closed_trades": closed_trades,
         "trades": closed_trades,
         "wins": wins,
         "losses": losses,
         "trial_days": trial_days,
-        "open_margin": dec_str(max(Decimal("0"), dec(account.get("open_margin")) - margin)),
+        "open_margin": dec_str(sum(dec(row.get("margin")) for row in remaining)),
         "open_positions": remaining,
         "updated_at": now,
     }
-    save_account(updated, path)
+    updated = save_account(updated, path)
     append_jsonl(POSITION_HISTORY_PATH, {"event": "paper_position_close", **closed})
     return {"ok": True, "position": closed, "account": updated, "can_place_live_orders": False}
 
