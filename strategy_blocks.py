@@ -64,27 +64,26 @@ def regime_atr_percentile(df: pd.DataFrame, low_pct: float = 0.0, high_pct: floa
 # ---------------------------------------------------------------------------
 
 def _swing_high(df: pd.DataFrame, left: int, right: int) -> pd.Series:
-    """A confirmed swing high is known only `right` bars AFTER it forms. We shift
-    the confirmation forward so the flag is set on the bar where it becomes
-    KNOWN (no lookahead)."""
+    """A confirmed swing high is known only `right` bars AFTER it forms; the flag
+    is set on the confirmation bar j=i+right (no lookahead). Strict definition:
+    high[i] is STRICTLY greater than every other bar in [i-left, i+right] (so
+    plateaus are excluded and the max is unique). Vectorized at j: h[i]=shift(right);
+    right side = max[i+1,i+right]; left side = max[i-left,i-1]. All indices <= j."""
     h = df["high"]
-    is_piv = pd.Series(False, index=df.index)
-    for i in range(left, len(df) - right):
-        window = h.iloc[i - left:i + right + 1]
-        if h.iloc[i] == window.max() and (window == h.iloc[i]).sum() == 1:
-            # known only at bar i+right (after right confirming bars close)
-            is_piv.iloc[i + right] = True
-    return is_piv
+    hi = h.shift(right)                                        # high at i (=j-right)
+    right_max = h.rolling(right, min_periods=right).max() if right >= 1 else pd.Series(float("-inf"), index=h.index)
+    left_max = h.shift(right + 1).rolling(left, min_periods=left).max() if left >= 1 else pd.Series(float("-inf"), index=h.index)
+    flag = (hi > right_max) & (hi > left_max)
+    return flag.fillna(False)
 
 
 def _swing_low(df: pd.DataFrame, left: int, right: int) -> pd.Series:
     l = df["low"]
-    is_piv = pd.Series(False, index=df.index)
-    for i in range(left, len(df) - right):
-        window = l.iloc[i - left:i + right + 1]
-        if l.iloc[i] == window.min() and (window == l.iloc[i]).sum() == 1:
-            is_piv.iloc[i + right] = True
-    return is_piv
+    lo = l.shift(right)
+    right_min = l.rolling(right, min_periods=right).min() if right >= 1 else pd.Series(float("inf"), index=l.index)
+    left_min = l.shift(right + 1).rolling(left, min_periods=left).min() if left >= 1 else pd.Series(float("inf"), index=l.index)
+    flag = (lo < right_min) & (lo < left_min)
+    return flag.fillna(False)
 
 
 def structure_break(df: pd.DataFrame, direction: str, left: int = 2, right: int = 2) -> pd.Series:
