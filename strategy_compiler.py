@@ -78,6 +78,14 @@ def _combined_mask(df: pd.DataFrame, direction: str, entry: dict[str, Any],
     return mask.fillna(False).astype(bool)
 
 
+def compute_mask(spec: dict[str, Any], df: pd.DataFrame, df_1h: pd.DataFrame | None) -> pd.Series:
+    """Full vectorized entry mask for a spec over a df (for the fast sweep path)."""
+    errors = validate_spec(spec)
+    if errors:
+        raise ValueError(f"invalid spec: {errors}")
+    return _combined_mask(df, spec["direction"], spec["entry"], df_htf=df_1h)
+
+
 def compile_spec(spec: dict[str, Any]) -> Callable[[pd.DataFrame, int, pd.DataFrame], dict[str, Any] | None]:
     """Return a signal_fn(df, i, df_1h) -> sig|None for the backtest engine.
 

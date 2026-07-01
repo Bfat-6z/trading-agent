@@ -49,18 +49,34 @@ def build_specs(spec_factory: Callable[[dict[str, Any]], dict[str, Any]],
     return specs
 
 
+def precompute_indicator_dfs(datasets: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Compute indicator DataFrames ONCE per symbol (entry + HTF), reused across
+    every spec in the sweep. This avoids recomputing indicators 128x per symbol."""
+    pre: dict[str, dict[str, Any]] = {}
+    for sym, d in datasets.items():
+        pre[sym] = {
+            "df": cs.compute_indicators(d["bars_5m"]),
+            "df_1h": cs.compute_indicators(d["bars_1h"]),
+            "quote_volume_24h": d["quote_volume_24h"],
+        }
+    return pre
+
+
 def backtest_spec_in_sample(spec: dict[str, Any], datasets: dict[str, dict[str, Any]],
-                            split_ts_ms: int, exit_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+                            split_ts_ms: int, exit_cfg: dict[str, Any] | None = None,
+                            precomputed: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Run one spec over the universe, IN-SAMPLE ONLY (bars closing before split).
-    Returns pooled metrics + per-symbol trade counts. Holdout untouched."""
-    signal_fn = sc.compile_spec(spec)
+    Uses the fast mask path (precomputed indicator dfs + sparse signal iteration).
+    Holdout untouched."""
     cfg = exit_cfg if exit_cfg is not None else spec.get("exit")
+    pre = precomputed if precomputed is not None else precompute_indicator_dfs(datasets)
     all_trades: list[dict[str, Any]] = []
     per_symbol: dict[str, int] = {}
-    for sym, d in datasets.items():
-        trades = cs.backtest_symbol(
-            d["bars_5m"], d["bars_1h"], d["quote_volume_24h"],
-            end_ts_ms=split_ts_ms, signal_fn=signal_fn, exit_cfg=cfg,
+    for sym, p in pre.items():
+        mask = sc.compute_mask(spec, p["df"], p["df_1h"])
+        trades = cs.backtest_with_mask(
+            p["df"], p["quote_volume_24h"], mask, spec["direction"],
+            end_ts_ms=split_ts_ms, exit_cfg=cfg,
         )
         for t in trades:
             t["symbol"] = sym
@@ -84,9 +100,10 @@ def run_sweep(spec_factory: Callable[[dict[str, Any]], dict[str, Any]],
     """Enumerate + backtest every spec IN-SAMPLE. Returns all results + honest
     N-trial count. Writes a compact log (no holdout access)."""
     specs = build_specs(spec_factory, param_grid)
+    precomputed = precompute_indicator_dfs(datasets)   # once, reused across all specs
     results = []
     for spec in specs:
-        res = backtest_spec_in_sample(spec, datasets, split_ts_ms)
+        res = backtest_spec_in_sample(spec, datasets, split_ts_ms, precomputed=precomputed)
         results.append(res)
     n_trials = len(results)
     out = {

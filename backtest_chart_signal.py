@@ -269,3 +269,44 @@ def backtest_symbol(bars_5m: list[dict[str, Any]], bars_1h: list[dict[str, Any]]
                 continue
         i += 1
     return trades
+
+
+def backtest_with_mask(df: pd.DataFrame, quote_volume_24h: float, mask, direction: str,
+                       *, start_ts_ms: int | None = None, end_ts_ms: int | None = None,
+                       exit_cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Fast sweep path: df + df_1h indicators are precomputed once; the entry mask
+    is precomputed (vectorized). We iterate ONLY the signal bars (sparse) instead
+    of every bar, so a spec backtest is ~O(#signals) not O(#bars). Same trade
+    semantics, embargo, and no-overlap rule as backtest_symbol."""
+    import numpy as np
+    trades: list[dict[str, Any]] = []
+    ts = df["ts_ms"].to_numpy()
+    ts_to_idx = {int(t): k for k, t in enumerate(ts.tolist())}
+    warmup = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 1
+    sig_idx = np.where(np.asarray(mask, dtype=bool))[0]
+    atr_col = df["atr"].to_numpy()
+    close_col = df["close"].to_numpy()
+    close_time_col = df["close_time"].to_numpy()
+    last_exit_idx = -1
+    for i in sig_idx:
+        i = int(i)
+        if i < warmup or i + 1 >= len(df) or i <= last_exit_idx:
+            continue
+        t = int(ts[i])
+        if start_ts_ms is not None and t < start_ts_ms:
+            continue
+        if end_ts_ms is not None and t >= end_ts_ms:
+            break
+        atr_v = atr_col[i]
+        if atr_v is None or atr_v != atr_v or float(atr_v) <= 0:  # nan/zero guard
+            continue
+        sig = {"side": direction, "index": i + 1, "feature_ts": close_time_col[i],
+               "atr": float(atr_v), "ref_close": float(close_col[i])}
+        tr = simulate_trade(df, sig, quote_volume_24h, exit_cfg)
+        if tr:
+            if end_ts_ms is not None and int(tr["exit_ts"]) >= int(end_ts_ms):
+                break  # embargo: no in-sample trade may cross the split
+            trades.append(tr)
+            exit_idx = ts_to_idx.get(int(tr["exit_ts"]), i + 1)
+            last_exit_idx = max(i, exit_idx)
+    return trades
