@@ -785,10 +785,12 @@ class ScalpAutoTrader:
     def open_paper(self, signal: Signal) -> None:
         bias = self.memory_bias()
         critic = evaluate_signal(asdict(signal), bias=self.critic_bias_for_paper_sample(bias))
+        # inner_critic is DIAGNOSTIC-ONLY: it is an AI judging AI output (echo
+        # chamber), so it must NOT veto trades or shape the paper trade population
+        # used for edge evaluation. Record its verdict as advisory context only.
         if critic.get("verdict") == "block":
-            self.log("inner_critic_block", {"signal": asdict(signal), "critic": critic})
-            self.log_shadow_trade(signal, "inner_critic_block", critic=critic)
-            return
+            self.log("inner_critic_advisory_block", {"signal": asdict(signal), "critic": critic,
+                                                     "note": "advisory_only_not_enforced"})
         plan = self.order_plan(signal)
         entry = Decimal(str(signal.price))
         _, step = self.symbol_filters(signal.symbol)

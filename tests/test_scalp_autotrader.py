@@ -270,10 +270,14 @@ def test_reset_paper_account_only_writes_100_and_logs(tmp_path: Path):
     log_text = (tmp_path / "scalp_autotrader.jsonl").read_text(encoding="utf-8")
     assert "paper_account_reset" in log_text
 
-def test_open_paper_respects_inner_critic_block(tmp_path: Path, monkeypatch):
+def test_open_paper_inner_critic_is_advisory_only(tmp_path: Path, monkeypatch):
+    # inner_critic is diagnostic-only: a "block" verdict must NOT veto the paper
+    # trade (that would shape the edge-eval trade population). It logs advisory and
+    # the trade proceeds.
     bot = _planner_bot(tmp_path)
     events = []
     bot.log = lambda event, payload: events.append((event, payload))
+    bot.symbol_filters = lambda symbol: (Decimal("0.01"), Decimal("0.001"))
     monkeypatch.setattr(
         "scalp_autotrader.evaluate_signal",
         lambda signal, bias=None: {"verdict": "block", "reasons": ["test_block"], "can_loosen": False},
@@ -281,9 +285,9 @@ def test_open_paper_respects_inner_critic_block(tmp_path: Path, monkeypatch):
 
     bot.open_paper(_strong_signal())
 
-    assert bot.paper_position is None
-    assert events[0][0] == "inner_critic_block"
-    assert events[0][1]["critic"]["reasons"] == ["test_block"]
+    # advisory event logged, but the diagnostic critic did NOT veto the trade
+    assert any(e[0] == "inner_critic_advisory_block" for e in events)
+    assert bot.paper_position is not None
 
 def test_open_paper_bypasses_inner_critic_memory_sleep_for_sample_collection(tmp_path: Path, monkeypatch):
     bot = _planner_bot(tmp_path)

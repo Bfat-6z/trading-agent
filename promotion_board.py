@@ -27,7 +27,9 @@ REQUIREMENTS = {
     "paper_trades": 300,
     "shadow_closes": 1000,
     "lifecycle_completeness": 0.99,
-    "daily_exam_avg": 80,
+    # daily_exam_avg removed as a HARD GATE: it is an AI self-exam (diagnostic
+    # only, echo-chamber signal). Per the meta-loop mandate, diagnostics must not
+    # gate promotion. Real promotion evidence = holdout + DSR, not self-scoring.
     "trial_days": 14,
 }
 
@@ -181,8 +183,8 @@ def evaluate_promotion(metrics: dict[str, Any], output_path: Path = PROMOTION_LA
         failures.append("insufficient_shadow_closes")
     if float(metrics.get("lifecycle_completeness") or 0.0) < REQUIREMENTS["lifecycle_completeness"]:
         failures.append("lifecycle_completeness_below_99pct")
-    if float(metrics.get("daily_exam_avg") or 0.0) < REQUIREMENTS["daily_exam_avg"]:
-        failures.append("daily_exam_below_threshold")
+    # daily_exam is DIAGNOSTIC-ONLY and must NOT block promotion (removed from the
+    # hard gate). It may still be reported as advisory context, never a failure.
     if int(metrics.get("trial_days") or 0) < REQUIREMENTS["trial_days"]:
         failures.append("trial_too_short")
     if metrics.get("critical_dont_do_violation"):
