@@ -39,6 +39,15 @@ def seed_candles(
     monkeypatch.setattr(ccs, "CHART_CANDLE_DIR", tmp_path / "chart" / "candles")
     cutoff = parse_utc(cutoff_ts)
     assert cutoff is not None, f"invalid cutoff_ts: {cutoff_ts}"
+    # Freeze the source-registry clock to just after the cutoff so the seeded
+    # candle cache isn't flagged source_stale by real wall-clock (these tests use
+    # fixed historical timestamps; without this they rot as time passes).
+    try:
+        import data_source_registry as _dsr
+        frozen_now = (cutoff + timedelta(seconds=120)).isoformat(timespec="seconds")
+        monkeypatch.setattr(_dsr, "utc_now", lambda: frozen_now)
+    except Exception:
+        pass
     step = ccs.TIMEFRAME_SECONDS.get(timeframe, 300)
     ingested_stamp = (cutoff + timedelta(seconds=3600)).isoformat(timespec="seconds") if ingested_after_cutoff else None
 

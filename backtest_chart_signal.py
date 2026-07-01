@@ -238,6 +238,12 @@ def backtest_symbol(bars_5m: list[dict[str, Any]], bars_1h: list[dict[str, Any]]
         if sig:
             tr = simulate_trade(df, sig, quote_volume_24h)
             if tr:
+                # EMBARGO: an in-sample trade (end_ts_ms set) must fully CLOSE
+                # before the split, otherwise its exit scan consumes holdout-window
+                # price data and biases in-sample expectancy (a sweep would select
+                # on that leak). Drop trades that exit at/after the split boundary.
+                if end_ts_ms is not None and int(tr["exit_ts"]) >= int(end_ts_ms):
+                    break  # this and all later signals would also cross the seam
                 trades.append(tr)
                 # no overlapping trade on the same symbol: resume after the exit bar
                 exit_idx = ts_to_idx.get(int(tr["exit_ts"]), i + 1)
