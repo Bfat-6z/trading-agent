@@ -124,3 +124,30 @@ breakout + efficiency regime), unlike the uniformly-negative dead families — a
 faint lead, NOT an edge (+0.086R at n=63 is weak and DSR-failing). Worth ONE
 focused follow-up around donchian_committed + kaufman with more sample to test
 real-vs-noise. Still KILL; loop continues (dry 1/3).
+
+## NEW-MECHANISM family — round B FOCUSED (stamped 2026-07-02T03:00Z) — KILL, lead PERSISTS
+
+Test whether round-A's lead was real or noise: focus on donchian_breakout_committed
+(4 lookbacks) x kaufman gate (2 thresholds) x volume filter, wide stops, 1h/4h.
+192 specs, 384 tested, **global cumulative trial count 4000**. Both cells KILL
+(meta_1h best +0.25R/391 — selection-biased; 4h +0.01R/185). Dry streak 2/3.
+
+**The lead did NOT collapse under more sample (this is the key finding):**
+| component | round A | round B (more sample) |
+|---|---|---|
+| donchian_breakout_committed | +0.086R (n=63) | **+0.092R (n=233)** |
+| kaufman_efficiency_regime | +0.060R (n=57) | **+0.116R (n=144)** |
+| volume_min_ratio | +0.028R (n=66) | **+0.102R (n=116)** |
+
+A pure-noise component would regress toward 0 (or flip) with 3-4x more sample; these
+HELD or improved. So committed-breakout + efficiency-regime + volume + WIDE stops is
+a **persistent faint positive lean (~+0.09-0.12R/component)** — the first in the
+whole program. STILL KILL by the strict criterion: the cumulative-DSR bar (4000
+trials) + cross-consistency are not cleared; +0.25R best-cell is selection bias.
+
+Honest implication: after ~4000 trials the in-sample DSR bar is saturated — even a
+genuine faint edge cannot "win" by more backtesting (grinding only raises the bar
+and risks overfit). The correct way to validate a persistent-but-faint lead is
+FORWARD-PAPER (real out-of-sample time), NOT more in-sample search. Candidate
+direction: donchian-committed-breakout + kaufman-efficiency + volume, wide stops,
+1h. NOT confirmed edge; NOT live money.

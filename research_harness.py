@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "plans" / "260701-0200-claude-takeover-edge-first" / "reports"
 
 # HTF pairing for each entry timeframe (bias timeframe)
-HTF_FOR = {"5m": "1h", "15m": "1h", "1h": "4h", "4h": "1d"}
+HTF_FOR = {"5m": "1h", "15m": "1h", "1h": "4h", "4h": "1d", "1d": "1w"}
 
 
 def fetch_datasets(client: Any, symbols: list[str], entry_tf: str, htf_tf: str,
