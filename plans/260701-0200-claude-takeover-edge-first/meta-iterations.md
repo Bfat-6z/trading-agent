@@ -44,3 +44,37 @@ meta-loop now quantifies WHICH components are least-bad, but none pass.
 
 Paper-only; live_guard intact; ALLOW_LIVE_ORDERS never set. 1 pass would be a
 CANDIDATE (forward-paper required) — none passed.
+
+## Iteration 2 (stamped 2026-07-01T18:00Z) — KILL (evolved from iter-1 learnings)
+
+Layer 3 -> Layer 2 feedback: `evolve_pools_from_stats` pruned proven-bad
+components BY NUMBER (drop_below -0.15):
+- **Dropped:** sweep_reversal (-0.259), funding_zscore_fade, cvd_reversal (flow
+  filters), AND the EMA-location trigger (see caveat).
+- **Kept triggers:** ts_momentum, bb_reversion, breakout_retest.
+- **Kept filters:** none, volume_min_ratio (a NON-flow confirmation).
+- **Kept gates:** none, regime_adx_min, trend_ema_stack.
+
+Result: 96 specs, 0 guarded-out, **192 tested**. **Global cumulative trial count
+2704.** Both cells KILL: meta_1h best +0.080R over **800 trades**; meta_4h +0.057R
+over 326 — neither DSR-significant after the 2704-trial correction. Holdout never
+peeked. **Dry streak 2/3** (one more dry -> auto-STOP).
+
+### Honest caveat (evolve heuristic limitation)
+The owner asked to explore around `location_reject_ema_from_below` (+0.05R, iter-1
+least-bad). The auto-evolve DROPPED the EMA-location trigger because it is
+direction-specific — SHORT=reject (+0.05) but LONG=reclaim (-0.204) — and the
+"all directions must pass" rule killed the whole trigger on the bad LONG mirror.
+So location_reject-SHORT was not re-tested this round. This is a real heuristic
+gap (a good one-direction trigger shouldn't be dropped for its bad mirror).
+HOWEVER: +0.05R at n=18 is economically marginal and cannot clear a 2704-trial
+DSR bar regardless, so this is not a missed edge — just an incomplete exploration.
+Fix (direction-aware evolve) noted for future; NOT chased now (KILL criterion:
+don't grind sub-iterations).
+
+### Cumulative picture (2 iterations + prior families)
+Trend (ts_momentum), mean-reversion (bb/vwap), breakout-retest, volume/ADX/trend
+gates — all KILL with adequate sample after removing the proven-bad components.
+Consistent with the family verdict: public TA + order-flow = no edge. One more dry
+iteration triggers auto-STOP -> propose a new source/angle (or lean on the
+forward-test order-book channel), not more combos.
