@@ -1,6 +1,38 @@
 # Phase 3 Design — Chart-based edge, prove-or-kill
 
-Status: DRAFT for owner approval. Direction (owner): edge must come from CHART TA —
+## RESULT (2026-07-01): KILL — with a decisive, reusable finding
+
+Ran the setup on 9 symbols × 9 months of real 5m+1h candles (77,759 bars each,
+0 gaps), Phase-2 pessimistic costs, sealed 3-month holdout:
+
+| | in-sample (6mo) | holdout (3mo, sealed) |
+|---|---|---|
+| trades | 790 | 353 |
+| win rate | 25.7% | 26.9% |
+| expectancy | **−0.83R** | **−0.87R** (lo95 −1.08) |
+| profit factor | 0.32 | 0.30 |
+| t-stat | −15.8 | −11.0 |
+| positive symbols | 0/9 | 0/9 |
+
+Consistent train↔holdout, 0/9 symbols positive, t≈−11 → this setup has NO edge;
+it loses systematically. KILL, accepted without parameter fishing.
+
+**WHY it loses (the reusable lesson):** even on BTC (cheapest tier), SL avg
+−1.75R not −1R. Root cause: SL = 1.5×ATR on 5m is only ~0.23% wide, so a 10bps
+round-trip taker fee = **~44% of the risk (0.44R) per trade** before slippage.
+A 5m scalp with ATR-tight stops CANNOT overcome fees. This is structural, not a
+bug (fees verified at exactly 10bps).
+
+**Implication for the next attempt:** to beat fees the edge must have a much
+larger reward-per-trade relative to costs → either (a) HIGHER TIMEFRAME (1h/4h)
+so ATR stops are wide enough that 10bps fee is a small fraction of risk, and/or
+(b) MAKER/limit entries to cut fees, and/or (c) far fewer, higher-conviction
+trades. This directly informs the next candidate (owner wants chart methods
+from TV pros — SMC/order-block on higher TF fits this constraint).
+
+---
+
+Original design below. Direction (owner): edge must come from CHART TA —
 candlesticks + moving averages + volume. Built from workflow map+research+design+redteam
 (wf_6545f53e-5ba). Red-team found 5 serious "backtest will lie" flaws — all folded in below.
 
