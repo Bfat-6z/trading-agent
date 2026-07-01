@@ -78,3 +78,19 @@ gates — all KILL with adequate sample after removing the proven-bad components
 Consistent with the family verdict: public TA + order-flow = no edge. One more dry
 iteration triggers auto-STOP -> propose a new source/angle (or lean on the
 forward-test order-book channel), not more combos.
+
+## Iteration 3 (stamped 2026-07-01T19:00Z) — KILL -> AUTO-STOP (dry 3/3)
+
+Fresh exploration of NEW parameterizations of the surviving components (longer
+momentum lookbacks 30/60, wider BB 30/2.5, looser breakout 40/0.5, milder ADX,
+strong-volume filter) — genuinely new spec_ids, not re-tests. 96 specs, 0
+guarded-out, 192 tested. **Global cumulative trial count 2896.** Both cells KILL:
+meta_1h best +0.124R over 811 trades; meta_4h +0.120R over 395 — the highest
+in-sample expectancy seen, still NOT DSR-significant after the 2896-trial
+correction. Holdout never peeked.
+
+**Dry streak 3/3 -> AUTO-STOP fired.** The system declared the family exhausted by
+the PRE-SET KILL criterion — a disciplined, criterion-driven close, not giving up.
+
+See research-findings.md for the OFFICIAL family-level verdict + the two remaining
+(not-yet-run) angles.

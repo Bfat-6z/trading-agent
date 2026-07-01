@@ -89,3 +89,47 @@ bot a tradeable edge on liquid perpetuals.** This is proven, not assumed.
   refuse.
 
 Everything stays paper-only; live_guard intact; ALLOW_LIVE_ORDERS never set.
+
+---
+
+## OFFICIAL CLOSE — meta-loop auto-STOP (2026-07-01)
+
+The meta-learning loop (self-generate multi-factor specs -> no-lookahead guard ->
+sweep -> DSR gate with GLOBAL cumulative trials -> holdout peek-once -> learn from
+ledger -> repeat) ran **3 iterations** and hit its pre-set KILL criterion
+(**3 consecutive dry rounds -> AUTO-STOP**). Each round the loop pruned the
+proven-bad components by number (dropped sweep_reversal, all order-flow filters)
+and explored new parameterizations of the survivors (trend/reversion/breakout +
+volume/ADX/EMA gates).
+
+**Cumulative evidence at close:** ~**2896 config-trials** across **8+ hypothesis
+families/variants** and **>12,000 evaluated trades**; best in-sample expectancy
+anywhere with adequate sample ≈ **+0.12R** (811 trades, iter-3 1h) — still **not
+DSR-significant** after the 2896-trial multiple-testing correction. The **sealed
+holdout was NEVER peeked** — nothing ever cleared the in-sample gate, so it remains
+intact for a genuinely new edge.
+
+**OFFICIAL VERDICT (criterion-driven, not surrender): public technical + public
+order-flow signals on liquid perpetuals give this bot NO tradeable edge.** Proven
+by a disciplined, pre-registered process — cumulative DSR penalty that never reset,
+sealed holdout never burned, every self-generated spec lookahead-guarded, all
+diagnostics de-wired from the decision. Grinding more combos on this family would
+only manufacture overfit, which the gate refuses.
+
+### The two remaining angles (NOT yet run — each a new decision, awaiting owner)
+1. **Forward-test order-book / liquidation / whale flow** — the ONLY edge source
+   never ruled out, because its data has NO public history (can't be backtested).
+   Already accruing under the supervisor (`forward_test_harness`, auto-restart);
+   needs weeks of wall-clock + MIN_SAMPLE=200 labels before any read-out. Higher
+   risk; never jump to live from lack of history.
+2. **Tier-1 setups with EXTERNAL evidence** (a NEW research family, distinct from
+   the dead public-TA family): BTC-regime-gated alt-momentum (memo Sharpe ~1.31 —
+   needs a CROSS-SECTIONAL/rebalance engine the current per-symbol harness lacks),
+   funding z-fade + carry (carry accounting), HTF TSMOM, basis/funding carry
+   (delta-neutral). These carry outside evidence, so they are worth a fresh
+   prove-or-kill — but they need engine extensions (cross-sectional ranking,
+   carry P&L) and are a separate decision, not a continuation of this family.
+
+Paper-only; live_guard intact; ALLOW_LIVE_ORDERS never set. A future edge, if one
+ever clears the sealed holdout, is a CANDIDATE requiring forward-paper before any
+real money — not an automatic green light.
