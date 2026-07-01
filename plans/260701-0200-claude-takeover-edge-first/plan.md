@@ -151,9 +151,40 @@ client chokepoint** — blocks the typed wrappers AND the ~100 manual scripts
 audit passed after fixing the manual-script bypass it found. Live trading remains
 disabled.
 
-## 10. First action (Phase 1)
+## 10. Phase 1 result (2026-07-01)
 
-Wire real point-in-time closed OHLCV (via existing `chart_candle_service.py`)
-into feature computation and the replay/exit buffer — replacing the synthetic
-3-candle proxy and mark-only exit snapshots. This is the unlock for honest
-features + intrabar exits + backtestability.
+DONE (3 pieces, adversarially audited, live disabled throughout):
+- **A. Ingestor** (`chart_candle_ingestor.py`): fetches+stores real Binance 5m
+  klines for the symbols about to be scored; bounded, fail-closed.
+- **B. Feature path** (`paper_candidate_feeder.py`): decision features now come
+  from real closed 5m OHLCV via `load_closed_candles` at the snapshot cutoff.
+  Missing data -> skip (reject-not-fake). Synthetic proxy has no non-test caller.
+- **C. Exit path** (`paper_execution_lifecycle_loop.py`): `should_close` resolves
+  SL/TP against real intrabar OHLC (fixes the ~54% blind-timeout problem);
+  fail-open to the mark candle; 30-min timeout retained as safety net.
+
+Audit (Phase 1.7) found and this session FIXED:
+- **M1 (MAJOR):** `build_cutoff_proof` gated on `ingested_at` (operational
+  write-time ~now) which starved the decision path against an older cutoff;
+  green tests hid it. Fixed in both copies — lookahead is now defined only by
+  data-existence timestamps (available_at/known_at/finalized_at). Regression
+  test added with `ingested_after_cutoff=True`.
+- **m5 (MINOR):** exit bars now require `open_time >= opened_at` so a bar
+  spanning entry can't fire on a pre-entry wick.
+- No lookahead leak confirmed. Full suite 827 passed.
+
+DEFERRED (tracked, not blocking):
+- **M2:** inline ingest does blocking network on the feeder hot path (bounded,
+  fail-closed, but no timeout; a test does real I/O unless
+  `INGEST_DECISION_CANDLES=0`). Move to a supervised ingest loop in **Phase 5**.
+- **m4/m6/m7:** stamp exit records with real-vs-mark source; `chart_candle_cache`
+  provider="local" isn't recency-flagged; close_ts uses mark ts. Address when
+  hardening execution realism (**Phase 2**).
+
+## 11. Next: Phase 2 — honest cost & exit model
+
+Intrabar SL/TP/liq against real OHLC (done in Piece C for touch detection; now
+add) explicit bid/ask half-spread, depth/volatility-scaled slippage with a
+microcap floor >> 2bps, taker-both-legs unless a realistic maker-fill model
+exists, tiered Binance MMR for liquidation. Expect edge to look WORSE — correct.
+Also fold in m4/m6/m7 exit-honesty stamping here.
