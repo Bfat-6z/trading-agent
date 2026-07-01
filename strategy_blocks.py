@@ -149,6 +149,84 @@ def location_reclaim_ema_from_above(df: pd.DataFrame, ema_col: str = "ema_fast")
 
 
 # ---------------------------------------------------------------------------
+# LIQUIDITY SWEEP REVERSAL (SMC/ICT concepts forced into numeric, no-lookahead
+# rules). Every threshold is explicit. Anything only definable "in hindsight" is
+# excluded. Hypothesis: price sweeps a liquidity level then reverses.
+# ---------------------------------------------------------------------------
+
+def sweep_reversal(df: pd.DataFrame, direction: str, swing_lookback: int = 20,
+                   reverse_within: int = 3) -> pd.Series:
+    """Numeric sweep: within the last `reverse_within` bars, the HIGH exceeded the
+    prior swing high (recent max over `swing_lookback`) then the CURRENT bar
+    closes back BELOW that level (bearish sweep -> SHORT); mirror for LONG.
+
+    No-lookahead: the swing level at bar i is the rolling max/min of bars strictly
+    BEFORE the sweep window; the current close is bar i's own close."""
+    # prior swing level: rolling extreme excluding the reverse window
+    shift_n = reverse_within
+    if direction == "SHORT":
+        prior_level = df["high"].shift(shift_n).rolling(swing_lookback, min_periods=5).max()
+        swept = df["high"].rolling(reverse_within, min_periods=1).max() > prior_level
+        reclaimed = df["close"] < prior_level
+        return (swept & reclaimed).fillna(False)
+    prior_level = df["low"].shift(shift_n).rolling(swing_lookback, min_periods=5).min()
+    swept = df["low"].rolling(reverse_within, min_periods=1).min() < prior_level
+    reclaimed = df["close"] > prior_level
+    return (swept & reclaimed).fillna(False)
+
+
+def htf_bias_po3(df: pd.DataFrame, direction: str, df_htf: pd.DataFrame | None = None) -> pd.Series:
+    """PO3 higher-timeframe bias: only allow SHORT when the HTF is in a down bias
+    (HTF EMA fast < slow at the last CLOSED HTF bar), LONG when up bias. Joined
+    point-in-time against df's ts_ms (no in-progress HTF bar).
+
+    If df_htf is None, falls back to df's own ema stack (same-TF bias)."""
+    if df_htf is None or df_htf.empty:
+        up = df["ema_fast"] > df["ema_slow"]
+        return up if direction == "LONG" else ~up
+    htf_ts = df_htf["ts_ms"].to_numpy()
+    htf_up = (df_htf["ema_fast"] > df_htf["ema_slow"]).to_numpy()
+    import numpy as np
+    idx = np.searchsorted(htf_ts, df["ts_ms"].to_numpy(), side="right") - 1
+    out = pd.Series(False, index=df.index)
+    valid = idx >= 0
+    vals = np.where(valid, htf_up[np.clip(idx, 0, len(htf_up) - 1)], False)
+    up_series = pd.Series(vals, index=df.index)
+    return up_series if direction == "LONG" else (~up_series & pd.Series(valid, index=df.index))
+
+
+def structure_shift(df: pd.DataFrame, direction: str, min_atr: float = 0.5,
+                    left: int = 2, right: int = 2) -> pd.Series:
+    """BOS/CHOCH forced to number: current close breaks the most recent confirmed
+    swing (opposite side) by at least `min_atr` * ATR. Backward-only swings."""
+    if direction == "SHORT":
+        piv = _swing_low(df, left, right)
+        level = df["low"].where(piv).ffill()
+        return ((level - df["close"]) >= float(min_atr) * df["atr"]) & level.notna()
+    piv = _swing_high(df, left, right)
+    level = df["high"].where(piv).ffill()
+    return ((df["close"] - level) >= float(min_atr) * df["atr"]) & level.notna()
+
+
+def displacement(df: pd.DataFrame, min_atr: float = 1.0) -> pd.Series:
+    """Confirmation candle with a real range: (high-low) >= min_atr * ATR."""
+    rng = df["high"] - df["low"]
+    return (rng >= float(min_atr) * df["atr"]).fillna(False)
+
+
+def retest_broken_level(df: pd.DataFrame, direction: str, swing_lookback: int = 20,
+                        tol_atr: float = 0.3) -> pd.Series:
+    """Entry proxy for FVG/OB retest: price returns within tol_atr*ATR of the
+    swing level that was just swept/broken (no in-progress HTF candle used)."""
+    if direction == "SHORT":
+        level = df["high"].shift(1).rolling(swing_lookback, min_periods=5).max()
+    else:
+        level = df["low"].shift(1).rolling(swing_lookback, min_periods=5).min()
+    dist = (df["close"] - level).abs() / df["atr"].replace(0, float("nan"))
+    return (dist <= float(tol_atr)).fillna(False)
+
+
+# ---------------------------------------------------------------------------
 # Block registry — name -> (callable, whether it needs `direction`)
 # ---------------------------------------------------------------------------
 
@@ -164,17 +242,28 @@ BLOCKS: dict[str, dict[str, Any]] = {
     "location_not_overextended": {"fn": location_not_overextended, "directional": False},
     "location_reject_ema_from_below": {"fn": location_reject_ema_from_below, "directional": False},
     "location_reclaim_ema_from_above": {"fn": location_reclaim_ema_from_above, "directional": False},
+    # Liquidity-sweep-reversal family (SMC/ICT forced into numeric rules)
+    "sweep_reversal": {"fn": sweep_reversal, "directional": True},
+    "structure_shift": {"fn": structure_shift, "directional": True},
+    "displacement": {"fn": displacement, "directional": False},
+    "retest_broken_level": {"fn": retest_broken_level, "directional": True},
+    # htf_bias_po3 needs the HTF dataframe -> handled specially in evaluate_block
+    "htf_bias_po3": {"fn": htf_bias_po3, "directional": True, "needs_htf": True},
 }
 
 
-def evaluate_block(name: str, df: pd.DataFrame, direction: str, params: dict[str, Any] | None = None) -> pd.Series:
-    """Evaluate a named block. Directional blocks receive `direction`; others get
-    only their params. Returns a boolean Series aligned to df."""
+def evaluate_block(name: str, df: pd.DataFrame, direction: str, params: dict[str, Any] | None = None,
+                   df_htf: pd.DataFrame | None = None) -> pd.Series:
+    """Evaluate a named block. Directional blocks receive `direction`; blocks
+    marked needs_htf also receive the higher-timeframe dataframe (point-in-time
+    joined inside the block). Returns a boolean Series aligned to df."""
     spec = BLOCKS.get(name)
     if spec is None:
         raise KeyError(f"unknown block: {name}")
     params = dict(params or {})
     fn = spec["fn"]
+    if spec.get("needs_htf"):
+        return fn(df, direction, df_htf=df_htf, **params).fillna(False).astype(bool)
     if spec["directional"]:
         return fn(df, direction, **params).fillna(False).astype(bool)
     return fn(df, **params).fillna(False).astype(bool)

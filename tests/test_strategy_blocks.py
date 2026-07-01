@@ -42,6 +42,10 @@ BLOCK_PARAMS = {
     "volume_spike": {"mult": 1.5},
     "location_near_ema": {"max_atr": 1.0},
     "location_not_overextended": {"max_atr": 2.0},
+    "sweep_reversal": {"swing_lookback": 20, "reverse_within": 3},
+    "structure_shift": {"min_atr": 0.5, "left": 2, "right": 2},
+    "displacement": {"min_atr": 1.0},
+    "retest_broken_level": {"swing_lookback": 20, "tol_atr": 0.3},
 }
 
 
@@ -50,13 +54,20 @@ BLOCK_PARAMS = {
 def test_block_is_no_lookahead(name, direction):
     bars = _bars(180)
     df_full = cs.compute_indicators(bars)
+    # HTF dataframe for blocks that need it (point-in-time join must be causal)
+    df_htf_full = cs.compute_indicators(_bars(40, step_s=3600))
     params = BLOCK_PARAMS.get(name)
-    full = sb.evaluate_block(name, df_full, direction, params)
+    full = sb.evaluate_block(name, df_full, direction, params, df_htf=df_htf_full)
 
     # truncate to 0..cut and recompute; the value at `cut` must match `full[cut]`.
     for cut in (120, 150, 170):
         df_trunc = cs.compute_indicators(bars[: cut + 1])
-        trunc = sb.evaluate_block(name, df_trunc, direction, params)
+        # HTF truncated to only bars closed by the cut bar's close time (causal)
+        cut_ts = int(df_full.iloc[cut]["ts_ms"])
+        htf_bars_trunc = [b for b in _bars(40, step_s=3600)
+                          if int(cs.compute_indicators([b]).iloc[0]["ts_ms"]) <= cut_ts]
+        df_htf_trunc = cs.compute_indicators(htf_bars_trunc) if len(htf_bars_trunc) >= 2 else df_htf_full
+        trunc = sb.evaluate_block(name, df_trunc, direction, params, df_htf=df_htf_trunc)
         assert bool(trunc.iloc[cut]) == bool(full.iloc[cut]), (
             f"{name}/{direction} at bar {cut} changed when future bars removed "
             f"-> lookahead leak")

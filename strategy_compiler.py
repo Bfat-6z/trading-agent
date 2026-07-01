@@ -61,17 +61,19 @@ def validate_spec(spec: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _combined_mask(df: pd.DataFrame, direction: str, entry: dict[str, Any]) -> pd.Series:
-    """AND all blocks in 'all', OR all in 'any', then AND the two groups."""
+def _combined_mask(df: pd.DataFrame, direction: str, entry: dict[str, Any],
+                   df_htf: pd.DataFrame | None = None) -> pd.Series:
+    """AND all blocks in 'all', OR all in 'any', then AND the two groups. df_htf
+    (higher timeframe) is passed to blocks that need it (e.g. htf_bias_po3)."""
     mask = pd.Series(True, index=df.index)
     all_blocks = entry.get("all") or []
     for b in all_blocks:
-        mask &= sb.evaluate_block(b["block"], df, direction, b.get("params"))
+        mask &= sb.evaluate_block(b["block"], df, direction, b.get("params"), df_htf=df_htf)
     any_blocks = entry.get("any") or []
     if any_blocks:
         any_mask = pd.Series(False, index=df.index)
         for b in any_blocks:
-            any_mask |= sb.evaluate_block(b["block"], df, direction, b.get("params"))
+            any_mask |= sb.evaluate_block(b["block"], df, direction, b.get("params"), df_htf=df_htf)
         mask &= any_mask
     return mask.fillna(False).astype(bool)
 
@@ -95,7 +97,7 @@ def compile_spec(spec: dict[str, Any]) -> Callable[[pd.DataFrame, int, pd.DataFr
             return None
         mask = getattr(df, cache_attr, None)
         if mask is None:
-            mask = _combined_mask(df, direction, entry)
+            mask = _combined_mask(df, direction, entry, df_htf=df_1h)
             try:
                 object.__setattr__(df, cache_attr, mask)
             except Exception:
