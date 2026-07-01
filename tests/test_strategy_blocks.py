@@ -46,6 +46,9 @@ BLOCK_PARAMS = {
     "structure_shift": {"min_atr": 0.5, "left": 2, "right": 2},
     "displacement": {"min_atr": 1.0},
     "retest_broken_level": {"swing_lookback": 20, "tol_atr": 0.3},
+    "bb_reversion": {"period": 20, "k": 2.0},
+    "vwap_reversion": {"window": 48, "dist_atr": 1.0},
+    "breakout_retest": {"lookback": 20, "tol_atr": 0.3, "break_within": 10},
 }
 
 

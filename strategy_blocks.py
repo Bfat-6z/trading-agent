@@ -226,6 +226,56 @@ def retest_broken_level(df: pd.DataFrame, direction: str, swing_lookback: int = 
 
 
 # ---------------------------------------------------------------------------
+# MEAN-REVERSION / BREAKOUT (direction 2). Numeric, no-lookahead (rolling causal).
+# ---------------------------------------------------------------------------
+
+def bb_reversion(df: pd.DataFrame, direction: str, period: int = 20, k: float = 2.0) -> pd.Series:
+    """Bollinger-band reversion: prior bar closed OUTSIDE the band, current bar
+    closes back INSIDE — a stretched move reverting. LONG on lower band, SHORT on
+    upper. Rolling SMA/std are causal; prior comparison uses shift(1)."""
+    ma = df["close"].rolling(period, min_periods=period).mean()
+    sd = df["close"].rolling(period, min_periods=period).std()
+    lower = ma - float(k) * sd
+    upper = ma + float(k) * sd
+    prev_close = df["close"].shift(1)
+    if direction == "LONG":
+        return ((prev_close < lower.shift(1)) & (df["close"] > lower)).fillna(False)
+    return ((prev_close > upper.shift(1)) & (df["close"] < upper)).fillna(False)
+
+
+def vwap_reversion(df: pd.DataFrame, direction: str, window: int = 48, dist_atr: float = 1.0) -> pd.Series:
+    """Rolling-VWAP reversion: price was >= dist_atr ATRs away from the trailing
+    VWAP on the prior bar, current bar turns back toward it. No-lookahead (rolling
+    VWAP + shift)."""
+    pv = (df["close"] * df["volume"]).rolling(window, min_periods=window).sum()
+    vv = df["volume"].rolling(window, min_periods=window).sum()
+    vwap = pv / vv.replace(0, float("nan"))
+    dist = (df["close"] - vwap) / df["atr"].replace(0, float("nan"))
+    prev_dist = dist.shift(1)
+    if direction == "LONG":
+        return ((prev_dist <= -float(dist_atr)) & (df["close"] > df["open"])).fillna(False)
+    return ((prev_dist >= float(dist_atr)) & (df["close"] < df["open"])).fillna(False)
+
+
+def breakout_retest(df: pd.DataFrame, direction: str, lookback: int = 20,
+                    tol_atr: float = 0.3, break_within: int = 10) -> pd.Series:
+    """Genuine breakout-retest: price BROKE a prior swing level within the last
+    `break_within` bars, then RETESTS it (close within tol_atr*ATR) while holding
+    the breakout side. All windows are trailing (causal)."""
+    if direction == "LONG":
+        level = df["high"].shift(1).rolling(lookback, min_periods=5).max()
+        broke = df["close"].shift(1).rolling(break_within, min_periods=1).max() > level
+        near = ((df["close"] - level).abs() / df["atr"].replace(0, float("nan"))) <= float(tol_atr)
+        hold = df["close"] >= level
+        return (broke & near & hold).fillna(False)
+    level = df["low"].shift(1).rolling(lookback, min_periods=5).min()
+    broke = df["close"].shift(1).rolling(break_within, min_periods=1).min() < level
+    near = ((df["close"] - level).abs() / df["atr"].replace(0, float("nan"))) <= float(tol_atr)
+    hold = df["close"] <= level
+    return (broke & near & hold).fillna(False)
+
+
+# ---------------------------------------------------------------------------
 # ORDER-FLOW (Family A: CVD + funding). These read columns added by
 # orderflow_data (cvd_delta_norm, buy_frac, funding_rate). All are no-lookahead
 # because those columns are themselves causal. If a column is absent (df not
@@ -305,6 +355,10 @@ BLOCKS: dict[str, dict[str, Any]] = {
     "cvd_reversal": {"fn": cvd_reversal, "directional": True},
     "funding_extreme_contrarian": {"fn": funding_extreme_contrarian, "directional": True},
     "buy_frac_extreme": {"fn": buy_frac_extreme, "directional": True},
+    # Mean-reversion / breakout (direction 2)
+    "bb_reversion": {"fn": bb_reversion, "directional": True},
+    "vwap_reversion": {"fn": vwap_reversion, "directional": True},
+    "breakout_retest": {"fn": breakout_retest, "directional": True},
 }
 
 
