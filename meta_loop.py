@@ -87,13 +87,18 @@ def _trig_block(trig: dict[str, Any], direction: str) -> str | None:
 
 def generate_specs(triggers: list[dict[str, Any]] | None = None,
                    gates: list[dict[str, Any]] | None = None,
-                   filters: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+                   filters: list[dict[str, Any]] | None = None,
+                   exit_grid: tuple[tuple[float, float], ...] | None = None,
+                   max_hold_bars: int = 48) -> list[dict[str, Any]]:
     """Layer 2: compose bounded, reasoned multi-factor specs, each with a
     hypothesis + source. Pools default to the module constants but can be supplied
-    (e.g. an EVOLVED config learned from the ledger)."""
+    (e.g. an EVOLVED config learned from the ledger). exit_grid = tuple of
+    (sl_atr, rr); default is the tight (1.5,·) grid, but new-mechanism families can
+    pass WIDE stops (the ledger's fee lesson)."""
     triggers = triggers if triggers is not None else TRIGGERS
     gates = gates if gates is not None else REGIME_GATES
     filters = filters if filters is not None else FILTERS
+    exit_grid = exit_grid if exit_grid is not None else ((1.5, 2.0), (1.5, 3.0))
     specs: list[dict[str, Any]] = []
     for direction in DIRECTIONS:
         for trig in triggers:
@@ -113,13 +118,13 @@ def generate_specs(triggers: list[dict[str, Any]] | None = None,
                         if filt["block"]:
                             blocks.append({"block": filt["block"], "params": filt["params"]})
                         hyp = f"{trig['hyp']} | {gate['hyp']} | {filt['hyp']}"
-                        for sl_atr, rr in ((1.5, 2.0), (1.5, 3.0)):
+                        for sl_atr, rr in exit_grid:
                             spec = {
                                 "name": f"meta_{tblock}_{direction.lower()}",
                                 "direction": direction,
                                 "entry": {"all": blocks},
                                 "exit": {"sl_atr": sl_atr, "tp_atr": sl_atr * rr,
-                                         "min_rr": 1.5, "regime_exit": True, "max_hold_bars": 48},
+                                         "min_rr": 1.5, "regime_exit": True, "max_hold_bars": max_hold_bars},
                                 "source": trig["src"],
                                 "hypothesis": hyp,
                             }
@@ -288,15 +293,21 @@ def run_iteration(client: Any, *, end_ms: int, stamped_at: str, months: float = 
                   timeframes: tuple[str, ...] = ("1h", "4h"), max_symbols: int = 9,
                   triggers: list[dict[str, Any]] | None = None,
                   gates: list[dict[str, Any]] | None = None,
-                  filters: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                  filters: list[dict[str, Any]] | None = None,
+                  exit_grid: tuple[tuple[float, float], ...] | None = None,
+                  new_family: bool = False) -> dict[str, Any]:
     """Layer 4: ONE honest iteration. Returns a report. Optional pools let a caller
-    pass an EVOLVED (ledger-pruned) config for later iterations."""
+    pass an EVOLVED (ledger-pruned) config for later iterations. exit_grid sets the
+    SL/RR grid (wide stops for new-mechanism families). new_family=True resets the
+    dry streak (a genuinely new source/angle, per the post-STOP mandate)."""
+    if new_family:
+        _write_dry_streak(0)
     uni = us.select_universe(client, end_ms=end_ms, months=months, timeframe="1h",
                              min_daily_quote_volume=50_000_000.0, max_symbols=max_symbols)
     symbols = uni["selected"]
     quote_vols = {s: uni["detail"].get(s, 0.0) for s in symbols}
 
-    specs = generate_specs(triggers=triggers, gates=gates, filters=filters)
+    specs = generate_specs(triggers=triggers, gates=gates, filters=filters, exit_grid=exit_grid)
     split = end_ms - int(3 * 30 * 24 * 3600 * 1000)
     cells = []
     any_pass = False
