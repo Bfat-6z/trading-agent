@@ -53,3 +53,28 @@
 htf_bias_po3 warmup guard; embargo `break`→`continue`; TF-derived `bars_held`.
 
 Paper-only; live_guard intact; ALLOW_LIVE_ORDERS never set.
+
+---
+
+## RESOLUTION (foundation now clean — ready for the meta-loop)
+
+All 4 MAJOR fixes + all 3 backbone components landed, each with tests; full suite
+**921 pass**.
+
+- **Fix 1** — `orderflow_data.enrich_indicator_df` is fail-closed on ts_ms
+  (canonical ms ISO; raises on any unmatched bar; positional shortcut removed).
+- **Fix 2** — `overfit_gate` DSR SR0 uses per-cell **Sharpe** variance (metrics
+  now returns std_r + sharpe); gate is stricter → prior KILLs stand.
+- **Fix 3** — `promotion_board` no longer hard-gates on `daily_exam_avg`.
+- **Fix 4** — `scalp_autotrader` inner_critic is advisory-only (no veto).
+- **Backbone** — `research_governance.py`: (1) global cumulative trial count
+  (BASELINE 2196 + Σ per-run `sweep_trials`, no feedback blowup) auto-feeds DSR;
+  (2) holdout peek-once budget (`can_peek_holdout`/`record_holdout_peek`); (3)
+  runtime no-lookahead/repaint guard on the winning composed spec (rejects a
+  leaker before holdout) + fail-closed order-flow holdout. Wired into
+  `run_family`.
+- A smoke run confirmed the wired pipeline (global count fed DSR, guard ran,
+  budget checked) and surfaced+fixed a cumulative-vs-per-run blowup.
+
+**Verdict: CLEAN. Foundation is safe to build the meta-learning loop (Layers 1-4)
+on.** Prior KILL verdicts are unaffected (stricter gate, valid alignment).
