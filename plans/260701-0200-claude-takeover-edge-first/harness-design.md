@@ -44,6 +44,28 @@ ALLOW_LIVE_ORDERS never set. Build minimal-that-runs first, expand later.
    pushes to the dashboard (port 8090) viewable remotely. Paper-only, live_guard
    intact.
 
+## Liquidity-sweep loosening — LOGICAL reasons (disciplined, documented)
+
+Round 1 result: 4 mandatory ANDs (htf_bias + sweep_reversal + structure_shift +
+displacement) gave only 2-22 trades at 1h/4h — too few to conclude; the +R seen
+is noise (DSR=0). Loosen ONLY where a condition is market-logically redundant,
+not to chase green:
+
+- **structure_shift is redundant with sweep_reversal.** A sweep_reversal already
+  encodes "price broke a prior level then closed back the opposite side" — a
+  structure event. Also requiring a separate BOS >= X*ATR in the same window
+  double-counts structure and slashes samples. -> make structure_shift OPTIONAL.
+- **displacement is a confirmation, not the hypothesis.** The core claim is
+  "sweep a liquidity level -> revert"; a big confirmation candle (range >= Y*ATR)
+  is a filter, not the signal. -> make displacement OPTIONAL.
+- **Keep htf_bias_po3 + sweep_reversal as the CORE** (the actual hypothesis).
+
+Discipline: every loosened variant is another trial -> DSR penalized via
+n_trials_offset (cumulative honest count includes round-1's 128/cell). Goal =
+reach thousands of trades at 1h/4h to learn whether round-1's +R is real or
+noise, NOT to "make it green". Holdout sealed, peeked once for the final best.
+Low-TF (<1h) chart-TA is LOCKED DEAD to fees — not retested.
+
 ## Non-negotiables
 Paper-only; never touch live_guard; per-step test + commit; adversarial audit
 before declaring done; minimal-that-runs over feature-rich; KILL is the normal
