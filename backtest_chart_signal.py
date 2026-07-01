@@ -153,9 +153,21 @@ def _apply_slip(price: float, side: str, bps: Decimal, *, entry: bool) -> float:
     return price * (1 - factor) if side == "LONG" else price * (1 + factor)
 
 
-def simulate_trade(df: pd.DataFrame, sig: dict[str, Any], quote_volume_24h: float) -> dict[str, Any] | None:
+def simulate_trade(df: pd.DataFrame, sig: dict[str, Any], quote_volume_24h: float,
+                   exit_cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Multi-bar bracket from entry (bar sig['index'] open) forward. Pessimistic:
-    if a bar spans both SL and TP, assume SL first. Real tiered costs + funding."""
+    if a bar spans both SL and TP, assume SL first. Real tiered costs + funding.
+
+    exit_cfg (optional) parameterizes the exit for the sweep harness:
+      sl_atr, tp_atr, min_rr, regime_exit (bool), adx_exit, max_hold_bars.
+    Defaults reproduce the original hard-coded behavior."""
+    cfg = exit_cfg or {}
+    sl_atr = float(cfg.get("sl_atr", SL_ATR_MULT))
+    tp_atr = float(cfg.get("tp_atr", TP_ATR_MULT))
+    min_rr = float(cfg.get("min_rr", 1.5))
+    use_regime_exit = bool(cfg.get("regime_exit", True))
+    adx_exit = float(cfg.get("adx_exit", 20))
+    max_hold = int(cfg.get("max_hold_bars", MAX_HOLD_BARS))
     idx = sig["index"]
     if idx >= len(df):
         return None
@@ -165,20 +177,20 @@ def simulate_trade(df: pd.DataFrame, sig: dict[str, Any], quote_volume_24h: floa
     entry_px = _apply_slip(float(entry_bar["open"]), side, fill_bps(tier), entry=True)
     atr = sig["atr"]
     if side == "LONG":
-        sl = entry_px - SL_ATR_MULT * atr
-        tp = entry_px + TP_ATR_MULT * atr
+        sl = entry_px - sl_atr * atr
+        tp = entry_px + tp_atr * atr
     else:
-        sl = entry_px + SL_ATR_MULT * atr
-        tp = entry_px - TP_ATR_MULT * atr
+        sl = entry_px + sl_atr * atr
+        tp = entry_px - tp_atr * atr
     rr = abs(tp - entry_px) / max(1e-12, abs(entry_px - sl))
-    if rr < 1.5:
+    if rr < min_rr:
         return None
 
     entry_ts = int(entry_bar["ts_ms"])
     exit_px = None
     reason = None
     exit_ts = entry_ts
-    end = min(len(df), idx + 1 + MAX_HOLD_BARS)
+    end = min(len(df), idx + 1 + max_hold)
     for j in range(idx, end):
         bar = df.iloc[j]
         hi, lo = float(bar["high"]), float(bar["low"])
@@ -196,9 +208,9 @@ def simulate_trade(df: pd.DataFrame, sig: dict[str, Any], quote_volume_24h: floa
         if hit_tp:
             exit_px = _apply_slip(tp, side, fill_bps(tier), entry=False); reason = "tp"; exit_ts = int(bar["ts_ms"]); break
         # regime exit (only after the entry bar)
-        if j > idx and not pd.isna(bar["ema_fast"]) and not pd.isna(bar["ema_slow"]):
+        if use_regime_exit and j > idx and not pd.isna(bar["ema_fast"]) and not pd.isna(bar["ema_slow"]):
             flip = bar["ema_fast"] < bar["ema_slow"] if side == "LONG" else bar["ema_fast"] > bar["ema_slow"]
-            if flip or (not pd.isna(bar["adx"]) and bar["adx"] < 20):
+            if flip or (not pd.isna(bar["adx"]) and bar["adx"] < adx_exit):
                 exit_px = _apply_slip(float(bar["close"]), side, fill_bps(tier), entry=False); reason = "regime_exit"; exit_ts = int(bar["ts_ms"]); break
     if exit_px is None:  # time stop
         last = df.iloc[end - 1]
@@ -220,9 +232,15 @@ def simulate_trade(df: pd.DataFrame, sig: dict[str, Any], quote_volume_24h: floa
 
 
 def backtest_symbol(bars_5m: list[dict[str, Any]], bars_1h: list[dict[str, Any]], quote_volume_24h: float,
-                    *, start_ts_ms: int | None = None, end_ts_ms: int | None = None) -> list[dict[str, Any]]:
-    """Run the setup over a 5m series (optionally restricted to [start,end) by
-    bar close time — for train/holdout split). Returns list of closed trades."""
+                    *, start_ts_ms: int | None = None, end_ts_ms: int | None = None,
+                    signal_fn: Any | None = None, exit_cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Run a setup over a 5m series (optionally restricted to [start,end) by bar
+    close time — for train/holdout split). Returns closed trades.
+
+    signal_fn(df, i, df_1h)->sig|None lets the sweep harness inject a compiled
+    strategy; default is the built-in EMA-pullback signal_at. exit_cfg
+    parameterizes the bracket exit (sl_atr/tp_atr/etc)."""
+    sig_fn = signal_fn or signal_at
     df = compute_indicators(bars_5m)
     df_1h = compute_indicators(bars_1h)
     trades: list[dict[str, Any]] = []
@@ -234,9 +252,9 @@ def backtest_symbol(bars_5m: list[dict[str, Any]], bars_1h: list[dict[str, Any]]
             i += 1; continue
         if end_ts_ms is not None and ts >= end_ts_ms:
             break
-        sig = signal_at(df, i, df_1h)
+        sig = sig_fn(df, i, df_1h)
         if sig:
-            tr = simulate_trade(df, sig, quote_volume_24h)
+            tr = simulate_trade(df, sig, quote_volume_24h, exit_cfg)
             if tr:
                 # EMBARGO: an in-sample trade (end_ts_ms set) must fully CLOSE
                 # before the split, otherwise its exit scan consumes holdout-window
