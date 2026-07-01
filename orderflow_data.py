@@ -23,8 +23,11 @@ _MAX_LIMIT = 1000
 
 
 def _iso_ms(ms: int) -> str:
+    # MILLISECOND precision on purpose: compute_indicators derives ts_ms by parsing
+    # this ISO string, so truncating to seconds would make the indicator df's ts_ms
+    # (…000) disagree with the flow df's raw ts_ms (…999) and break the enrich join.
     import datetime
-    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat(timespec="seconds")
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat(timespec="milliseconds")
 
 
 def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms: int,
@@ -117,28 +120,33 @@ CVD_COLS = ("cvd_delta", "buy_frac", "cvd_roll20", "cvd_delta_norm", "funding_ra
 
 def enrich_indicator_df(indicator_df: pd.DataFrame, flow_bars: list[dict[str, Any]],
                         funding: list[dict[str, Any]]) -> pd.DataFrame:
-    """Attach CVD + funding columns to an indicator df (from compute_indicators).
-    The indicator df and the flow bars are built from the SAME klines in ascending
-    time order, so alignment is positional when lengths match (robust to differing
-    ts_ms parsing between paths); otherwise fall back to a ts_ms join. No-lookahead:
-    cvd columns are per-bar causal, funding joined point-in-time."""
+    """Attach CVD + funding columns to an indicator df (from compute_indicators),
+    aligned STRICTLY by ts_ms and FAIL-CLOSED: every indicator bar must have a
+    matching flow bar (same ts_ms), else raise. This makes silent misalignment
+    (the old positional shortcut = latent lookahead) impossible. No-lookahead: cvd
+    columns are per-bar causal, funding joined point-in-time."""
+    out = indicator_df.copy().reset_index(drop=True)
+    if not flow_bars:
+        raise ValueError("enrich_indicator_df: no flow_bars provided (order-flow spec cannot be evaluated)")
     flow = compute_cvd_columns(flow_bars)
     flow = join_funding_point_in_time(flow, funding)
-    out = indicator_df.copy().reset_index(drop=True)
     if flow.empty:
-        for col in CVD_COLS:
-            out[col] = 0.0 if col == "funding_rate" else float("nan")
-        return out
-    if len(flow) == len(out):
-        for col in CVD_COLS:
-            out[col] = flow[col].to_numpy() if col in flow.columns else float("nan")
-        return out
-    # length mismatch -> align by ts_ms (assumes both ts_ms are true epoch ms)
-    flow_idx = flow.set_index("ts_ms")
-    ts = out["ts_ms"].to_numpy()
+        raise ValueError("enrich_indicator_df: flow frame empty after CVD compute")
+    # exact ts_ms join
+    flow_pos = {int(t): i for i, t in enumerate(flow["ts_ms"].to_numpy())}
+    out_ts = [int(t) for t in out["ts_ms"].to_numpy()]
+    idxs = [flow_pos.get(t) for t in out_ts]
+    unmatched = sum(1 for x in idxs if x is None)
+    if unmatched:
+        raise ValueError(f"enrich_indicator_df: {unmatched}/{len(idxs)} indicator bars have no matching "
+                         f"flow bar by ts_ms — refusing to enrich (would be a silent lookahead/NaN). "
+                         f"Ensure both dfs come from the same flow bars with canonical ts_ms.")
     for col in CVD_COLS:
-        src = flow_idx[col] if col in flow_idx.columns else None
-        out[col] = ([src.get(t, float("nan")) for t in ts] if src is not None else float("nan"))
+        if col in flow.columns:
+            arr = flow[col].to_numpy()
+            out[col] = [arr[i] for i in idxs]
+        else:
+            out[col] = 0.0 if col == "funding_rate" else float("nan")
     return out
 
 
