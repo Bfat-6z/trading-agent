@@ -59,3 +59,14 @@ KILL (do not wire chart edge into decisions) if ANY: expectancy lower-95%-CI ≤
 
 ## Note
 No live trading anywhere in Phase 3. This is measurement only. If it passes, wiring into decisions is a later, separately-gated step.
+
+## Owner direction update (2026-07-01)
+1. **Optimize NET EXPECTANCY, not win rate.** Owner confirmed: lãi ròng > win rate. Keep the R:R-driven setup (35-45% win, RR 2-3). Do NOT chase high win rate (near TP / far SL) — that is the account-blowup shape. Every candidate still gated by holdout expectancy CI.
+2. **Agent must DRAW charts, not just read numbers.** Infra already exists:
+   - `chart_snapshot_renderer.py` (matplotlib): renders candles + EMA + volume + overlays (zones/trendlines/structure/SL-TP) to PNG. Reuse.
+   - `tradingagents_crypto_src/.../tv_data.py` `fetch_tv_multi_tf` (tvdatafeed): multi-TF TV indicators. Reuse for signal + cross-check.
+   - Vision model (Gemini via ai-multimodal skill) can READ a rendered chart PNG.
+   Plan: after the deterministic signal fires, the agent RENDERS the setup chart (candles+EMA+volume+SL/TP) as a PNG artifact for every paper decision — so decisions are visual + auditable, and a vision pass can sanity-check the setup. This makes the agent "see" its own charts, learn from rendered snapshots, and lets the owner review the exact chart per trade.
+3. **Research chart methodology from pros/whales** (SMC, order blocks, price action, MA pullback) to inform future setups — but every method must survive the same backtest-holdout gate before it can trade. No method trades on reputation.
+
+Sequencing: finish the deterministic prove-or-kill FIRST (it's the honest edge test). The chart-rendering + vision layer is built alongside as the "agent draws its own chart" capability, wired to every decision snapshot. TV methodology research feeds the NEXT candidate setups if the first is killed.
