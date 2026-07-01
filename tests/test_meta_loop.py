@@ -88,3 +88,35 @@ def test_dry_streak_roundtrip(tmp_path, monkeypatch):
     assert ml._read_dry_streak() == 0
     ml._write_dry_streak(2)
     assert ml._read_dry_streak() == 2
+
+
+def test_evolve_pools_drops_proven_bad_components():
+    # stats say sweep_reversal + cvd_reversal are below the drop threshold; funding
+    # zscore too. evolve must drop them and keep the rest.
+    stats = {
+        "sweep_reversal": {"mean_expectancy_r": -0.26, "n": 496},
+        "cvd_reversal": {"mean_expectancy_r": -0.21, "n": 120},
+        "funding_zscore_fade": {"mean_expectancy_r": -0.20, "n": 150},
+        "ts_momentum": {"mean_expectancy_r": -0.10, "n": 72},   # above -0.15 -> kept
+    }
+    ev = ml.evolve_pools_from_stats(stats, drop_below=-0.15)
+    trig_blocks = {t.get("block") for t in ev["triggers"]}
+    filt_blocks = {f.get("block") for f in ev["filters"]}
+    assert "sweep_reversal" not in trig_blocks      # dropped by number
+    assert "cvd_reversal" not in filt_blocks        # flow filter dropped
+    assert "funding_zscore_fade" not in filt_blocks
+    assert "ts_momentum" in trig_blocks             # least-bad kept
+    assert any(d[0] == "trigger" for d in ev["dropped"])
+
+
+def test_generate_specs_with_evolved_pools_and_ema_trigger():
+    # extended pool with the direction-specific EMA-location trigger compiles
+    triggers = [ml.EMA_LOCATION_TRIGGER, {"block": "ts_momentum", "params": [{"lookback": 20}],
+                                          "src": "T3", "hyp": "momentum"}]
+    specs = ml.generate_specs(triggers=triggers, gates=[{"block": None, "params": None, "hyp": "none"}],
+                              filters=[{"block": None, "params": None, "hyp": "none"}])
+    blocks = {b["block"] for s in specs for b in s["entry"]["all"]}
+    assert "location_reject_ema_from_below" in blocks    # SHORT direction
+    assert "location_reclaim_ema_from_above" in blocks   # LONG direction
+    for s in specs:
+        assert sc.validate_spec(s) == []

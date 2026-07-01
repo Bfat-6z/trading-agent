@@ -64,27 +64,50 @@ FILTERS = [
     {"block": "cvd_reversal", "params": {"min_norm": 0.1}, "hyp": "confirmed by a CVD aggression flip"},
 ]
 
-# reasoned pairing: mean-reversion triggers pair with fade filters; trend triggers
-# pair with trend gates. We still allow "none" everywhere. A few combos are
-# skipped as illogical (e.g. trend gate on a pure reversion trigger is allowed but
-# a fade filter contradicting a trend trigger is skipped).
+# Direction-specific trigger: EMA-cluster rejection (SHORT) / reclaim (LONG) — the
+# least-bad component from iteration 1 (+0.05R). Added to the pool for round 2.
+EMA_LOCATION_TRIGGER = {
+    "dir_block": {"SHORT": "location_reject_ema_from_below", "LONG": "location_reclaim_ema_from_above"},
+    "params": [{}], "src": "EMA rejection/reclaim",
+    "hyp": "price rejects/reclaims the EMA cluster (least-bad block in iter 1)"}
+
+# A non-order-flow confirmation filter (volume), distinct from the flow filters
+# that iteration 1 proved harmful.
+VOLUME_FILTER = {"block": "volume_min_ratio", "params": {"min_ratio": 1.5},
+                 "hyp": "confirmed by above-average volume"}
+
 DIRECTIONS = ["SHORT", "LONG"]
 
 
-def generate_specs() -> list[dict[str, Any]]:
+def _trig_block(trig: dict[str, Any], direction: str) -> str | None:
+    if trig.get("dir_block"):
+        return trig["dir_block"].get(direction)
+    return trig.get("block")
+
+
+def generate_specs(triggers: list[dict[str, Any]] | None = None,
+                   gates: list[dict[str, Any]] | None = None,
+                   filters: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Layer 2: compose bounded, reasoned multi-factor specs, each with a
-    hypothesis + source. Returns spec dicts ready for the compiler."""
+    hypothesis + source. Pools default to the module constants but can be supplied
+    (e.g. an EVOLVED config learned from the ledger)."""
+    triggers = triggers if triggers is not None else TRIGGERS
+    gates = gates if gates is not None else REGIME_GATES
+    filters = filters if filters is not None else FILTERS
     specs: list[dict[str, Any]] = []
     for direction in DIRECTIONS:
-        for trig in TRIGGERS:
+        for trig in triggers:
+            tblock = _trig_block(trig, direction)
+            if not tblock:
+                continue
             for tparams in trig["params"]:
-                for gate in REGIME_GATES:
-                    for filt in FILTERS:
+                for gate in gates:
+                    for filt in filters:
                         # skip illogical combo: a funding-fade filter on a
                         # trend-continuation trigger contradicts the thesis
-                        if trig["block"] == "ts_momentum" and filt["block"] == "funding_zscore_fade":
+                        if tblock == "ts_momentum" and filt.get("block") == "funding_zscore_fade":
                             continue
-                        blocks = [{"block": trig["block"], "params": tparams}]
+                        blocks = [{"block": tblock, "params": tparams}]
                         if gate["block"]:
                             blocks.append({"block": gate["block"], **({"params": gate["params"]} if gate["params"] else {})})
                         if filt["block"]:
@@ -92,7 +115,7 @@ def generate_specs() -> list[dict[str, Any]]:
                         hyp = f"{trig['hyp']} | {gate['hyp']} | {filt['hyp']}"
                         for sl_atr, rr in ((1.5, 2.0), (1.5, 3.0)):
                             spec = {
-                                "name": f"meta_{trig['block']}_{direction.lower()}",
+                                "name": f"meta_{tblock}_{direction.lower()}",
                                 "direction": direction,
                                 "entry": {"all": blocks},
                                 "exit": {"sl_atr": sl_atr, "tp_atr": sl_atr * rr,
@@ -110,6 +133,43 @@ def generate_specs() -> list[dict[str, Any]]:
             seen.add(sid)
             out.append(s)
     return out
+
+
+def evolve_pools_from_stats(stats: dict[str, Any], *, drop_below: float = -0.15,
+                            base_triggers: list[dict[str, Any]] | None = None,
+                            base_gates: list[dict[str, Any]] | None = None,
+                            base_filters: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Layer 3 -> Layer 2 feedback: given per-component expectancy stats, DROP any
+    pool entry whose block's mean expectancy is <= drop_below (proven-bad by
+    number), and keep the rest. This is data-driven pruning, not hand-tuning: the
+    ledger decides what survives. Returns {triggers, gates, filters, dropped}."""
+    def block_ok(block: str | None) -> bool:
+        if not block:
+            return True   # 'none' options always allowed
+        s = stats.get(block)
+        if not s:
+            return True   # untested block -> allowed (explore)
+        return float(s.get("mean_expectancy_r", 0)) > drop_below
+
+    triggers = base_triggers if base_triggers is not None else TRIGGERS
+    gates = base_gates if base_gates is not None else REGIME_GATES
+    filters = base_filters if base_filters is not None else FILTERS
+    dropped = []
+    kept_triggers = []
+    for t in triggers:
+        blocks = list(t["dir_block"].values()) if t.get("dir_block") else [t.get("block")]
+        if all(block_ok(b) for b in blocks):
+            kept_triggers.append(t)
+        else:
+            dropped.append(("trigger", blocks))
+    kept_filters = []
+    for f in filters:
+        if block_ok(f.get("block")):
+            kept_filters.append(f)
+        else:
+            dropped.append(("filter", f.get("block")))
+    kept_gates = [g for g in gates if block_ok(g.get("block"))]
+    return {"triggers": kept_triggers, "gates": kept_gates, "filters": kept_filters, "dropped": dropped}
 
 
 def guard_specs(specs: list[dict[str, Any]], ref_df, ref_df1) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -225,14 +285,18 @@ def write_learnings(report: dict[str, Any]) -> None:
 
 
 def run_iteration(client: Any, *, end_ms: int, stamped_at: str, months: float = 9.0,
-                  timeframes: tuple[str, ...] = ("1h", "4h"), max_symbols: int = 9) -> dict[str, Any]:
-    """Layer 4: ONE honest iteration. Returns a report."""
+                  timeframes: tuple[str, ...] = ("1h", "4h"), max_symbols: int = 9,
+                  triggers: list[dict[str, Any]] | None = None,
+                  gates: list[dict[str, Any]] | None = None,
+                  filters: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Layer 4: ONE honest iteration. Returns a report. Optional pools let a caller
+    pass an EVOLVED (ledger-pruned) config for later iterations."""
     uni = us.select_universe(client, end_ms=end_ms, months=months, timeframe="1h",
                              min_daily_quote_volume=50_000_000.0, max_symbols=max_symbols)
     symbols = uni["selected"]
     quote_vols = {s: uni["detail"].get(s, 0.0) for s in symbols}
 
-    specs = generate_specs()
+    specs = generate_specs(triggers=triggers, gates=gates, filters=filters)
     split = end_ms - int(3 * 30 * 24 * 3600 * 1000)
     cells = []
     any_pass = False
