@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import backtest_data_fetcher as bf
 import overfit_gate as og
+import research_governance as rg
 import research_ledger as rl
 import sweep_runner as sw
 
@@ -45,27 +46,50 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
                *, entry_tf: str, split_ts_ms: int, stamped_at: str,
                direction_of: Callable[[dict[str, Any]], str] | None = None,
                precomputed: dict[str, dict[str, Any]] | None = None,
-               n_trials_offset: int = 0) -> dict[str, Any]:
+               n_trials_offset: int | None = None) -> dict[str, Any]:
     """Full pipeline for one family on one timeframe. Writes ledger + report.
     `precomputed` supplies enriched indicator dfs (Family A CVD/funding).
-    `n_trials_offset` adds prior cumulative trials to the DSR multiple-testing
-    correction (honest cumulative count when a family is re-swept/loosened)."""
+    DSR multiple-testing correction uses the GLOBAL cumulative trial count from
+    the ledger (auto), so the penalty never resets. `n_trials_offset` (rare) lets
+    a caller override with an explicit prior count instead of the auto global."""
     sweep = sw.run_sweep(spec_factory, param_grid, datasets, split_ts_ms,
                          sweep_name=f"{family}_{entry_tf}", precomputed=precomputed)
-    n_trials = sweep["n_trials"] + int(n_trials_offset)
+    prior = int(n_trials_offset) if n_trials_offset is not None else rg.global_trial_count()
+    n_trials = sweep["n_trials"] + prior
     best = og.pick_best(sweep["results"])
     if best is None:
         return _finalize(family, entry_tf, n_trials, None, None, None, stamped_at,
                          reason="no_specs")
 
+    # RUNTIME NO-LOOKAHEAD GUARD: a (possibly self-generated) winning spec that
+    # repaints would win in-sample by cheating. Re-check the best spec across all
+    # symbols before it can reach the holdout; reject a leaker outright.
+    guard_pre = precomputed if precomputed is not None else sw.precompute_indicator_dfs(datasets)
+    guard = rg.guard_spec_across_symbols(best["spec"], guard_pre)
+    if not guard["clean"]:
+        return _finalize(family, entry_tf, n_trials, best, None, None, stamped_at,
+                         final_verdict="KILL", reason=f"lookahead_guard_failed:{guard['mismatches']}mismatch")
+
     verdict = og.evaluate_candidate(best, sweep["results"], n_trials)
     holdout = None
+    holdout_blocked = None
     if verdict["pre_holdout_pass"]:
-        # THE single sealed-holdout peek, for the best survivor only
-        holdout = og.peek_holdout_once(best["spec"], datasets, split_ts_ms,
-                                       exit_cfg=best["spec"].get("exit"), precomputed=precomputed)
+        spec_id = best["spec_id"]
+        holdout_key = rg._holdout_digest(split_ts_ms)
+        if not rg.can_peek_holdout(spec_id):
+            # HOLDOUT BUDGET: this spec already spent its one-and-only peek.
+            holdout_blocked = "holdout_already_peeked"
+        else:
+            # fail-closed: order-flow specs must peek on enriched dfs, never the
+            # plain backtest_symbol fallback (which would drop CVD/funding).
+            if rg.spec_has_order_flow(best["spec"]) and precomputed is None:
+                holdout_blocked = "order_flow_holdout_needs_enriched_precomputed"
+            else:
+                holdout = og.peek_holdout_once(best["spec"], datasets, split_ts_ms,
+                                               exit_cfg=best["spec"].get("exit"), precomputed=precomputed)
+                rg.record_holdout_peek(spec_id, holdout_key, stamped_at)
     final_verdict = "KILL"
-    reason = "failed_in_sample_overfit_gate"
+    reason = holdout_blocked or "failed_in_sample_overfit_gate"
     if verdict["pre_holdout_pass"] and holdout:
         final_verdict = holdout["verdict"]
         reason = holdout.get("reason") or ("passed_all_gates" if final_verdict == "PASS" else "failed_sealed_holdout")
