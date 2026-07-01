@@ -59,3 +59,28 @@ def test_futures_open_long_blocks_before_hitting_api(monkeypatch):
 
     with pytest.raises(lg.LiveOrdersBlocked):
         fut.open_long("BTCUSDT", margin_usdt=5, leverage=5)
+
+
+def test_client_chokepoint_guards_direct_futures_create_order(monkeypatch):
+    """The manual scripts call spot_client().futures_create_order directly,
+    bypassing the futures.py wrappers. The guard installed on the client itself
+    must still block them (absolute chokepoint)."""
+    monkeypatch.delenv("ALLOW_LIVE_ORDERS", raising=False)
+    monkeypatch.delenv("BINANCE_TESTNET", raising=False)
+    client_mod = importlib.import_module("tradingagents.binance.client")
+
+    class _RawClient:
+        def __init__(self, *a, **k):
+            pass
+        def futures_create_order(self, **kw):  # pragma: no cover - must never run
+            raise AssertionError("LIVE ORDER REACHED API — chokepoint guard failed!")
+
+    # Reset singleton and force our raw client, then let the guard wrap it.
+    monkeypatch.setattr(client_mod, "_spot", None)
+    monkeypatch.setattr(client_mod, "_get_keys", lambda: ("k", "s"))
+    monkeypatch.setattr(client_mod, "Client", _RawClient)
+    monkeypatch.setattr(client_mod, "is_testnet", lambda: False)
+
+    c = client_mod.spot_client()
+    with pytest.raises(lg.LiveOrdersBlocked):
+        c.futures_create_order(symbol="BTCUSDT", side="BUY", type="MARKET", quantity=1)
