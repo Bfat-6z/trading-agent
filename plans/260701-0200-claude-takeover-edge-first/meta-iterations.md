@@ -94,3 +94,33 @@ the PRE-SET KILL criterion — a disciplined, criterion-driven close, not giving
 
 See research-findings.md for the OFFICIAL family-level verdict + the two remaining
 (not-yet-run) angles.
+
+## NEW-MECHANISM family — round A (stamped 2026-07-02T02:00Z) — KILL, first faint +signal
+
+Owner: "spam agents to research, self-learn, learn from mistakes." A 7-agent
+research workflow (grounded on the dead-family ledger) proposed 6 genuinely new
+no-lookahead blocks; all passed the guard + no-lookahead tests. First iteration of
+this new family (WIDE stops sl 2-3 ATR, kaufman efficiency gate, new_family=True
+reset dry streak):
+
+- 168 specs, 0 guarded-out, **336 tested**. **Global cumulative trial count 3232.**
+- Both cells KILL: meta_1h best **+0.31R** over 338 trades (highest ever, but
+  selection-biased = best of 168, NOT DSR-significant); meta_4h +0.095R over 498.
+  Holdout never peeked. **Dry streak 1/3.**
+- **Layer-3 learning — the NEW blocks are the FIRST positive-leaning components:**
+  | component | mean_exp_R | n |
+  |---|---|---|
+  | donchian_breakout_committed | **+0.086** | 63 |
+  | kaufman_efficiency_regime | **+0.060** | 57 |
+  | location_reject_ema_from_below | +0.050 | 18 |
+  | volume_min_ratio | +0.028 | 66 |
+  | session_range_breakout | +0.002 | 39 |
+  | squeeze_release_break | -0.002 | 12 |
+  | donchian_multitouch_fade | -0.081 | 33 |
+  | cvd_trend_divergence | -0.095 | 6 |
+
+Honest read: this is the first family where components lean POSITIVE (committed
+breakout + efficiency regime), unlike the uniformly-negative dead families — a
+faint lead, NOT an edge (+0.086R at n=63 is weak and DSR-failing). Worth ONE
+focused follow-up around donchian_committed + kaufman with more sample to test
+real-vs-noise. Still KILL; loop continues (dry 1/3).
