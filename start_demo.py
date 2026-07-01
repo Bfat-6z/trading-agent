@@ -56,14 +56,26 @@ def start() -> int:
     env["TRADING_AGENT_PAPER_EXPLORATION"] = "1"   # allow under-sampled setups to open demo trades
     env["INGEST_DECISION_CANDLES"] = "1"           # real 5m candles into decisions
     env.pop("ALLOW_LIVE_ORDERS", None)             # SAFETY: never allow live orders
+    # A strong token lets the dashboard be viewed through a Cloudflare tunnel.
+    # Open the tunnel URL as  https://<tunnel>/#token=<TOKEN>  and the page stores
+    # it. Bind 0.0.0.0 so the tunnel reaches it; the token gates /api/*.
+    import secrets
+    # Strong token: needs >=24 chars, >=10 distinct, >=3 char classes
+    # (lower/upper/digit/symbol). Build one deterministically-random per run.
+    token = os.environ.get("TRADING_AGENT_DASHBOARD_TOKEN") or ("Demo-" + secrets.token_urlsafe(24))
+    env["TRADING_AGENT_DASHBOARD_TOKEN"] = token
     _reset_account_to_100()
     _clear_sleep_pause()
 
-    # Dashboard (foreground-detached)
-    dash = subprocess.Popen([PY, str(ROOT / "agent_status_dashboard.py"), "--host", "127.0.0.1", "--port", "8090"],
+    # Dashboard bound for tunnel access, token-gated.
+    dash = subprocess.Popen([PY, str(ROOT / "agent_status_dashboard.py"), "--host", "0.0.0.0", "--port", "8090",
+                             "--token-env", "TRADING_AGENT_DASHBOARD_TOKEN"],
                             cwd=str(ROOT), env=env,
                             stdout=open(STATE / "demo_dashboard.out.log", "w"), stderr=subprocess.STDOUT)
+    (STATE / "demo_dashboard_token.txt").write_text(token, encoding="utf-8")
     print(f"[demo] dashboard starting (pid {dash.pid}) -> http://127.0.0.1:8090")
+    print(f"[demo] dashboard token: {token}")
+    print(f"[demo] remote view: append  #token={token}  to the tunnel URL")
 
     # Agent fleet via supervisor loop
     sup = subprocess.Popen([PY, str(ROOT / "agent_process_supervisor.py")],

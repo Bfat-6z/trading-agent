@@ -10,8 +10,12 @@ phân tích, **tự vẽ chart cho mỗi lệnh**, có dashboard theo dõi trự
 
 ## Xem demo
 
-- **Dashboard:** http://127.0.0.1:8090 (hoặc link Cloudflare được cấp)
+- **Link cho sếp (Cloudflare, xem từ xa):**
+  `https://evening-expand-deaf-demonstrated.trycloudflare.com/#token=Demo-cJ5cnhlXiUqgcy2S5OEubRzQ2mcqH4_7`
+  *(mở nguyên link kèm `#token=...` — token cho phép xem dashboard qua tunnel. Link trycloudflare đổi mỗi lần khởi động lại.)*
+- **Local:** http://127.0.0.1:8090
 - **Khởi động:** `python start_demo.py` · **Dừng:** `python start_demo.py --stop`
+- **Mở tunnel:** `cloudflared.exe tunnel --url http://127.0.0.1:8090` (in ra link + token)
 
 ## ĐÃ CHẠY ĐƯỢC (kiểm chứng)
 
