@@ -355,6 +355,93 @@ def funding_zscore_fade(df: pd.DataFrame, direction: str, window: int = 48, z: f
 
 
 # ---------------------------------------------------------------------------
+# ROUND-2 agent-proposed blocks (new mechanisms, learned from the dead ledger).
+# All causal: trailing rolling + shift(+n) only, no shift(-n)/centered windows.
+# ---------------------------------------------------------------------------
+
+def squeeze_release_break(df: pd.DataFrame, direction: str, bb_period: int = 20, bb_k: float = 2.0,
+                          kc_mult: float = 1.5, squeeze_min_bars: int = 6, box_lookback: int = 20) -> pd.Series:
+    """Vol compression->expansion ignition: Bollinger width inside Keltner width
+    (a 'squeeze') for >= squeeze_min_bars, then RELEASE + close breaks the box
+    extreme. Fires only at the ignition point (rare, high-conviction)."""
+    ma = df["close"].rolling(bb_period, min_periods=bb_period).mean()
+    sd = df["close"].rolling(bb_period, min_periods=bb_period).std()
+    sq = (2 * float(bb_k) * sd) < (2 * float(kc_mult) * df["atr"])
+    was = sq.shift(1).rolling(squeeze_min_bars, min_periods=squeeze_min_bars).min() >= 1
+    rel = was & (~sq)
+    hi = df["high"].shift(1).rolling(box_lookback, min_periods=box_lookback).max()
+    lo = df["low"].shift(1).rolling(box_lookback, min_periods=box_lookback).min()
+    sig = rel & (df["close"] > hi) if direction == "LONG" else rel & (df["close"] < lo)
+    return sig.fillna(False)
+
+
+def donchian_breakout_committed(df: pd.DataFrame, direction: str, n: int = 20, k: float = 0.25) -> pd.Series:
+    """Turtle-style committed breakout with an ATR buffer beyond a fresh N-bar
+    extreme (wide-stop trend entry; the logical OPPOSITE of breakout_retest)."""
+    dh = df["high"].shift(1).rolling(n, min_periods=n).max()
+    dl = df["low"].shift(1).rolling(n, min_periods=n).min()
+    sig = (df["close"] > dh + float(k) * df["atr"]) if direction == "LONG" else (df["close"] < dl - float(k) * df["atr"])
+    return sig.fillna(False)
+
+
+def session_range_breakout(df: pd.DataFrame, direction: str, asia_end: int = 7, win_end: int = 16) -> pd.Series:
+    """Asia-range breakout at the London/NY session (calendar axis; no dead block
+    reads the clock). LONG = first window-session bar to close above today's Asia
+    high. Causal: within-day cummax/cummin of the completed Asia session."""
+    dt = pd.to_datetime(df["ts_ms"], unit="ms")
+    hod = dt.dt.hour
+    day = dt.dt.floor("D")
+    asia = (hod >= 0) & (hod < int(asia_end))
+    win = (hod >= int(asia_end)) & (hod < int(win_end))
+    ah = df["high"].where(asia).groupby(day).cummax().groupby(day).ffill()
+    al = df["low"].where(asia).groupby(day).cummin().groupby(day).ffill()
+    lg = win & (df["close"] > ah) & (df["close"].shift(1) <= ah.shift(1)) & ah.notna()
+    sh = win & (df["close"] < al) & (df["close"].shift(1) >= al.shift(1)) & al.notna()
+    return (lg if direction == "LONG" else sh).fillna(False)
+
+
+def cvd_trend_divergence(df: pd.DataFrame, direction: str, lookback: int = 20,
+                         p_thr: float = 1.0, c_thr: float = 0.5) -> pd.Series:
+    """Flow DISAGREES with price (dead CVD blocks required agreement): price makes
+    a >= p_thr*ATR move over lookback while net taker flow (rolling cvd) leans the
+    other way -> absorption/exhaustion. Reads enriched cvd_delta_norm."""
+    c = _col_or_false(df, "cvd_delta_norm")
+    if c is None:
+        return pd.Series(False, index=df.index)
+    pc = (df["close"] - df["close"].shift(lookback)) / df["atr"].replace(0, float("nan"))
+    cs = c.rolling(lookback, min_periods=lookback).sum()
+    sh = (pc >= float(p_thr)) & (cs <= -float(c_thr))
+    lg = (pc <= -float(p_thr)) & (cs >= float(c_thr))
+    return (lg if direction == "LONG" else sh).fillna(False)
+
+
+def donchian_multitouch_fade(df: pd.DataFrame, direction: str, level_lookback: int = 48,
+                             tol_atr: float = 0.5, min_touches: int = 3) -> pd.Series:
+    """Fade a shelf validated >= min_touches times (stacked liquidity likely
+    defended), not one fresh wick (unlike the dead sweep_reversal). Wide structural
+    stop beyond the level implied by exit_cfg."""
+    mp = max(5, level_lookback // 2)
+    res = df["high"].shift(1).rolling(level_lookback, min_periods=mp).max()
+    sup = df["low"].shift(1).rolling(level_lookback, min_periods=mp).min()
+    atr = df["atr"].replace(0, float("nan"))
+    nr = ((res - df["high"]).abs() <= float(tol_atr) * atr).rolling(level_lookback, min_periods=mp).sum()
+    ns = ((df["low"] - sup).abs() <= float(tol_atr) * atr).rolling(level_lookback, min_periods=mp).sum()
+    sh = (df["high"] >= res) & (df["close"] < res) & (nr >= int(min_touches))
+    lg = (df["low"] <= sup) & (df["close"] > sup) & (ns >= int(min_touches))
+    return (lg if direction == "LONG" else sh).fillna(False)
+
+
+def kaufman_efficiency_regime(df: pd.DataFrame, er_window: int = 20, er_min: float = 0.35) -> pd.Series:
+    """Kaufman Efficiency Ratio regime gate (direction-agnostic): net travel /
+    total path over er_window. ER>=er_min = efficient/trending (enables trend
+    triggers); path-efficiency, distinct from DI-based ADX."""
+    net = (df["close"] - df["close"].shift(er_window)).abs()
+    path = (df["close"] - df["close"].shift(1)).abs().rolling(er_window, min_periods=er_window).sum()
+    er = net / path.replace(0, float("nan"))
+    return (er >= float(er_min)).fillna(False)
+
+
+# ---------------------------------------------------------------------------
 # Block registry — name -> (callable, whether it needs `direction`)
 # ---------------------------------------------------------------------------
 
@@ -389,6 +476,13 @@ BLOCKS: dict[str, dict[str, Any]] = {
     # Tier-1 seeds (meta-loop Layer 1)
     "ts_momentum": {"fn": ts_momentum, "directional": True},
     "funding_zscore_fade": {"fn": funding_zscore_fade, "directional": True},
+    # Round-2 agent-proposed blocks (new mechanisms)
+    "squeeze_release_break": {"fn": squeeze_release_break, "directional": True},
+    "donchian_breakout_committed": {"fn": donchian_breakout_committed, "directional": True},
+    "session_range_breakout": {"fn": session_range_breakout, "directional": True},
+    "cvd_trend_divergence": {"fn": cvd_trend_divergence, "directional": True},
+    "donchian_multitouch_fade": {"fn": donchian_multitouch_fade, "directional": True},
+    "kaufman_efficiency_regime": {"fn": kaufman_efficiency_regime, "directional": False},
 }
 
 

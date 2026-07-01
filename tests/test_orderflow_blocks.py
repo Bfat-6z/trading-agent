@@ -39,7 +39,7 @@ def _enriched(n):
 
 
 CVD_BLOCKS = ["cvd_aggression", "cvd_reversal", "funding_extreme_contrarian", "buy_frac_extreme",
-              "funding_zscore_fade"]
+              "funding_zscore_fade", "cvd_trend_divergence"]
 
 
 def test_cvd_blocks_safe_on_unenriched_df():

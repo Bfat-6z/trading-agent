@@ -51,6 +51,12 @@ BLOCK_PARAMS = {
     "breakout_retest": {"lookback": 20, "tol_atr": 0.3, "break_within": 10},
     "ts_momentum": {"lookback": 20},
     "funding_zscore_fade": {"window": 48, "z": 2.0},
+    "squeeze_release_break": {"bb_period": 20, "bb_k": 2.0, "kc_mult": 1.5, "squeeze_min_bars": 6, "box_lookback": 20},
+    "donchian_breakout_committed": {"n": 20, "k": 0.25},
+    "session_range_breakout": {"asia_end": 7, "win_end": 16},
+    "cvd_trend_divergence": {"lookback": 20, "p_thr": 1.0, "c_thr": 0.5},
+    "donchian_multitouch_fade": {"level_lookback": 48, "tol_atr": 0.5, "min_touches": 3},
+    "kaufman_efficiency_regime": {"er_window": 20, "er_min": 0.35},
 }
 
 
