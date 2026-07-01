@@ -279,7 +279,10 @@ def chart_snapshot_summary(
     for key in ("chart_score_id", "chart_risk_plan_id", "chart_intelligence_id"):
         if not id_fields.get(key) and preflight.get(key):
             id_fields[key] = preflight.get(key)
-    chart_used = bool(preflight.get("chart_used") or score or id_fields.get("chart_intelligence_id"))
+    # Demo: a real candle batch attached to the candidate means we can and will
+    # render the entry/exit chart, so treat chart as used for rendering purposes.
+    has_render_batch = isinstance(candidate.get("chart_candle_batch"), dict) and bool((candidate.get("chart_candle_batch") or {}).get("bars"))
+    chart_used = bool(preflight.get("chart_used") or score or id_fields.get("chart_intelligence_id") or has_render_batch)
     warnings = list(preflight.get("warnings") or [])
     errors = list(preflight.get("errors") or [])
     rendered_metadata = None
@@ -912,6 +915,37 @@ def build_close_event(position: dict[str, Any], closed: dict[str, Any], candle: 
     }
 
 
+def attach_entry_chart_batch(candidate: dict[str, Any], decision: dict[str, Any]) -> None:
+    """Demo helper: attach a fresh real closed-candle batch (+ indicator bundle)
+    to the candidate so chart_snapshot_summary can render an entry chart PNG
+    (candles + EMA20/50 + volume + SL/TP). Best-effort, never raises."""
+    try:
+        if candidate.get("chart_candle_batch"):
+            return
+        symbol = str(candidate.get("symbol") or "")
+        if not symbol:
+            return
+        from chart_candle_service import load_closed_candles
+        from chart_indicator_engine import compute_indicator_bundle
+
+        batch = load_closed_candles(symbol, EXIT_CANDLE_TIMEFRAME, utc_now(), limit=120)
+        if not (batch.get("bars") or []):
+            return
+        candidate["chart_candle_batch"] = batch
+        try:
+            candidate["chart_indicator_bundle"] = compute_indicator_bundle(batch)
+        except Exception:
+            pass
+        # Provide a minimal risk_plan (SL/TP) so the chart shows the trade bracket.
+        if not candidate.get("chart_risk_plan"):
+            sl = candidate.get("sl"); tp = candidate.get("tp")
+            if sl and tp:
+                candidate["chart_risk_plan"] = {"risk_plan_id": f"rp_{candidate.get('candidate_id','demo')}",
+                                                "sl": sl, "tp_ladder": [{"price": tp}]}
+    except Exception:
+        pass
+
+
 def try_open_latest_decision(account: dict[str, Any], market: dict[str, Any] | None = None) -> dict[str, Any] | None:
     latest = read_json(DECISION_LATEST, default={})
     decision = latest.get("decision") if isinstance(latest.get("decision"), dict) else {}
@@ -951,6 +985,9 @@ def try_open_latest_decision(account: dict[str, Any], market: dict[str, Any] | N
     if not opened.get("ok"):
         return {"action": "open_failed", "reason": opened.get("reason"), "risk_decision_id": risk_id, "candidate_id": candidate_id}
     position = opened["position"]
+    # Demo: attach a fresh real candle batch so the snapshot renderer can draw the
+    # entry chart (candles + EMA + volume + SL/TP). Best-effort; never blocks open.
+    attach_entry_chart_batch(candidate, decision)
     open_chart_evidence = chart_snapshot_summary(candidate, decision, position=position, stage="open", chart_preflight=chart_preflight)
     position = {
         **position,
