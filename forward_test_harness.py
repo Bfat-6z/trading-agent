@@ -166,6 +166,51 @@ def run_once(symbols: list[str] | None = None) -> dict[str, Any]:
             "total_labeled": summary["total_labeled"]}
 
 
+# --- supervised always-on loop (matches the fleet agent pattern) --------------
+import os
+
+PID_FILE = FT_DIR / "forward_test_harness.pid"
+STOP_FILE = FT_DIR / "forward_test_harness.stop"
+HEARTBEAT_PATH = FT_DIR / "forward_test_harness_heartbeat.json"
+
+
+def _write_heartbeat(last: dict[str, Any], status: str = "running") -> None:
+    import time as _time
+    from atomic_state import write_json_atomic
+    from timebase import utc_now
+    write_json_atomic(HEARTBEAT_PATH, {
+        "agent": "forward_test_harness", "pid": os.getpid(), "ts": utc_now(),
+        "updated_at": utc_now(), "status": status, "last_run": last,
+    })
+
+
+def _interruptible_sleep(seconds: float) -> bool:
+    import time as _time
+    deadline = _time.time() + max(0.0, seconds)
+    while _time.time() < deadline:
+        if STOP_FILE.exists():
+            return False
+        _time.sleep(min(1.0, max(0.0, deadline - _time.time())))
+    return not STOP_FILE.exists()
+
+
 if __name__ == "__main__":
-    result = run_once()
-    print(json.dumps(result, default=str))
+    import argparse
+    ap = argparse.ArgumentParser(description="Forward-test channel: record real order-flow snapshots + tag matured returns (paper-only)")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--interval-seconds", type=float, default=900.0)
+    args = ap.parse_args()
+    FT_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()), encoding="ascii")
+    if args.once:
+        print(json.dumps(run_once(), default=str))
+    else:
+        while not STOP_FILE.exists():
+            try:
+                res = run_once()
+            except Exception as exc:
+                res = {"error": str(exc)[:200]}
+            _write_heartbeat(res)
+            if not _interruptible_sleep(args.interval_seconds):
+                break
+        _write_heartbeat({}, status="stopped")
