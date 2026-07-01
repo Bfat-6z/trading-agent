@@ -49,6 +49,8 @@ BLOCK_PARAMS = {
     "bb_reversion": {"period": 20, "k": 2.0},
     "vwap_reversion": {"window": 48, "dist_atr": 1.0},
     "breakout_retest": {"lookback": 20, "tol_atr": 0.3, "break_within": 10},
+    "ts_momentum": {"lookback": 20},
+    "funding_zscore_fade": {"window": 48, "z": 2.0},
 }
 
 

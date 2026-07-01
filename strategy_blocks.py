@@ -328,6 +328,33 @@ def buy_frac_extreme(df: pd.DataFrame, direction: str, thresh: float = 0.6) -> p
 
 
 # ---------------------------------------------------------------------------
+# TIER-1 seeds (public/academic evidence; meta-loop Layer 1). No-lookahead.
+# ---------------------------------------------------------------------------
+
+def ts_momentum(df: pd.DataFrame, direction: str, lookback: int = 20) -> pd.Series:
+    """[T3] Time-series momentum (Liu-Tsyvinski): trailing return over `lookback`
+    bars > 0 => LONG regime, < 0 => SHORT. Causal: close[i]/close[i-lookback]-1
+    uses only past bars."""
+    ret = df["close"] / df["close"].shift(lookback) - 1.0
+    return (ret > 0).fillna(False) if direction == "LONG" else (ret < 0).fillna(False)
+
+
+def funding_zscore_fade(df: pd.DataFrame, direction: str, window: int = 48, z: float = 2.0) -> pd.Series:
+    """[T2] Funding z-score fade: z = (funding - trailing_mean)/trailing_std over
+    `window`. Very POSITIVE z (crowded longs) -> fade with SHORT; very NEGATIVE ->
+    LONG. Reads the enriched funding_rate column; rolling stats are causal. Distinct
+    from funding_extreme_contrarian (absolute threshold) — this is regime-relative."""
+    fr = _col_or_false(df, "funding_rate")
+    if fr is None:
+        return pd.Series(False, index=df.index)
+    mp = max(5, window // 2)
+    mean = fr.rolling(window, min_periods=mp).mean()
+    sd = fr.rolling(window, min_periods=mp).std()
+    zscore = (fr - mean) / sd.replace(0, float("nan"))
+    return (zscore <= -float(z)).fillna(False) if direction == "LONG" else (zscore >= float(z)).fillna(False)
+
+
+# ---------------------------------------------------------------------------
 # Block registry — name -> (callable, whether it needs `direction`)
 # ---------------------------------------------------------------------------
 
@@ -359,6 +386,9 @@ BLOCKS: dict[str, dict[str, Any]] = {
     "bb_reversion": {"fn": bb_reversion, "directional": True},
     "vwap_reversion": {"fn": vwap_reversion, "directional": True},
     "breakout_retest": {"fn": breakout_retest, "directional": True},
+    # Tier-1 seeds (meta-loop Layer 1)
+    "ts_momentum": {"fn": ts_momentum, "directional": True},
+    "funding_zscore_fade": {"fn": funding_zscore_fade, "directional": True},
 }
 
 
