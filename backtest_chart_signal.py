@@ -77,7 +77,9 @@ def _bars_to_df(bars: list[dict[str, Any]]) -> pd.DataFrame:
         "close": [float(b["close"]) for b in bars],
         "volume": [float(b.get("volume") or 0.0) for b in bars],
     })
-    df["ts_ms"] = pd.to_datetime(df["close_time"], utc=True).astype("int64") // 1_000_000
+    # close_time -> epoch milliseconds, unit-safe (pandas may use us/ns dtype).
+    dt = pd.to_datetime(df["close_time"], utc=True).dt.tz_localize(None)
+    df["ts_ms"] = (dt.astype("datetime64[ms]").astype("int64"))
     return df
 
 
