@@ -210,12 +210,27 @@ def variance_of_trial_sharpes(sweep_results: list[dict[str, Any]]) -> float:
     return sum((s - mean) ** 2 for s in srs) / (len(srs) - 1)
 
 
+MIN_CANDIDATE_TRADES = 300     # a candidate must be statistically meaningful
+
+
 def pick_best(sweep_results: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Best in-sample candidate by expectancy_r, then profit_factor."""
-    ranked = sorted(sweep_results, key=lambda r: (float(r["in_sample"].get("expectancy_r", -9) or -9),
-                                                  float(r["in_sample"].get("profit_factor", 0) or 0)),
-                    reverse=True)
-    return ranked[0] if ranked else None
+    """Best STATISTICALLY MEANINGFUL in-sample candidate. Ranking by raw
+    expectancy alone always crowns a 2-trade fluke (huge exp, pure noise) that the
+    gate then kills — so we never evaluate the promising high-sample specs. Prefer
+    specs with >= MIN_CANDIDATE_TRADES, ranked by expectancy then profit_factor.
+    If none clear the floor, fall back to the highest-sample spec (the most
+    meaningful attempt) so the report reflects a real candidate, not a fluke."""
+    def key(r):
+        return (float(r["in_sample"].get("expectancy_r", -9) or -9),
+                float(r["in_sample"].get("profit_factor", 0) or 0))
+    qualified = [r for r in sweep_results
+                 if int(r["in_sample"].get("trades", 0) or 0) >= MIN_CANDIDATE_TRADES]
+    if qualified:
+        return sorted(qualified, key=key, reverse=True)[0]
+    if not sweep_results:
+        return None
+    # nothing had enough trades -> report the best-sampled attempt
+    return sorted(sweep_results, key=lambda r: int(r["in_sample"].get("trades", 0) or 0), reverse=True)[0]
 
 
 def evaluate_candidate(best: dict[str, Any], sweep_results: list[dict[str, Any]],

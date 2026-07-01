@@ -62,6 +62,20 @@ def test_cross_consistency_counts_symbols_and_subperiods():
     assert cc["positive_subperiods"] >= 3
 
 
+def test_pick_best_prefers_meaningful_sample_over_fluke():
+    fluke = {"spec_id": "fluke", "in_sample": {"expectancy_r": 2.0, "profit_factor": 9.0, "trades": 3}}
+    solid = {"spec_id": "solid", "in_sample": {"expectancy_r": 0.15, "profit_factor": 1.3, "trades": 500}}
+    best = og.pick_best([fluke, solid])
+    assert best["spec_id"] == "solid", "must not crown a 3-trade fluke over a 500-trade candidate"
+
+
+def test_pick_best_falls_back_to_most_sampled_when_none_qualify():
+    a = {"spec_id": "a", "in_sample": {"expectancy_r": 1.0, "trades": 10}}
+    b = {"spec_id": "b", "in_sample": {"expectancy_r": -0.1, "trades": 120}}
+    best = og.pick_best([a, b])
+    assert best["spec_id"] == "b", "with no spec >=300 trades, report the best-sampled attempt"
+
+
 def test_gate_kills_when_any_check_fails():
     # a candidate with great in-sample numbers but only 1 positive symbol
     best = {
