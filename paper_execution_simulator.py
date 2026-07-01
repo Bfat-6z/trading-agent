@@ -76,7 +76,8 @@ def simulate_entry_order(
     fee_rate = TAKER_FEE_RATE
     reason = "unfilled"
     # Phase 2: market entry pays tiered slippage + half-spread (pessimistic).
-    entry_bps = fill_bps(liquidity_tier(quote_volume)) if quote_volume is not None else DEFAULT_SLIPPAGE_BPS
+    # Missing quote_volume -> "micro" tier (most expensive), never the cheap default.
+    entry_bps = fill_bps(liquidity_tier(quote_volume))
     if order_type == "market":
         filled = True
         fill_price = adverse_slippage(open_price if open_price > 0 else requested, side_up, entry_bps)
@@ -155,7 +156,9 @@ def simulate_exit(
     tp_dec = dec(tp)
     # Phase 2: pessimistic tiered costs. SL is a stop-market (worse slippage);
     # TP is treated as a market exit at the level; liquidation now also slips.
-    tier = liquidity_tier(quote_volume) if quote_volume is not None else "major"
+    # Missing quote_volume -> "micro" (most expensive): unknown liquidity is
+    # treated pessimistically, never given the cheap "major" tier by default.
+    tier = liquidity_tier(quote_volume)
     sl_bps = fill_bps(tier, is_stop=True)
     mkt_bps = fill_bps(tier)
     liq = liquidation_price(entry_dec, side_up, leverage, quote_volume=quote_volume)
@@ -224,8 +227,11 @@ def apply_funding_payment(account: dict[str, Any], notional: Any, funding_rate: 
 def simulate_round_trip(trade: dict[str, Any], candles: list[dict[str, Any]], append_order: bool = True) -> dict[str, Any]:
     if not candles:
         return {"status": "skipped", "reason": "missing_candles"}
-    entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=append_order)
+    # Phase 2 lockstep: tier off the trade's 24h quote volume (fall back to
+    # candle quote_volume, never base volume). Missing -> None -> micro (pessimistic).
+    quote_volume = trade.get("quote_volume") or candles[0].get("quote_volume")
+    entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=append_order, quote_volume=quote_volume)
     if entry["status"] not in {"filled", "partial"}:
         return {**entry, "trade_status": "not_opened"}
-    exit_row = simulate_exit(trade["side"], entry["fill_price"], entry.get("filled_qty") or trade["qty"], trade["sl"], trade["tp"], candles[1:] or candles, trade.get("leverage", "1"))
+    exit_row = simulate_exit(trade["side"], entry["fill_price"], entry.get("filled_qty") or trade["qty"], trade["sl"], trade["tp"], candles[1:] or candles, trade.get("leverage", "1"), quote_volume=quote_volume)
     return {"entry_order": entry, "exit": exit_row, "trade_status": exit_row.get("status")}

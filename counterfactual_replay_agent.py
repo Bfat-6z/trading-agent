@@ -221,7 +221,7 @@ def _mark_to_market_exit(side: str, entry: Any, qty: Any, exit_price: Any, ts: A
 def _simulate_time_exit(trade: dict[str, Any], candles: list[dict[str, Any]]) -> dict[str, Any]:
     if not candles:
         return {"status": "skipped", "reason": "missing_candles"}
-    quote_volume = trade.get("quote_volume") or candles[0].get("volume")
+    quote_volume = trade.get("quote_volume") or candles[0].get("quote_volume")
     entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=False, quote_volume=quote_volume)
     if entry["status"] not in {"filled", "partial"}:
         return {**entry, "trade_status": "not_opened"}
@@ -234,7 +234,7 @@ def _simulate_time_exit(trade: dict[str, Any], candles: list[dict[str, Any]]) ->
 def _simulate_trailing_1r(trade: dict[str, Any], candles: list[dict[str, Any]]) -> dict[str, Any]:
     if not candles:
         return {"status": "skipped", "reason": "missing_candles"}
-    quote_volume = trade.get("quote_volume") or candles[0].get("volume")
+    quote_volume = trade.get("quote_volume") or candles[0].get("quote_volume")
     entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=False, quote_volume=quote_volume)
     if entry["status"] not in {"filled", "partial"}:
         return {**entry, "trade_status": "not_opened"}
@@ -246,6 +246,10 @@ def _simulate_trailing_1r(trade: dict[str, Any], candles: list[dict[str, Any]]) 
     tp = dec(trade["tp"])
     risk = abs(entry_price - active_sl)
     liq = liquidation_price(entry_price, side, trade.get("leverage", "1"), quote_volume=quote_volume)
+    # Phase 2 lockstep: tiered exit costs (stop-market slips worse than market).
+    _tier = cost_liquidity_tier(quote_volume)
+    _sl_bps = cost_fill_bps(_tier, is_stop=True)
+    _mkt_bps = cost_fill_bps(_tier)
 
     for candle in candles[1:] or candles:
         open_price = dec(candle.get("open"))
@@ -258,10 +262,10 @@ def _simulate_trailing_1r(trade: dict[str, Any], candles: list[dict[str, Any]]) 
                 close = min(open_price, liq) if open_price < entry_price else liq
                 reason = "liquidation"
             elif low <= active_sl:
-                close = exit_slippage(open_price if open_price < active_sl else active_sl, side)
+                close = exit_slippage(open_price if open_price < active_sl else active_sl, side, _sl_bps)
                 reason = "trailing_sl" if active_sl == entry_price else "sl"
             elif high >= tp:
-                close = exit_slippage(tp, side)
+                close = exit_slippage(tp, side, _mkt_bps)
                 reason = "tp"
             else:
                 continue
@@ -273,10 +277,10 @@ def _simulate_trailing_1r(trade: dict[str, Any], candles: list[dict[str, Any]]) 
                 close = max(open_price, liq) if open_price > entry_price else liq
                 reason = "liquidation"
             elif high >= active_sl:
-                close = exit_slippage(open_price if open_price > active_sl else active_sl, side)
+                close = exit_slippage(open_price if open_price > active_sl else active_sl, side, _sl_bps)
                 reason = "trailing_sl" if active_sl == entry_price else "sl"
             elif low <= tp:
-                close = exit_slippage(tp, side)
+                close = exit_slippage(tp, side, _mkt_bps)
                 reason = "tp"
             else:
                 continue

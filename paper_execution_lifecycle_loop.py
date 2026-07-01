@@ -1000,7 +1000,11 @@ def monitor_open_positions(account: dict[str, Any], market: dict[str, Any], max_
                 results.append({"action": "monitor_wait", "position_id": position.get("position_id"), "reason": "missing_mark_price"})
                 continue
             position = append_replay_candle(position, candle)
-            close_plan = {"reason": "missing_mark_price_timeout", "exit": dec(candle.get("close"))}
+            # Phase 2: this fallback timeout is still a market close -> apply
+            # tiered slippage (was 0, a hidden optimism vector).
+            _tier = cost_liquidity_tier(position.get("quote_volume") or candle.get("volume"))
+            _to_exit = cost_exit_slippage(dec(candle.get("close")), str(position.get("side") or ""), cost_fill_bps(_tier))
+            close_plan = {"reason": "missing_mark_price_timeout", "exit": _to_exit, "liquidity_tier": _tier, "exit_price_source": "timeout_fallback"}
         else:
             position = append_replay_candle(position, candle)
             close_plan = should_close(position, candle, max_hold_seconds=max_hold_seconds)

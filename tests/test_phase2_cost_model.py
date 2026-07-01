@@ -20,16 +20,19 @@ def test_cost_ordering_micro_worse_than_major():
     assert cm.mmr_for("micro") >= cm.mmr_for("major")
 
 
-def test_new_model_is_never_cheaper_than_old_flat_2bps():
-    """Monotonic-cost guarantee: for every tier, a TP exit under the new model
-    fills no better than the legacy flat-2bps path (we removed optimism, not
-    added it)."""
+def test_cost_monotonic_across_tiers_and_missing_is_micro():
+    """Worse liquidity = worse fill (higher cost). And MISSING quote_volume must
+    fall to the most-expensive micro tier, never the cheap major default —
+    unknown liquidity is treated pessimistically."""
     candle = {"ts": "t", "open": "100.5", "high": "103", "low": "99.5", "close": "100.8"}
-    legacy = sim.simulate_exit("LONG", "100", "1", "98", "102", [candle], "10")  # no quote_volume -> legacy 2bps
-    for qv in (1_000_000_000, 100_000_000, 1_000_000):
-        new = sim.simulate_exit("LONG", "100", "1", "98", "102", [candle], "10", quote_volume=qv)
-        # LONG TP: lower exit = worse fill = higher cost
-        assert Decimal(new["exit"]) <= Decimal(legacy["exit"]), f"tier {qv} exit better than legacy"
+    major = Decimal(sim.simulate_exit("LONG", "100", "1", "98", "102", [candle], "10", quote_volume=1_000_000_000)["exit"])
+    mid = Decimal(sim.simulate_exit("LONG", "100", "1", "98", "102", [candle], "10", quote_volume=100_000_000)["exit"])
+    micro = Decimal(sim.simulate_exit("LONG", "100", "1", "98", "102", [candle], "10", quote_volume=1_000_000)["exit"])
+    missing = Decimal(sim.simulate_exit("LONG", "100", "1", "98", "102", [candle], "10")["exit"])
+    # LONG TP: lower exit = worse fill. micro worst, major best.
+    assert micro < mid < major
+    # missing quote_volume must equal the micro (pessimistic) fill, not major.
+    assert missing == micro
 
 
 def test_stop_exit_costs_more_than_market_exit_same_tier():
