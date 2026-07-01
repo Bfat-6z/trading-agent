@@ -200,10 +200,13 @@ def plateau_check(sweep_results: list[dict[str, Any]], best_spec_id: str,
 # ---------------------------------------------------------------------------
 
 def variance_of_trial_sharpes(sweep_results: list[dict[str, Any]]) -> float:
-    """Var of per-trial Sharpe proxies across the sweep, for E[max SR]. Use
-    expectancy_r / sqrt of variance proxy; here we approximate each trial's SR by
-    its in-sample expectancy_r (already risk-normalized R units)."""
-    srs = [float(r["in_sample"].get("expectancy_r", 0) or 0) for r in sweep_results]
+    """Var of per-cell SHARPE across the sweep, for E[max SR] (Bailey/LdP).
+    Must use each cell's Sharpe (mean/std of R), NOT its expectancy_r (mean-R):
+    using mean-R understates the spread of Sharpes for high-win-rate/low-std
+    shapes, which deflates SR0 and makes the gate too easy. Falls back to
+    expectancy_r only for old rows that predate the `sharpe` field."""
+    srs = [float(r["in_sample"].get("sharpe", r["in_sample"].get("expectancy_r", 0)) or 0)
+           for r in sweep_results]
     if len(srs) < 2:
         return 0.0
     mean = sum(srs) / len(srs)

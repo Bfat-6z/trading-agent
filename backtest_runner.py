@@ -73,6 +73,7 @@ def metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
     ci = block_bootstrap_ci(rs)
     sd = (sum((r - ci["mean"]) ** 2 for r in rs) / len(rs)) ** 0.5 if len(rs) > 1 else 0.0
     tstat = (ci["mean"] / (sd / math.sqrt(len(rs)))) if sd > 0 else 0.0
+    sharpe = (ci["mean"] / sd) if sd > 0 else 0.0   # per-trade Sharpe (mean/std of R)
     return {
         "trades": len(rs),
         "win_rate": len(wins) / len(rs),
@@ -83,6 +84,8 @@ def metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
         "total_r": sum(rs),
         "max_drawdown_r": mdd,
         "tstat": tstat,
+        "std_r": sd,
+        "sharpe": sharpe,
     }
 
 
