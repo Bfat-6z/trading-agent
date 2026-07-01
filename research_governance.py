@@ -30,6 +30,12 @@ import strategy_compiler as sc
 ROOT = Path(__file__).resolve().parent
 HOLDOUT_BUDGET_PATH = ROOT / "state" / "agent_memory" / "holdout_budget.jsonl"
 
+# Distinct specs already evaluated on the public-TA/flow family BEFORE the
+# per-run sweep_trials field existed (liq_sweep 768 + Family A 576 + liqsweep2 768
+# + final batch 84*... ~2196). Pre-field ledger rows lack sweep_trials, so we
+# credit their history once via this baseline instead of re-parsing them.
+BASELINE_PRIOR_TRIALS = 2196
+
 # blocks that require an enriched (CVD/funding) df; a holdout peek on these MUST
 # use enriched precomputed dfs, never the plain backtest_symbol fallback.
 ORDER_FLOW_BLOCKS = {"cvd_aggression", "cvd_reversal", "funding_extreme_contrarian", "buy_frac_extreme"}
@@ -38,12 +44,14 @@ ORDER_FLOW_BLOCKS = {"cvd_aggression", "cvd_reversal", "funding_extreme_contrari
 # --- 1. GLOBAL cumulative trial count -----------------------------------------
 
 def global_trial_count(ledger_path: Path = rl.LEDGER_PATH) -> int:
-    """Sum n_trials across every ledger row = total distinct specs ever evaluated.
-    Feeds the DSR so the multiple-testing penalty is cumulative, not per-run."""
-    total = 0
+    """Total distinct specs ever evaluated = BASELINE (pre-field history) + sum of
+    each row's OWN sweep_trials (new specs that run). Summing per-run counts (not
+    the stored cumulative n_trials) avoids a re-summing feedback blowup. Feeds the
+    DSR so the multiple-testing penalty is cumulative across all time, not per-run."""
+    total = BASELINE_PRIOR_TRIALS
     for row in rl.load_rows(ledger_path):
         try:
-            total += int(row.get("n_trials", 0) or 0)
+            total += int(row.get("sweep_trials", 0) or 0)
         except Exception:
             continue
     return total

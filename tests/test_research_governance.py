@@ -29,12 +29,13 @@ SPEC = {"name": "t", "direction": "SHORT",
         "exit": {"sl_atr": 1.5, "tp_atr": 3.0}}
 
 
-def test_global_trial_count_sums_ledger(tmp_path):
+def test_global_trial_count_sums_sweep_trials_plus_baseline(tmp_path):
     lp = tmp_path / "led.jsonl"
-    rl.append_row({"family": "a", "n_trials": 128, "verdict": "KILL"}, ledger_path=lp)
-    rl.append_row({"family": "b", "n_trials": 320, "verdict": "KILL"}, ledger_path=lp)
-    rl.append_row({"family": "c", "verdict": "KILL"}, ledger_path=lp)  # missing n_trials -> 0
-    assert rg.global_trial_count(ledger_path=lp) == 448
+    rl.append_row({"family": "a", "sweep_trials": 128, "n_trials": 128, "verdict": "KILL"}, ledger_path=lp)
+    rl.append_row({"family": "b", "sweep_trials": 192, "n_trials": 320, "verdict": "KILL"}, ledger_path=lp)
+    rl.append_row({"family": "c", "verdict": "KILL"}, ledger_path=lp)  # no sweep_trials -> 0 (baseline covers)
+    # sums OWN per-run counts (128+192), NOT the cumulative n_trials (avoids blowup)
+    assert rg.global_trial_count(ledger_path=lp) == rg.BASELINE_PRIOR_TRIALS + 320
 
 
 def test_holdout_budget_peek_once(tmp_path):

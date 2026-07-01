@@ -59,7 +59,7 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
     best = og.pick_best(sweep["results"])
     if best is None:
         return _finalize(family, entry_tf, n_trials, None, None, None, stamped_at,
-                         reason="no_specs")
+                         reason="no_specs", run_trials=sweep["n_trials"])
 
     # RUNTIME NO-LOOKAHEAD GUARD: a (possibly self-generated) winning spec that
     # repaints would win in-sample by cheating. Re-check the best spec across all
@@ -68,7 +68,8 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
     guard = rg.guard_spec_across_symbols(best["spec"], guard_pre)
     if not guard["clean"]:
         return _finalize(family, entry_tf, n_trials, best, None, None, stamped_at,
-                         final_verdict="KILL", reason=f"lookahead_guard_failed:{guard['mismatches']}mismatch")
+                         final_verdict="KILL", reason=f"lookahead_guard_failed:{guard['mismatches']}mismatch",
+                         run_trials=sweep["n_trials"])
 
     verdict = og.evaluate_candidate(best, sweep["results"], n_trials)
     holdout = None
@@ -95,17 +96,22 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
         reason = holdout.get("reason") or ("passed_all_gates" if final_verdict == "PASS" else "failed_sealed_holdout")
 
     return _finalize(family, entry_tf, n_trials, best, verdict, holdout, stamped_at,
-                     final_verdict=final_verdict, reason=reason, sweep=sweep)
+                     final_verdict=final_verdict, reason=reason, sweep=sweep,
+                     run_trials=sweep["n_trials"])
 
 
 def _finalize(family, entry_tf, n_trials, best, verdict, holdout, stamped_at,
-              *, final_verdict="KILL", reason="no_edge", sweep=None) -> dict[str, Any]:
+              *, final_verdict="KILL", reason="no_edge", sweep=None, run_trials=0) -> dict[str, Any]:
     direction = (best["spec"].get("direction") if best else "?")
     row = {
         "stamped_at": stamped_at,
         "family": family,
         "timeframe": entry_tf,
         "direction": direction,
+        # sweep_trials = NEW specs tested THIS run (what global_trial_count sums);
+        # n_trials = cumulative-at-run-time (for the DSR record + display). Storing
+        # the cumulative in sweep_trials would create a re-summing feedback blowup.
+        "sweep_trials": int(run_trials),
         "n_trials": n_trials,
         "spec_id": (best["spec_id"] if best else None),
         "spec": (best["spec"] if best else None),
