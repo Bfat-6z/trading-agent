@@ -226,6 +226,58 @@ def retest_broken_level(df: pd.DataFrame, direction: str, swing_lookback: int = 
 
 
 # ---------------------------------------------------------------------------
+# ORDER-FLOW (Family A: CVD + funding). These read columns added by
+# orderflow_data (cvd_delta_norm, buy_frac, funding_rate). All are no-lookahead
+# because those columns are themselves causal. If a column is absent (df not
+# enriched) the block returns all-False (safe no-op).
+# ---------------------------------------------------------------------------
+
+def _col_or_false(df: pd.DataFrame, col: str) -> pd.Series | None:
+    if col not in df.columns:
+        return None
+    return df[col]
+
+
+def cvd_aggression(df: pd.DataFrame, direction: str, min_norm: float = 0.5) -> pd.Series:
+    """Volume-delta aggression in the trade direction: net taker BUYING (>= +min)
+    supports LONG, net taker SELLING (<= -min) supports SHORT. Uses cvd_delta_norm
+    (per-bar CVD normalized by trailing volume)."""
+    c = _col_or_false(df, "cvd_delta_norm")
+    if c is None:
+        return pd.Series(False, index=df.index)
+    return (c >= float(min_norm)) if direction == "LONG" else (c <= -float(min_norm))
+
+
+def cvd_reversal(df: pd.DataFrame, direction: str, min_norm: float = 0.5) -> pd.Series:
+    """Aggression FLIP: the prior bar pushed against the trade, the current bar
+    flips in-favor — buyers/sellers exhausted then reversed."""
+    c = _col_or_false(df, "cvd_delta_norm")
+    if c is None:
+        return pd.Series(False, index=df.index)
+    prev = c.shift(1)
+    if direction == "LONG":
+        return (prev <= -float(min_norm)) & (c >= float(min_norm))
+    return (prev >= float(min_norm)) & (c <= -float(min_norm))
+
+
+def funding_extreme_contrarian(df: pd.DataFrame, direction: str, min_rate: float = 0.0003) -> pd.Series:
+    """Crowd-imbalance contrarian: very POSITIVE funding = crowded longs -> fade
+    with SHORT; very NEGATIVE funding = crowded shorts -> fade with LONG."""
+    c = _col_or_false(df, "funding_rate")
+    if c is None:
+        return pd.Series(False, index=df.index)
+    return (c <= -float(min_rate)) if direction == "LONG" else (c >= float(min_rate))
+
+
+def buy_frac_extreme(df: pd.DataFrame, direction: str, thresh: float = 0.6) -> pd.Series:
+    """Taker buy fraction of volume beyond a threshold in the trade direction."""
+    c = _col_or_false(df, "buy_frac")
+    if c is None:
+        return pd.Series(False, index=df.index)
+    return (c >= float(thresh)) if direction == "LONG" else (c <= (1.0 - float(thresh)))
+
+
+# ---------------------------------------------------------------------------
 # Block registry — name -> (callable, whether it needs `direction`)
 # ---------------------------------------------------------------------------
 
@@ -248,6 +300,11 @@ BLOCKS: dict[str, dict[str, Any]] = {
     "retest_broken_level": {"fn": retest_broken_level, "directional": True},
     # htf_bias_po3 needs the HTF dataframe -> handled specially in evaluate_block
     "htf_bias_po3": {"fn": htf_bias_po3, "directional": True, "needs_htf": True},
+    # Order-flow family A (CVD + funding; read enriched columns)
+    "cvd_aggression": {"fn": cvd_aggression, "directional": True},
+    "cvd_reversal": {"fn": cvd_reversal, "directional": True},
+    "funding_extreme_contrarian": {"fn": funding_extreme_contrarian, "directional": True},
+    "buy_frac_extreme": {"fn": buy_frac_extreme, "directional": True},
 }
 
 

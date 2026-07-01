@@ -43,11 +43,16 @@ def fetch_datasets(client: Any, symbols: list[str], entry_tf: str, htf_tf: str,
 def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, Any]],
                param_grid: dict[str, list[Any]], datasets: dict[str, dict[str, Any]],
                *, entry_tf: str, split_ts_ms: int, stamped_at: str,
-               direction_of: Callable[[dict[str, Any]], str] | None = None) -> dict[str, Any]:
-    """Full pipeline for one family on one timeframe. Writes ledger + report."""
+               direction_of: Callable[[dict[str, Any]], str] | None = None,
+               precomputed: dict[str, dict[str, Any]] | None = None,
+               n_trials_offset: int = 0) -> dict[str, Any]:
+    """Full pipeline for one family on one timeframe. Writes ledger + report.
+    `precomputed` supplies enriched indicator dfs (Family A CVD/funding).
+    `n_trials_offset` adds prior cumulative trials to the DSR multiple-testing
+    correction (honest cumulative count when a family is re-swept/loosened)."""
     sweep = sw.run_sweep(spec_factory, param_grid, datasets, split_ts_ms,
-                         sweep_name=f"{family}_{entry_tf}")
-    n_trials = sweep["n_trials"]
+                         sweep_name=f"{family}_{entry_tf}", precomputed=precomputed)
+    n_trials = sweep["n_trials"] + int(n_trials_offset)
     best = og.pick_best(sweep["results"])
     if best is None:
         return _finalize(family, entry_tf, n_trials, None, None, None, stamped_at,
@@ -58,7 +63,7 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
     if verdict["pre_holdout_pass"]:
         # THE single sealed-holdout peek, for the best survivor only
         holdout = og.peek_holdout_once(best["spec"], datasets, split_ts_ms,
-                                       exit_cfg=best["spec"].get("exit"))
+                                       exit_cfg=best["spec"].get("exit"), precomputed=precomputed)
     final_verdict = "KILL"
     reason = "failed_in_sample_overfit_gate"
     if verdict["pre_holdout_pass"] and holdout:

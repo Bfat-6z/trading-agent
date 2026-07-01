@@ -252,18 +252,30 @@ def evaluate_candidate(best: dict[str, Any], sweep_results: list[dict[str, Any]]
 
 
 def peek_holdout_once(spec: dict[str, Any], datasets: dict[str, dict[str, Any]],
-                      split_ts_ms: int, exit_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+                      split_ts_ms: int, exit_cfg: dict[str, Any] | None = None,
+                      precomputed: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """THE single sealed-holdout peek for one candidate. Run only AFTER
-    pre_holdout_pass. Returns holdout metrics + a KILL/PASS verdict."""
-    signal_fn = sc.compile_spec(spec)
+    pre_holdout_pass. Returns holdout metrics + a KILL/PASS verdict. Uses the fast
+    mask path; `precomputed` supplies enriched indicator dfs (needed for Family A
+    CVD/funding columns) so the holdout is evaluated on the same feature set."""
     cfg = exit_cfg if exit_cfg is not None else spec.get("exit")
     trades: list[dict[str, Any]] = []
-    for sym, d in datasets.items():
-        tr = cs.backtest_symbol(d["bars_5m"], d["bars_1h"], d["quote_volume_24h"],
-                                start_ts_ms=split_ts_ms, signal_fn=signal_fn, exit_cfg=cfg)
-        for t in tr:
-            t["symbol"] = sym
-        trades.extend(tr)
+    if precomputed is not None:
+        for sym, p in precomputed.items():
+            mask = sc.compute_mask(spec, p["df"], p["df_1h"])
+            tr = cs.backtest_with_mask(p["df"], p["quote_volume_24h"], mask, spec["direction"],
+                                       start_ts_ms=split_ts_ms, exit_cfg=cfg)
+            for t in tr:
+                t["symbol"] = sym
+            trades.extend(tr)
+    else:
+        signal_fn = sc.compile_spec(spec)
+        for sym, d in datasets.items():
+            tr = cs.backtest_symbol(d["bars_5m"], d["bars_1h"], d["quote_volume_24h"],
+                                    start_ts_ms=split_ts_ms, signal_fn=signal_fn, exit_cfg=cfg)
+            for t in tr:
+                t["symbol"] = sym
+            trades.extend(tr)
     purged = purge_overlaps(trades)
     m = br.metrics(purged)
     cc = cross_consistency(purged)

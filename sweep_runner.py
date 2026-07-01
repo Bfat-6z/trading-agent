@@ -96,11 +96,14 @@ def run_sweep(spec_factory: Callable[[dict[str, Any]], dict[str, Any]],
               param_grid: dict[str, list[Any]],
               datasets: dict[str, dict[str, Any]],
               split_ts_ms: int,
-              *, sweep_name: str = "sweep") -> dict[str, Any]:
+              *, sweep_name: str = "sweep",
+              precomputed: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Enumerate + backtest every spec IN-SAMPLE. Returns all results + honest
-    N-trial count. Writes a compact log (no holdout access)."""
+    N-trial count. Writes a compact log (no holdout access). `precomputed` lets a
+    caller supply enriched indicator dfs (e.g. Family A with CVD/funding columns)."""
     specs = build_specs(spec_factory, param_grid)
-    precomputed = precompute_indicator_dfs(datasets)   # once, reused across all specs
+    if precomputed is None:
+        precomputed = precompute_indicator_dfs(datasets)   # once, reused across all specs
     results = []
     for spec in specs:
         res = backtest_spec_in_sample(spec, datasets, split_ts_ms, precomputed=precomputed)

@@ -22,6 +22,11 @@ _TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d"
 _MAX_LIMIT = 1000
 
 
+def _iso_ms(ms: int) -> str:
+    import datetime
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat(timespec="seconds")
+
+
 def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms: int,
                            client: Any, sleep_between: float = 0.02) -> list[dict[str, Any]]:
     """Page CLOSED klines and KEEP taker-buy volume so CVD can be computed. Only
@@ -44,7 +49,10 @@ def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms
                 continue
             open_time = int(r[0])
             seen[open_time] = {
-                "open_time": open_time, "close_time": close_time, "ts_ms": close_time,
+                # ISO strings so compute_indicators parses ts_ms correctly; ts_ms
+                # int kept for compute_cvd_columns. Both built from these same bars.
+                "open_time": _iso_ms(open_time), "close_time": _iso_ms(close_time),
+                "ts_ms": close_time,
                 "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4]),
                 "volume": float(r[5]), "quote_volume": float(r[7]),
                 "taker_buy_base": float(r[9]), "taker_buy_quote": float(r[10]),
@@ -102,6 +110,36 @@ def fetch_funding_series(symbol: str, *, months: float, end_ms: int, client: Any
         if len(rows) < 1000:
             break
     return [{"fundingTime": t, "fundingRate": seen[t]} for t in sorted(seen)]
+
+
+CVD_COLS = ("cvd_delta", "buy_frac", "cvd_roll20", "cvd_delta_norm", "funding_rate")
+
+
+def enrich_indicator_df(indicator_df: pd.DataFrame, flow_bars: list[dict[str, Any]],
+                        funding: list[dict[str, Any]]) -> pd.DataFrame:
+    """Attach CVD + funding columns to an indicator df (from compute_indicators).
+    The indicator df and the flow bars are built from the SAME klines in ascending
+    time order, so alignment is positional when lengths match (robust to differing
+    ts_ms parsing between paths); otherwise fall back to a ts_ms join. No-lookahead:
+    cvd columns are per-bar causal, funding joined point-in-time."""
+    flow = compute_cvd_columns(flow_bars)
+    flow = join_funding_point_in_time(flow, funding)
+    out = indicator_df.copy().reset_index(drop=True)
+    if flow.empty:
+        for col in CVD_COLS:
+            out[col] = 0.0 if col == "funding_rate" else float("nan")
+        return out
+    if len(flow) == len(out):
+        for col in CVD_COLS:
+            out[col] = flow[col].to_numpy() if col in flow.columns else float("nan")
+        return out
+    # length mismatch -> align by ts_ms (assumes both ts_ms are true epoch ms)
+    flow_idx = flow.set_index("ts_ms")
+    ts = out["ts_ms"].to_numpy()
+    for col in CVD_COLS:
+        src = flow_idx[col] if col in flow_idx.columns else None
+        out[col] = ([src.get(t, float("nan")) for t in ts] if src is not None else float("nan"))
+    return out
 
 
 def join_funding_point_in_time(df: pd.DataFrame, funding: list[dict[str, Any]]) -> pd.DataFrame:
