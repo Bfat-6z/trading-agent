@@ -51,9 +51,41 @@ shortcut to live.
   noise instead of hiding it.
 - **Sealed holdout, peeked once:** never burned — still available for a real edge.
 
-## What this means
-No tradeable edge yet — expected. The harness now lets us test new hypotheses
-cheaply and honestly. Next candidate families (owner's call): mean-reversion
-bands, genuine breakout-retest, or CVD/funding as a FILTER on a chart setup
-rather than a standalone signal. Everything stays paper-only; live_guard intact;
-ALLOW_LIVE_ORDERS never set.
+### 4. Final batch — mean-reversion + breakout + order-flow AS FILTER
+- Direction 1 (CVD/funding as a FILTER on a chart setup) + direction 2
+  (BB/VWAP reversion, breakout-retest), 1h/4h, cumulative N=2196 trials (DSR
+  penalized for the WHOLE family search, not reset).
+- **KILL, all cells, adequate sample:** short 1h −0.017R (1438), long 1h −0.10R
+  (1159, best=bb_reversion), short 4h +0.06R (434, DSR=0), long 4h −0.09R (1172,
+  best=vwap_reversion). **The order-flow filter did NOT rescue any base setup.**
+
+## FAMILY-LEVEL VERDICT: public TA + order-flow on liquid perps has NO EDGE
+
+Across **6 hypothesis families** — EMA pullback, liquidity-sweep/SMC, CVD+funding
+(standalone), Bollinger reversion, VWAP reversion, breakout-retest, plus
+CVD/funding used as a FILTER on all of them — swept with **~2196 cumulative
+config-trials** producing **~11,000+ evaluated trades** on the best-sampled cells,
+the result is uniform: **KILL**. Best in-sample expectancy anywhere with adequate
+sample is ≈ +0.06R (4h short) and it is **not DSR-significant** after
+multiple-testing correction. The sealed holdout was **never peeked** — nothing
+passed the in-sample gate.
+
+Conclusion: **public, backtestable technical + order-flow signals do NOT give this
+bot a tradeable edge on liquid perpetuals.** This is proven, not assumed.
+
+### Recommendation (honoring the plan's KILL criterion — do NOT grind more combos)
+- **(a) Pivot to the ONE untested angle: forward-test order-book / liquidation /
+  whale flow.** That data has NO public history (can't be backtested), so it was
+  never in the sweep — it is the only edge source not yet ruled out. It requires
+  weeks of wall-clock forward-paper accrual (`forward_test_harness`, clock already
+  started, MIN_SAMPLE=200) and is HIGHER risk. Never jump to live from lack of
+  history.
+- **(b) Otherwise, accept this bot as safe research infrastructure + a boss demo,
+  NOT a profit machine.** The harness (blocks → compiler → sweep → DSR overfit
+  gate → sealed holdout → ledger) is a genuine asset for cheaply/honestly killing
+  future hypotheses; the paper agent + dashboard + per-trade charts are a real
+  demo. But on public TA/flow it has no edge, and grinding more parameter combos
+  on the same family would only manufacture overfit — which the gate is built to
+  refuse.
+
+Everything stays paper-only; live_guard intact; ALLOW_LIVE_ORDERS never set.
