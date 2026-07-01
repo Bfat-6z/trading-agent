@@ -126,6 +126,34 @@ Per audit + red-team, these consume effort/MB and touch **zero** trade decisions
 - No live capital risked unless Phase 4-5 gates hold on out-of-sample forward paper.
 - Every claim of "done" backed by a runnable test or a measured number, not a narrative.
 
-## 8. First action
+## 8. Repo layout note (decided 2026-07-01)
 
-Start Phase 0: diagnose and fix the pytest hang, write the baseline report. That is the smallest step that makes every later measurement trustworthy.
+`tradingagents_crypto_src/` is a **separate nested git repo** (118 core files:
+binance client/futures, LLM clients, data adapters) that the main repo ignores
+(`.gitignore:36`). Everything in the main repo imports from it (`from tradingagents...`).
+Decision: **leave it out of the public repo** (owner: "bỏ qua"). Consequences:
+- The live-order guard (`live_guard.py` + guarded `client.py`/`futures.py`) lives
+  there, so it is enforced at **runtime on the local machine** (verified) but is
+  **not** in the public GitHub repo.
+- The public repo therefore is not independently runnable; Claude-web sees the
+  orchestration layer but not the binance/LLM/data core. Acceptable per owner.
+- `tests/test_live_guard.py` is committed publicly but imports the local-only
+  module; it passes locally, would error on a bare public clone. Non-blocking.
+- `plans/**/reports/` stays gitignored (baseline + audit artifacts are local).
+
+## 9. Phase 0 result (2026-07-01)
+
+DONE. Gates: pytest fixed (821 pass ~17s, was >129s hang); the one real test
+failure fixed (time-dependent, not masked); **fail-closed live guard at the
+client chokepoint** — blocks the typed wrappers AND the ~100 manual scripts
+(both verified: direct `spot_client().futures_create_order` raises
+`LiveOrdersBlocked` without `ALLOW_LIVE_ORDERS`); baseline measured. Adversarial
+audit passed after fixing the manual-script bypass it found. Live trading remains
+disabled.
+
+## 10. First action (Phase 1)
+
+Wire real point-in-time closed OHLCV (via existing `chart_candle_service.py`)
+into feature computation and the replay/exit buffer — replacing the synthetic
+3-candle proxy and mark-only exit snapshots. This is the unlock for honest
+features + intrabar exits + backtestability.
