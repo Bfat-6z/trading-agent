@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_data_contracts import SCHEMA_VERSION
 from atomic_state import append_jsonl, read_json, write_json_atomic
+from paper_cost_model import fill_bps, liquidity_tier, mmr_for
 from timebase import utc_now
 
 ROOT = Path(__file__).resolve().parent
@@ -17,8 +18,8 @@ PAPER_POSITIONS = STATE_DIR / "paper_positions.json"
 
 TAKER_FEE_RATE = Decimal("0.0005")
 MAKER_FEE_RATE = Decimal("0.0002")
-DEFAULT_SLIPPAGE_BPS = Decimal("2")
-MAINTENANCE_MARGIN_RATE = Decimal("0.005")
+DEFAULT_SLIPPAGE_BPS = Decimal("2")  # legacy default; real fills use paper_cost_model tiers
+MAINTENANCE_MARGIN_RATE = Decimal("0.005")  # legacy; liquidation now uses mmr_for(tier)
 
 
 def dec(value: Any, default: str = "0") -> Decimal:
@@ -61,6 +62,7 @@ def simulate_entry_order(
     candle: dict[str, Any],
     post_only: bool = False,
     append_order: bool = True,
+    quote_volume: Any = None,
 ) -> dict[str, Any]:
     side_up = side.upper()
     order_type = order_type.lower()
@@ -73,9 +75,11 @@ def simulate_entry_order(
     fill_price = requested
     fee_rate = TAKER_FEE_RATE
     reason = "unfilled"
+    # Phase 2: market entry pays tiered slippage + half-spread (pessimistic).
+    entry_bps = fill_bps(liquidity_tier(quote_volume)) if quote_volume is not None else DEFAULT_SLIPPAGE_BPS
     if order_type == "market":
         filled = True
-        fill_price = adverse_slippage(open_price if open_price > 0 else requested, side_up)
+        fill_price = adverse_slippage(open_price if open_price > 0 else requested, side_up, entry_bps)
         reason = "market_fill"
     elif order_type == "limit":
         touch = low <= requested if side_up == "LONG" else high >= requested
@@ -124,9 +128,11 @@ def simulate_entry_order(
     return payload
 
 
-def liquidation_price(entry: Decimal, side: str, leverage: Any) -> Decimal:
+def liquidation_price(entry: Decimal, side: str, leverage: Any, quote_volume: Any = None) -> Decimal:
     lev = max(Decimal("1"), dec(leverage, "1"))
-    move = (Decimal("1") / lev) - MAINTENANCE_MARGIN_RATE
+    # Phase 2: conservative tiered maintenance margin (not flat 0.5%).
+    mmr = mmr_for(liquidity_tier(quote_volume)) if quote_volume is not None else MAINTENANCE_MARGIN_RATE
+    move = (Decimal("1") / lev) - mmr
     if side.upper() == "LONG":
         return entry * (Decimal("1") - move)
     return entry * (Decimal("1") + move)
@@ -140,13 +146,19 @@ def simulate_exit(
     tp: Any,
     candles: list[dict[str, Any]],
     leverage: Any = "1",
+    quote_volume: Any = None,
 ) -> dict[str, Any]:
     side_up = side.upper()
     entry_dec = dec(entry)
     qty_dec = dec(qty)
     sl_dec = dec(sl)
     tp_dec = dec(tp)
-    liq = liquidation_price(entry_dec, side_up, leverage)
+    # Phase 2: pessimistic tiered costs. SL is a stop-market (worse slippage);
+    # TP is treated as a market exit at the level; liquidation now also slips.
+    tier = liquidity_tier(quote_volume) if quote_volume is not None else "major"
+    sl_bps = fill_bps(tier, is_stop=True)
+    mkt_bps = fill_bps(tier)
+    liq = liquidation_price(entry_dec, side_up, leverage, quote_volume=quote_volume)
     for candle in candles:
         open_price = dec(candle.get("open"))
         high = dec(candle.get("high"))
@@ -154,13 +166,14 @@ def simulate_exit(
         if side_up == "LONG":
             if low <= liq:
                 close = min(open_price, liq) if open_price < entry_dec else liq
+                close = exit_slippage(close, side_up, mkt_bps)
                 reason = "liquidation"
             elif low <= sl_dec:
                 close = open_price if open_price < sl_dec else sl_dec
-                close = exit_slippage(close, side_up)
+                close = exit_slippage(close, side_up, sl_bps)
                 reason = "sl"
             elif high >= tp_dec:
-                close = exit_slippage(tp_dec, side_up)
+                close = exit_slippage(tp_dec, side_up, mkt_bps)
                 reason = "tp"
             else:
                 continue
@@ -168,13 +181,14 @@ def simulate_exit(
         else:
             if high >= liq:
                 close = max(open_price, liq) if open_price > entry_dec else liq
+                close = exit_slippage(close, side_up, mkt_bps)
                 reason = "liquidation"
             elif high >= sl_dec:
                 close = open_price if open_price > sl_dec else sl_dec
-                close = exit_slippage(close, side_up)
+                close = exit_slippage(close, side_up, sl_bps)
                 reason = "sl"
             elif low <= tp_dec:
-                close = exit_slippage(tp_dec, side_up)
+                close = exit_slippage(tp_dec, side_up, mkt_bps)
                 reason = "tp"
             else:
                 continue
@@ -190,6 +204,8 @@ def simulate_exit(
             "fee": dstr(fee),
             "net": dstr(gross - fee),
             "liquidation_price": dstr(liq),
+            "liquidity_tier": tier,
+            "slippage_bps_applied": dstr(sl_bps if reason == "sl" else mkt_bps),
             "promotion_blocked": reason == "liquidation",
         }
     return {"schema_version": SCHEMA_VERSION, "status": "open", "reason": "unresolved", "liquidation_price": dstr(liq), "promotion_blocked": False}

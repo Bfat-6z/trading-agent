@@ -16,6 +16,7 @@ from live_permission_firewall import sanitize_and_detect
 from market_data_lake import coverage_report, load_candles, select_window
 from market_learner import valid_paper_close
 from paper_execution_simulator import TAKER_FEE_RATE, dec, dstr, exit_slippage, liquidation_price, simulate_entry_order, simulate_round_trip
+from paper_cost_model import fill_bps as cost_fill_bps, liquidity_tier as cost_liquidity_tier
 from timebase import parse_utc, utc_now
 
 ROOT = Path(__file__).resolve().parent
@@ -195,11 +196,14 @@ def validate_replay_signal(signal: dict[str, Any]) -> list[str]:
             errors.append(f"invalid_{field}")
     return errors
 
-def _mark_to_market_exit(side: str, entry: Any, qty: Any, exit_price: Any, ts: Any, reason: str) -> dict[str, Any]:
+def _mark_to_market_exit(side: str, entry: Any, qty: Any, exit_price: Any, ts: Any, reason: str, quote_volume: Any = None) -> dict[str, Any]:
     side_up = str(side).upper()
     entry_dec = dec(entry)
     qty_dec = dec(qty)
-    close = exit_slippage(dec(exit_price), side_up)
+    # Phase 2 lockstep: shadow engine uses the same tiered cost model as the live
+    # paper sim so the two cannot diverge. A market/time exit uses market bps.
+    bps = cost_fill_bps(cost_liquidity_tier(quote_volume)) if quote_volume is not None else None
+    close = exit_slippage(dec(exit_price), side_up, bps) if bps is not None else exit_slippage(dec(exit_price), side_up)
     gross = (close - entry_dec) * qty_dec if side_up == "LONG" else (entry_dec - close) * qty_dec
     fee = abs(close * qty_dec) * TAKER_FEE_RATE
     return {
@@ -217,19 +221,21 @@ def _mark_to_market_exit(side: str, entry: Any, qty: Any, exit_price: Any, ts: A
 def _simulate_time_exit(trade: dict[str, Any], candles: list[dict[str, Any]]) -> dict[str, Any]:
     if not candles:
         return {"status": "skipped", "reason": "missing_candles"}
-    entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=False)
+    quote_volume = trade.get("quote_volume") or candles[0].get("volume")
+    entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=False, quote_volume=quote_volume)
     if entry["status"] not in {"filled", "partial"}:
         return {**entry, "trade_status": "not_opened"}
     exit_candles = candles[1:] or candles
     close_candle = exit_candles[-1]
     close_price = close_candle.get("close") or close_candle.get("open") or entry["fill_price"]
-    exit_row = _mark_to_market_exit(trade["side"], entry["fill_price"], entry.get("filled_qty") or trade["qty"], close_price, close_candle.get("ts"), "time_exit")
+    exit_row = _mark_to_market_exit(trade["side"], entry["fill_price"], entry.get("filled_qty") or trade["qty"], close_price, close_candle.get("ts"), "time_exit", quote_volume=quote_volume)
     return {"entry_order": entry, "exit": exit_row, "trade_status": "closed"}
 
 def _simulate_trailing_1r(trade: dict[str, Any], candles: list[dict[str, Any]]) -> dict[str, Any]:
     if not candles:
         return {"status": "skipped", "reason": "missing_candles"}
-    entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=False)
+    quote_volume = trade.get("quote_volume") or candles[0].get("volume")
+    entry = simulate_entry_order(trade["symbol"], trade["side"], trade.get("order_type", "market"), trade["qty"], trade["entry"], candles[0], append_order=False, quote_volume=quote_volume)
     if entry["status"] not in {"filled", "partial"}:
         return {**entry, "trade_status": "not_opened"}
 
@@ -239,7 +245,7 @@ def _simulate_trailing_1r(trade: dict[str, Any], candles: list[dict[str, Any]]) 
     active_sl = dec(trade["sl"])
     tp = dec(trade["tp"])
     risk = abs(entry_price - active_sl)
-    liq = liquidation_price(entry_price, side, trade.get("leverage", "1"))
+    liq = liquidation_price(entry_price, side, trade.get("leverage", "1"), quote_volume=quote_volume)
 
     for candle in candles[1:] or candles:
         open_price = dec(candle.get("open"))

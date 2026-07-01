@@ -20,7 +20,8 @@ from agent_data_contracts import SCHEMA_VERSION
 from atomic_state import append_jsonl, append_jsonl_once, canonical_json, read_json, write_json_atomic
 from live_permission_firewall import evaluate_live_permission, paper_action_allowed
 from market_data_lake import store_candles
-from paper_execution_simulator import DEFAULT_SLIPPAGE_BPS, TAKER_FEE_RATE, simulate_entry_order, simulate_exit
+from paper_execution_simulator import DEFAULT_SLIPPAGE_BPS, TAKER_FEE_RATE, exit_slippage as cost_exit_slippage, simulate_entry_order, simulate_exit
+from paper_cost_model import fill_bps as cost_fill_bps, liquidity_tier as cost_liquidity_tier
 from paper_portfolio_manager import close_paper_position, load_account, open_paper_position, save_account
 from post_trade_learning_agent import review_closed_trade
 from timebase import seconds_between, utc_now
@@ -807,7 +808,10 @@ def should_close(position: dict[str, Any], candle: dict[str, Any], max_hold_seco
     # Phase 1: prefer REAL intrabar OHLC (chronological) so SL/TP fire on true
     # wick touches. Fall back to the single mark candle if no real bars.
     exit_candles = real_intrabar_candles(position, str(candle.get("ts") or utc_now())) or [candle]
-    simulated = simulate_exit(side, position.get("entry"), position.get("qty"), sl, tp, exit_candles, position.get("leverage", "1"))
+    # Phase 2: liquidity tier from the position's traded volume (candle volume is
+    # quote_volume) drives tiered slippage/spread/MMR in the simulator.
+    quote_volume = position.get("quote_volume") or candle.get("volume")
+    simulated = simulate_exit(side, position.get("entry"), position.get("qty"), sl, tp, exit_candles, position.get("leverage", "1"), quote_volume=quote_volume)
     if simulated.get("status") == "closed":
         exit_price = dec(simulated.get("exit"))
         trigger = dec(simulated.get("liquidation_price")) if simulated.get("reason") == "liquidation" else tp if simulated.get("reason") == "tp" else sl
@@ -816,13 +820,18 @@ def should_close(position: dict[str, Any], candle: dict[str, Any], max_hold_seco
             "exit": exit_price,
             "slippage": dec_str(abs(exit_price - trigger)),
             "liquidation_price": simulated.get("liquidation_price"),
+            "liquidity_tier": simulated.get("liquidity_tier"),
+            "exit_price_source": "real_ohlc" if exit_candles is not [candle] and exit_candles and exit_candles[0].get("quality") == "real_ohlc_5m" else "mark_or_fallback",
             "promotion_blocked": bool(simulated.get("promotion_blocked")),
             "execution_simulator": simulated,
         }
     age = seconds_between(position.get("opened_at"), candle.get("ts"))
     wall_age = seconds_between(position.get("opened_at"), utc_now())
     if (age is not None and age >= max_hold_seconds) or (wall_age is not None and wall_age >= max_hold_seconds):
-        return {"reason": "timeout", "exit": mark}
+        # Phase 2: timeout is a market close -> apply tiered slippage+spread (was 0).
+        tier = cost_liquidity_tier(quote_volume)
+        timeout_exit = cost_exit_slippage(mark, side, cost_fill_bps(tier))
+        return {"reason": "timeout", "exit": timeout_exit, "liquidity_tier": tier, "exit_price_source": "timeout_mark"}
     return None
 
 

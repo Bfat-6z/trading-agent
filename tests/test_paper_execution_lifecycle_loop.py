@@ -420,14 +420,18 @@ def test_lifecycle_accounts_for_entry_fee_exit_fee_and_funding(monkeypatch, tmp_
     assert result["actions"]
     assert "closed" in result["actions"]
     assert Decimal(close["entry_fee"]) == Decimal("0.025")
-    assert Decimal(close["exit_fee"]) == Decimal("0.02624475")
-    assert Decimal(close["fee"]) == Decimal("0.05124475")
+    # Phase 2: TP is a market exit; quote_volume=1000 -> micro tier -> 70bps
+    # slippage+spread (was flat 2bps), so exit fills worse (10.4265 vs ~10.4979)
+    # and the taker exit fee is correspondingly lower.
+    assert Decimal(close["exit_fee"]) == Decimal("0.02606625")
+    assert Decimal(close["fee"]) == Decimal("0.05106625")
     assert Decimal(close["funding_payment"]) == Decimal("-0.05")
     assert Decimal(close["slippage"]) > 0
-    assert Decimal(close["net"]) == Decimal("2.38825525")
-    assert Decimal(account_after["fees_paid"]) == Decimal("0.05124475")
-    assert Decimal(account_after["equity"]) == Decimal("102.38825525")
-    assert Decimal(account_after["realized_pnl"]) == Decimal("2.38825525")
+    # Phase 2: worse (realistic) exit fill -> lower net than the old flat-2bps model.
+    assert Decimal(close["net"]) == Decimal("2.03143375")
+    assert Decimal(account_after["fees_paid"]) == Decimal("0.05106625")
+    assert Decimal(account_after["equity"]) == Decimal("102.03143375")
+    assert Decimal(account_after["realized_pnl"]) == Decimal("2.03143375")
 
 def test_open_deducts_entry_fee_immediately(tmp_path: Path):
     account_path = tmp_path / "paper_account.json"
@@ -458,7 +462,10 @@ def test_lifecycle_liquidates_before_sl_when_mark_breaches_liq(monkeypatch, tmp_
     close = close_rows[-1]
     assert close["reason"] == "liquidation"
     assert close["promotion_blocked"] is True
-    assert Decimal(close["liquidation_price"]) == Decimal("9.85")
+    # Phase 2: tiered MMR. quote_volume=1000 -> micro tier -> MMR 1% (was flat
+    # 0.5%). 50x: move = 1/50 - 0.01 = 0.01 -> liq = 10*(1-0.01) = 9.90.
+    # Conservative (liq closer to entry) is intentional.
+    assert Decimal(close["liquidation_price"]) == Decimal("9.9")
     assert Decimal(close["exit"]) <= Decimal(close["liquidation_price"])
 
 def test_legacy_partial_account_load_uses_equity_as_cash(tmp_path: Path):
