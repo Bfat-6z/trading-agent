@@ -165,6 +165,26 @@ def test_feature_row_uses_real_candles_not_ticker_proxy(tmp_path, monkeypatch):
     assert int(fr.get("candle_count") or 0) >= feeder.MIN_DECISION_CANDLES
 
 
+def test_real_candles_usable_when_ingested_after_cutoff(tmp_path, monkeypatch):
+    """Phase 1 M1 regression: the real ingestor stamps ingested_at at fetch time
+    (~now), which is LATER than the decision snapshot cutoff. Those bars must
+    still be usable — ingested_at is operational, not a lookahead gate.
+    (The prior seed helper hid this by stamping ingested_at in the past.)"""
+    from _candle_seed import seed_candles
+
+    cutoff = "2026-06-21T00:02:00+00:00"
+    monkeypatch.setenv("INGEST_DECISION_CANDLES", "0")
+    seed_candles(monkeypatch, tmp_path, "ABCUSDT", cutoff, base_price=10.0, ingested_after_cutoff=True)
+    market = {"ts": cutoff, "source_ids": ["local_state"]}
+    row = {"symbol": "ABCUSDT", "price": 10, "high": 11, "low": 6, "change_pct": 25, "range_pos": 0.9, "quote_volume": 100_000_000, "funding_pct": 0.01}
+
+    fr = feeder.feature_row_for_market_row(row, market, cutoff)
+
+    assert fr["feature_status"] == "ok", "bars ingested after cutoff must remain usable"
+    assert fr["decision_data_capability_mask"]["action"] in {"normal", "size_cap"}
+    assert (fr.get("cutoff_proof") or {}).get("ok") is True
+
+
 def test_feature_row_skips_when_no_real_candles(monkeypatch):
     """Reject-not-fake: with no real candle cache, the decision feature path must
     NOT fabricate — the candidate is dropped/quarantined."""

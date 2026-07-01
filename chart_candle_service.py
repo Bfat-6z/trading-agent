@@ -82,7 +82,12 @@ def build_cutoff_proof(bars: list[dict[str, Any]], decision_cutoff: str) -> dict
         input_id = f"bar:{idx}:{bar.get('open_time')}"
         checked.append(input_id)
         row_max = None
-        for field in ("available_at", "known_at", "ingested_at", "finalized_at"):
+        # No-lookahead is about when the data EXISTED / was KNOWABLE, not when we
+        # happened to write it to cache. available_at/known_at/finalized_at are the
+        # data-existence timestamps and must be <= cutoff. ingested_at is an
+        # operational write-time (~now) that legitimately exceeds an older decision
+        # cutoff; gating on it starves the decision path without adding safety.
+        for field in ("available_at", "known_at", "finalized_at"):
             parsed = parse_utc(bar.get(field))
             if not parsed:
                 errors.append(f"invalid_{field}:{input_id}")
@@ -90,6 +95,10 @@ def build_cutoff_proof(bars: list[dict[str, Any]], decision_cutoff: str) -> dict
             row_max = parsed if row_max is None or parsed > row_max else row_max
             if parsed > cutoff_dt:
                 errors.append(f"{field}_after_cutoff:{input_id}")
+        # ingested_at is still validated for presence/parseability (integrity),
+        # but is NOT a lookahead gate.
+        if not parse_utc(bar.get("ingested_at")):
+            errors.append(f"invalid_ingested_at:{input_id}")
         if row_max:
             max_seen = row_max if max_seen is None or row_max > max_seen else max_seen
     return {

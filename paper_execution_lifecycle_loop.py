@@ -773,8 +773,14 @@ def real_intrabar_candles(position: dict[str, Any], cutoff_ts: str, timeframe: s
     for bar in batch.get("bars") or []:
         if bar.get("is_final") is not True:
             continue
+        open_t = parse_ts(str(bar.get("open_time") or ""))
         close_t = parse_ts(str(bar.get("close_time") or bar.get("finalized_at") or ""))
-        # only bars that closed strictly after entry (no bar the entry already saw)
+        # Only bars whose ENTIRE range is after entry. Requiring open_time >=
+        # opened_at (not just close_time > opened_at) prevents a bar that spans
+        # the entry from firing SL/TP on a wick that occurred BEFORE the position
+        # opened (Phase 1 audit m5).
+        if opened_dt is not None and open_t is not None and open_t < opened_dt:
+            continue
         if opened_dt is not None and close_t is not None and close_t <= opened_dt:
             continue
         try:

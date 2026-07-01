@@ -28,13 +28,19 @@ def seed_candles(
     timeframe: str = "5m",
     count: int = 12,
     base_price: float = 100.0,
+    ingested_after_cutoff: bool = False,
 ) -> None:
     """Point the candle cache at tmp_path and write `count` valid final bars
-    that all finalize before `cutoff_ts`."""
+    that all finalize before `cutoff_ts`.
+
+    ingested_after_cutoff=True stamps ingested_at LATER than the cutoff (like the
+    real ingestor, which writes at fetch time ~now). This must NOT exclude bars —
+    ingested_at is operational, not a lookahead signal (Phase 1 M1 fix)."""
     monkeypatch.setattr(ccs, "CHART_CANDLE_DIR", tmp_path / "chart" / "candles")
     cutoff = parse_utc(cutoff_ts)
     assert cutoff is not None, f"invalid cutoff_ts: {cutoff_ts}"
     step = ccs.TIMEFRAME_SECONDS.get(timeframe, 300)
+    ingested_stamp = (cutoff + timedelta(seconds=3600)).isoformat(timespec="seconds") if ingested_after_cutoff else None
 
     bars: list[dict[str, Any]] = []
     # Oldest first; the most recent bar closes one full step before cutoff.
@@ -59,7 +65,7 @@ def seed_candles(
             "is_final": True,
             "available_at": iso_close,
             "known_at": iso_close,
-            "ingested_at": iso_close,
+            "ingested_at": ingested_stamp or iso_close,
             "finalized_at": iso_close,
             "price_basis": "last_trade",
             "native_timeframe": True,

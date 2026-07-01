@@ -135,7 +135,12 @@ def build_cutoff_proof(inputs: list[dict[str, str]], decision_cutoff: str, laten
     for item in inputs:
         input_id = str(item.get("input_id") or "unknown")
         row_max = None
-        for field in ("available_at", "known_at", "ingested_at", "finalized_at"):
+        # Lookahead is defined by data-existence timestamps (available_at/known_at/
+        # finalized_at) — those must be <= cutoff. ingested_at is the operational
+        # cache write-time (~now) and legitimately exceeds an older decision
+        # cutoff; gating on it would starve the decision path without adding
+        # safety. It is still validated for presence below.
+        for field in ("available_at", "known_at", "finalized_at"):
             parsed = parse_utc(item.get(field))
             if not parsed:
                 errors.append(f"invalid_{field}:{input_id}")
@@ -143,6 +148,8 @@ def build_cutoff_proof(inputs: list[dict[str, str]], decision_cutoff: str, laten
             row_max = parsed if row_max is None or parsed > row_max else row_max
             if parsed > allowed_dt:
                 errors.append(f"{field}_after_cutoff:{input_id}")
+        if not parse_utc(item.get("ingested_at")):
+            errors.append(f"invalid_ingested_at:{input_id}")
         if row_max:
             max_seen = row_max if max_seen is None or row_max > max_seen else max_seen
         checked.append(input_id)
