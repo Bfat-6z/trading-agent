@@ -22,6 +22,13 @@ DEFAULT_SOURCES = {
     "local_state": {"provider": "local", "source_type": "state", "freshness_sla_seconds": 3600, "trust_score": 0.8},
     "market_observer": {"provider": "binance", "source_type": "market", "freshness_sla_seconds": 900, "trust_score": 0.82},
     "binance_usdm_klines": {"provider": "binance", "source_type": "market_candles", "freshness_sla_seconds": 300, "trust_score": 0.85},
+    # Phase 1: real closed candles served from the local chart cache
+    # (chart_candle_service.load_closed_candles). Provider "local" so the
+    # registry treats the on-disk cache as verified with a fresh timestamp;
+    # the underlying bars are real Binance closed klines (manifest
+    # binance_usdm_klines) and each bar carries its own finalized_at that the
+    # cutoff_proof independently checks for lookahead. 5m bars -> 900s SLA.
+    "chart_candle_cache": {"provider": "local", "source_type": "market_candles", "freshness_sla_seconds": 900, "trust_score": 0.85},
     "binance_usdm_orderbook": {"provider": "binance", "source_type": "orderbook", "freshness_sla_seconds": 30, "trust_score": 0.85},
     "binance_usdm_liquidations": {"provider": "binance", "source_type": "liquidation", "freshness_sla_seconds": 120, "trust_score": 0.78},
     "binance_usdm_funding_oi": {"provider": "binance", "source_type": "funding", "freshness_sla_seconds": 600, "trust_score": 0.78},
@@ -88,6 +95,25 @@ def load_source_registry(path: Path = DATA_SOURCES_LATEST) -> dict[str, Any]:
         return default_registry()
     payload.setdefault("schema_version", SCHEMA_VERSION)
     payload.setdefault("updated_at", utc_now())
+    # Backfill any DEFAULT_SOURCES entry missing from a stale on-disk registry
+    # (e.g. sources added in code after the file was written), so newly declared
+    # sources like chart_candle_cache resolve instead of erroring source_missing.
+    sources = payload.get("sources")
+    if isinstance(sources, dict):
+        now = utc_now()
+        for source_id, row in DEFAULT_SOURCES.items():
+            if source_id not in sources:
+                is_local = row.get("provider") == "local"
+                sources[source_id] = apply_source_defaults(source_id, {
+                    "source_id": source_id,
+                    "endpoint": None,
+                    "status": "ok" if is_local else "unverified",
+                    "last_success_at": now if is_local else None,
+                    "last_failure_at": None,
+                    "cooldown_until": None,
+                    "license_notes": "local registry entry; verify provider terms before production use",
+                    **row,
+                })
     return payload
 
 

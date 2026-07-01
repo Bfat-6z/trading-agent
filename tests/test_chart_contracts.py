@@ -1,4 +1,5 @@
 import json
+import tempfile
 from pathlib import Path
 
 import agent_data_contracts as contracts
@@ -131,6 +132,9 @@ def test_chart_intelligence_generated_event_schema_accepts_provenance():
 
 
 def test_ticker_proxy_candles_are_not_chart_decision_eligible():
+    # The proxy builder still exists (diagnostic only) and must self-label as
+    # non-decision-eligible. Phase 1 removed it from the decision path — see
+    # test_feature_row_uses_real_candles_not_ticker_proxy below.
     rows = feeder.feature_candles_from_market_row(
         {"price": 100, "high": 110, "low": 90, "change_pct": 5, "quote_volume": 3000},
         "2026-06-21T00:02:00+00:00",
@@ -140,6 +144,40 @@ def test_ticker_proxy_candles_are_not_chart_decision_eligible():
     assert all(row["is_synthetic_chart_proxy"] is True for row in rows)
     assert all(row["chart_decision_eligible"] is False for row in rows)
     assert all(row["chart_candle_source"] == "ticker_24h_proxy" for row in rows)
+
+
+def test_feature_row_uses_real_candles_not_ticker_proxy(tmp_path, monkeypatch):
+    """Phase 1: the decision feature path must consume real closed candles at the
+    decision timeframe, never the fabricated ticker_24h_proxy."""
+    from _candle_seed import seed_candles
+
+    cutoff = "2026-06-21T00:02:00+00:00"
+    monkeypatch.setenv("INGEST_DECISION_CANDLES", "0")
+    seed_candles(monkeypatch, tmp_path, "ABCUSDT", cutoff, base_price=10.0)
+    market = {"ts": cutoff, "source_ids": ["local_state"]}
+    row = {"symbol": "ABCUSDT", "price": 10, "high": 11, "low": 6, "change_pct": 25, "range_pos": 0.9, "quote_volume": 100_000_000, "funding_pct": 0.01}
+
+    fr = feeder.feature_row_for_market_row(row, market, cutoff)
+
+    assert fr["timeframe"] == feeder.DECISION_CANDLE_TIMEFRAME  # "5m", not ticker_24h_proxy
+    assert fr["feature_status"] == "ok"
+    assert fr["decision_data_capability_mask"]["action"] in {"normal", "size_cap"}
+    assert int(fr.get("candle_count") or 0) >= feeder.MIN_DECISION_CANDLES
+
+
+def test_feature_row_skips_when_no_real_candles(monkeypatch):
+    """Reject-not-fake: with no real candle cache, the decision feature path must
+    NOT fabricate — the candidate is dropped/quarantined."""
+    monkeypatch.setenv("INGEST_DECISION_CANDLES", "0")
+    import chart_candle_service as ccs
+    # point cache somewhere empty
+    monkeypatch.setattr(ccs, "CHART_CANDLE_DIR", Path(tempfile.mkdtemp()) / "empty")
+    market = {"ts": "2026-06-21T00:02:00+00:00", "source_ids": ["local_state"]}
+    row = {"symbol": "ZZZUSDT", "price": 10, "high": 11, "low": 6, "change_pct": 25, "range_pos": 0.9, "quote_volume": 100_000_000, "funding_pct": -0.30}
+
+    cands = feeder.build_candidates(market)
+
+    assert cands == []  # no fabrication -> no candidate
 
 
 def test_chart_fixture_skeletons_are_valid_json():

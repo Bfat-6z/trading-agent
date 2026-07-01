@@ -17,9 +17,18 @@ from typing import Any, Iterable
 from agent_data_contracts import SCHEMA_VERSION
 from agent_work_queue import enqueue_job
 from atomic_state import append_jsonl, read_json, write_json_atomic
+from chart_candle_service import load_closed_candles
 from instrument_registry import QUALITY_PATH as REGISTRY_QUALITY_PATH, REGISTRY_PATH, load_registry, normalize_symbol, summarize_registry
 from market_feature_store import compute_market_features
 from timebase import parse_utc, seconds_between, utc_now
+
+# Phase 1: real closed-candle timeframe for decision features (edge-first plan
+# 260701). Replaces the fabricated ticker_24h_proxy candles. Missing real
+# candles -> the feature capability mask becomes 'skip' and the brain rejects
+# the candidate (reject-not-fake). See chart_candle_ingestor for population.
+DECISION_CANDLE_TIMEFRAME = "5m"
+DECISION_CANDLE_LIMIT = 200
+MIN_DECISION_CANDLES = 3
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
@@ -139,20 +148,32 @@ def feature_row_for_market_row(row: dict[str, Any], market: dict[str, Any], snap
             "ingested_at": snapshot_ts,
             "finalized_at": snapshot_ts,
         }
-    source_ids = market.get("source_ids") if isinstance(market.get("source_ids"), list) else ["local_state"]
     source_manifest_ids = [str(value) for value in (market.get("provenance_id"), market.get("snapshot_id"), market.get("event_id")) if value]
     input_event_ids = [str(value) for value in market.get("event_ids", [])] if isinstance(market.get("event_ids"), list) else []
+    cutoff = snapshot_ts if parse_utc(snapshot_ts) else utc_now()
+    symbol = str(row.get("symbol") or "")
+
+    # Phase 1: use REAL closed OHLCV as of the snapshot cutoff. No fabrication.
+    # If real candles are unavailable/insufficient, compute_market_features
+    # raises (<3 candles) and the caller quarantines the candidate -> skip.
+    batch = load_closed_candles(symbol, DECISION_CANDLE_TIMEFRAME, cutoff, limit=DECISION_CANDLE_LIMIT)
+    real_bars = [bar for bar in (batch.get("bars") or []) if bar.get("is_final") is True]
+    batch_source_ids = [str(s) for s in (batch.get("source_ids") or [])]
+    source_ids = batch_source_ids or (market.get("source_ids") if isinstance(market.get("source_ids"), list) else ["chart_candle_cache"])
+    if str(batch.get("batch_id")):
+        input_event_ids = input_event_ids + [str(batch.get("batch_id"))]
+
     return compute_market_features(
-        str(row.get("symbol") or ""),
-        "ticker_24h_proxy",
-        feature_candles_from_market_row(row, snapshot_ts),
+        symbol,
+        DECISION_CANDLE_TIMEFRAME,
+        real_bars,
         derivatives=derivatives,
         source_ids=source_ids,
         input_event_ids=input_event_ids,
         source_manifest_ids=source_manifest_ids,
-        decision_cutoff=snapshot_ts if parse_utc(snapshot_ts) else utc_now(),
+        decision_cutoff=cutoff,
         latency_buffer_seconds=0,
-        fit_metadata={"fit_window": "none_ticker_proxy", "train_partition": "none_runtime_transform"},
+        fit_metadata={"fit_window": "closed_candles_5m", "train_partition": "runtime_pit"},
     )
 
 def paper_scalp_geometry(side: str, price: float, raw_sl: float, raw_tp: float, setup_id: str) -> tuple[float, float]:
@@ -433,6 +454,18 @@ def build_candidates(market: dict[str, Any], limit: int = 8, setup_rankings: dic
         symbol = str(row.get("symbol") or "").upper()
         if symbol and symbol not in by_symbol:
             by_symbol[symbol] = row
+
+    # Phase 1: populate the real closed-candle cache for the symbols about to be
+    # scored, so feature_row_for_market_row reads honest OHLCV. Fail-closed: any
+    # symbol we cannot ingest simply won't have candles and will be skipped
+    # downstream. Disabled by env for offline tests (INGEST_DECISION_CANDLES=0).
+    if os.environ.get("INGEST_DECISION_CANDLES", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            from chart_candle_ingestor import ingest_symbols
+            ingest_symbols(list(by_symbol.keys()), DECISION_CANDLE_TIMEFRAME, limit=DECISION_CANDLE_LIMIT)
+        except Exception:
+            pass  # ingestion is best-effort; missing candles fail-closed to skip
+
     candidates = []
     for row in by_symbol.values():
         flow_features = flow_features_for_symbol(str(row.get("symbol") or ""), whale_flow)

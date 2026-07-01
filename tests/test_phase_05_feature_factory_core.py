@@ -11,6 +11,7 @@ import news_signal_model as nsm
 import paper_candidate_feeder as feeder
 import post_trade_learning_agent as ptl
 import source_provenance as sp
+from _candle_seed import seed_candles
 
 
 @pytest.fixture
@@ -125,10 +126,13 @@ def test_candle_cache_and_replay_manifest_hash_full_inputs(tmp_path: Path, monke
 
 def test_candidate_feeder_attaches_feature_row_id(tmp_path: Path, monkeypatch):
     patch_feature_paths(tmp_path, monkeypatch)
-    # Freeze "now" just after the fixed snapshot so the local_state source is not
-    # flagged source_stale (SLA 3600s). Without this the test is time-dependent
-    # and starts failing once the hardcoded 2026-06-21 ts ages past the SLA.
+    # Freeze "now" just after the fixed snapshot so time-relative staleness
+    # (SLA) checks don't flip once the hardcoded 2026-06-21 ts ages.
     monkeypatch.setattr(dsr, "utc_now", lambda: "2026-06-21T00:05:00+00:00")
+    # Phase 1: decisions use real closed candles. Seed the cache (bars before
+    # cutoff) and disable live ingest so the test is offline + deterministic.
+    monkeypatch.setenv("INGEST_DECISION_CANDLES", "0")
+    seed_candles(monkeypatch, tmp_path, "ABCUSDT", "2026-06-21T00:02:00+00:00", base_price=10.0)
     market = {
         "ts": "2026-06-21T00:02:00+00:00",
         "source_ids": ["local_state"],

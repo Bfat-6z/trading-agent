@@ -12,6 +12,7 @@ import liquidation_observer as lob
 import microstructure_flow_factory as mff
 import orderbook_observer as obo
 import paper_candidate_feeder as feeder
+from _candle_seed import seed_candles
 
 
 @pytest.fixture
@@ -128,6 +129,9 @@ def test_candidate_feeder_reads_microstructure_bundle_not_raw_whale_latest(tmp_p
     monkeypatch.setattr(feeder, "HEARTBEAT_PATH", tmp_path / "hb.json")
     write_json(feeder.MARKET_LATEST, {"ts": "2026-06-21T00:00:20+00:00", "source_ids": ["local_state"], "hot": [{"symbol": "BTCUSDT", "price": 100, "high": 101, "low": 80, "change_pct": 25, "range_pos": 0.9, "quote_volume": 100_000_000, "funding_pct": 0.01}]})
     write_json(feeder.MICROSTRUCTURE_FLOW_LATEST, {"updated_at": "2026-06-21T00:00:20+00:00", "symbols": {"BTCUSDT": {"feature_confidence": 0.8}}, "by_symbol": {"BTCUSDT": {"pressure_side": "SHORT", "pressure_score": -0.4, "source_quorum_passed": True, "market_confirmed": True, "event_count": 2}}})
+    # Phase 1: decisions use real closed candles; seed the cache and disable live ingest.
+    monkeypatch.setenv("INGEST_DECISION_CANDLES", "0")
+    seed_candles(monkeypatch, tmp_path, "BTCUSDT", "2026-06-21T00:00:20+00:00")
     monkeypatch.setattr(feeder, "enqueue_job", lambda *args, **kwargs: {"ok": True, "job_id": "j"})
 
     result = feeder.run_once(enqueue=False)
