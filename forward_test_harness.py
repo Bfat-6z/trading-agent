@@ -146,3 +146,26 @@ def summarize(labeled_path: Path = LABELED) -> dict[str, Any]:
     out["verdict"] = ("insufficient_data_forward_test_still_accruing"
                       if len(rows) < MIN_SAMPLE else "readable")
     return out
+
+
+DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
+
+
+def run_once(symbols: list[str] | None = None) -> dict[str, Any]:
+    """One record + tag pass. Idempotent enough for a cron/supervisor to call on a
+    fixed cadence to keep the forward-test clock advancing. Paper-only."""
+    import time as _time
+    from tradingagents.binance.client import spot_client
+    from timebase import utc_now
+    client = spot_client()
+    now_ms = int(_time.time() * 1000)
+    recorded = record_snapshots(client, symbols or DEFAULT_SYMBOLS, utc_now(), now_ms)
+    labeled = tag_matured_returns(client, now_ms)
+    summary = summarize()
+    return {"recorded": recorded, "labeled": labeled, "verdict": summary["verdict"],
+            "total_labeled": summary["total_labeled"]}
+
+
+if __name__ == "__main__":
+    result = run_once()
+    print(json.dumps(result, default=str))
