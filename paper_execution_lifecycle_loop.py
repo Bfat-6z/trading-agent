@@ -46,6 +46,10 @@ MAX_MARKET_SNAPSHOT_AGE_SECONDS = 15 * 60
 MAX_CHART_EVIDENCE_AGE_SECONDS = 15 * 60
 FUNDING_INTERVAL_HOURS = 8
 MAX_REPLAY_CANDLES = 240
+# Phase 1: resolve exits against REAL intrabar OHLC instead of single-point mark
+# snapshots, so SL/TP fire on wick touches instead of ~54% blind timeouts.
+EXIT_CANDLE_TIMEFRAME = "5m"
+EXIT_CANDLE_LIMIT = 60
 
 
 def dec(value: Any, default: str = "0") -> Decimal:
@@ -748,12 +752,56 @@ def build_open_event(position: dict[str, Any], candidate: dict[str, Any], decisi
     }
 
 
+def real_intrabar_candles(position: dict[str, Any], cutoff_ts: str, timeframe: str = EXIT_CANDLE_TIMEFRAME) -> list[dict[str, Any]]:
+    """Real closed OHLC bars that finalized AFTER the position opened and no later
+    than cutoff_ts. Used so exits resolve on true wick touches, not single marks.
+
+    Returns [] on any failure (fail-open to the mark-snapshot path) — never raises.
+    """
+    symbol = str(position.get("symbol") or "").upper()
+    opened_at = str(position.get("opened_at") or "")
+    if not symbol or not opened_at:
+        return []
+    try:
+        from chart_candle_service import load_closed_candles
+
+        batch = load_closed_candles(symbol, timeframe, cutoff_ts, limit=EXIT_CANDLE_LIMIT)
+    except Exception:
+        return []
+    opened_dt = parse_ts(opened_at)
+    out: list[dict[str, Any]] = []
+    for bar in batch.get("bars") or []:
+        if bar.get("is_final") is not True:
+            continue
+        close_t = parse_ts(str(bar.get("close_time") or bar.get("finalized_at") or ""))
+        # only bars that closed strictly after entry (no bar the entry already saw)
+        if opened_dt is not None and close_t is not None and close_t <= opened_dt:
+            continue
+        try:
+            o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if c <= 0:
+            continue
+        out.append({
+            "ts": str(bar.get("close_time") or bar.get("finalized_at")),
+            "open": o, "high": h, "low": l, "close": c,
+            "volume": float(bar.get("volume") or 0.0),
+            "quality": "real_ohlc_5m",
+        })
+    out.sort(key=lambda r: r.get("ts") or "")
+    return out
+
+
 def should_close(position: dict[str, Any], candle: dict[str, Any], max_hold_seconds: int = MAX_HOLD_SECONDS) -> dict[str, Any] | None:
     side = str(position.get("side") or "").upper()
     mark = dec(candle.get("close"))
     sl = dec(position.get("sl"))
     tp = dec(position.get("tp"))
-    simulated = simulate_exit(side, position.get("entry"), position.get("qty"), sl, tp, [candle], position.get("leverage", "1"))
+    # Phase 1: prefer REAL intrabar OHLC (chronological) so SL/TP fire on true
+    # wick touches. Fall back to the single mark candle if no real bars.
+    exit_candles = real_intrabar_candles(position, str(candle.get("ts") or utc_now())) or [candle]
+    simulated = simulate_exit(side, position.get("entry"), position.get("qty"), sl, tp, exit_candles, position.get("leverage", "1"))
     if simulated.get("status") == "closed":
         exit_price = dec(simulated.get("exit"))
         trigger = dec(simulated.get("liquidation_price")) if simulated.get("reason") == "liquidation" else tp if simulated.get("reason") == "tp" else sl
