@@ -289,6 +289,34 @@ def write_learnings(report: dict[str, Any]) -> None:
     LEARNINGS_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+CANDIDATE_FILE = ROOT / "state" / "agent_memory" / "forward_candidate.json"
+
+
+def _emit_forward_candidate(cells: list[dict[str, Any]], stamped_at: str) -> None:
+    """Write the best in-sample candidate (highest expectancy_r among cells that
+    have a spec) to forward_candidate.json. forward_strategy_paper reads this, so a
+    freshly-discovered lead flows to forward-paper automatically. This is a
+    FORWARD-TEST candidate (best-of-search), NOT a confirmed edge — it was still
+    KILLed in-sample by DSR; forward-paper is exactly how we test it out-of-sample."""
+    best = None
+    for c in cells:
+        sp = c.get("spec")
+        if not sp:
+            continue
+        exp = float((c.get("in_sample") or {}).get("expectancy_r", -9) or -9)
+        if best is None or exp > best[0]:
+            best = (exp, sp, c)
+    if not best:
+        return
+    exp, sp, c = best
+    CANDIDATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CANDIDATE_FILE.write_text(json.dumps({
+        "stamped_at": stamped_at, "spec": sp,
+        "insample_expectancy_r": exp, "verdict": c.get("verdict"),
+        "note": "forward-test candidate (best-of-search) — NOT a confirmed edge; KILLed in-sample by DSR",
+    }, indent=1, default=str), encoding="utf-8")
+
+
 def run_iteration(client: Any, *, end_ms: int, stamped_at: str, months: float = 9.0,
                   timeframes: tuple[str, ...] = ("1h", "4h"), max_symbols: int = 9,
                   triggers: list[dict[str, Any]] | None = None,
@@ -332,9 +360,14 @@ def run_iteration(client: Any, *, end_ms: int, stamped_at: str, months: float = 
         row = rh.run_family(f"meta_{entry_tf}", factory, grid, {}, entry_tf=entry_tf,
                             split_ts_ms=split, stamped_at=stamped_at, precomputed=pre)
         cells.append({"cell": f"meta_{entry_tf}", "verdict": row["verdict"], "reason": row["reason"],
-                      "in_sample": row.get("in_sample"), "holdout": row.get("holdout")})
+                      "in_sample": row.get("in_sample"), "holdout": row.get("holdout"),
+                      "spec": row.get("spec")})
         if row["verdict"] == "PASS":
             any_pass = True
+
+    # LINK meta-loop -> forward-paper: write the best-sampled candidate spec to
+    # forward_candidate.json so forward_strategy_paper picks it up automatically.
+    _emit_forward_candidate(cells, stamped_at)
 
     # Layer 3: learnings
     comp = component_stats_from_sweeps()

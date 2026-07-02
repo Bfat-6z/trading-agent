@@ -52,8 +52,27 @@ FROZEN_SPEC = {
 DIRECTIONS = ["LONG", "SHORT"]
 
 
+CANDIDATE_FILE = ROOT / "state" / "agent_memory" / "forward_candidate.json"
+
+
+def _active_spec() -> dict[str, Any]:
+    """The spec being forward-tested. LINKED to research: if the meta-loop has
+    written a forward_candidate.json (its current best lead), use that; else fall
+    back to the built-in FROZEN_SPEC. This closes the meta-loop -> forward-paper
+    link so a newly-discovered lead flows here automatically (on next cycle)."""
+    try:
+        if CANDIDATE_FILE.exists():
+            c = json.loads(CANDIDATE_FILE.read_text(encoding="utf-8"))
+            spec = c.get("spec") if isinstance(c, dict) else None
+            if isinstance(spec, dict) and spec.get("entry"):
+                return spec
+    except Exception:
+        pass
+    return FROZEN_SPEC
+
+
 def _spec_for(direction: str) -> dict[str, Any]:
-    s = json.loads(json.dumps(FROZEN_SPEC))
+    s = json.loads(json.dumps(_active_spec()))
     s["direction"] = direction
     return s
 
@@ -112,8 +131,10 @@ def detect_and_open(client: Any, symbols: list[str], quote_vols: dict[str, float
                     continue
                 tier = pcm.liquidity_tier(quote_vols.get(sym, 0.0))
                 entry = _apply_slip(float(df.iloc[i]["close"]), direction, pcm.fill_bps(tier), entry=True)
-                sl = entry - 2.5 * atr if direction == "LONG" else entry + 2.5 * atr
-                tp = entry + 5.0 * atr if direction == "LONG" else entry - 5.0 * atr
+                # SL/TP from the ACTIVE spec's exit (linked to the research candidate)
+                ex = spec.get("exit", {}); sl_atr = float(ex.get("sl_atr", 2.5)); tp_atr = float(ex.get("tp_atr", 5.0))
+                sl = entry - sl_atr * atr if direction == "LONG" else entry + sl_atr * atr
+                tp = entry + tp_atr * atr if direction == "LONG" else entry - tp_atr * atr
                 open_pos.append({
                     "symbol": sym, "direction": direction, "decision_cutoff": now_iso,
                     "entry_ts": int(df.iloc[i]["ts_ms"]), "entry": entry, "sl": sl, "tp": tp,
