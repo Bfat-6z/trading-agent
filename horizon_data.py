@@ -267,10 +267,49 @@ def build() -> dict:
     except Exception:
         pass
 
+    # MANUAL test trades (manual_trader.py) — separate account, shown distinctly.
+    manual = {"equity": None, "realized": 0.0, "pending": [], "open": [], "closed_recent": []}
+    try:
+        md = st / "manual_trader"
+        ma = json.loads((md / "account.json").read_text())
+        manual["equity"] = round(float(ma.get("equity", 100) or 100), 2)
+        manual["realized"] = round(float(ma.get("realized", 0) or 0), 2)
+        manual["trades"] = int(ma.get("trades", 0) or 0)
+    except Exception:
+        pass
+    try:
+        md = st / "manual_trader"
+        manual["pending"] = [{"sym": o.get("symbol"), "side": o.get("side"), "lev": o.get("leverage"),
+                              "limit": o.get("limit_price"), "sl": o.get("sl"), "tp": o.get("tp"),
+                              "cancel_above": o.get("cancel_above"), "note": (o.get("note") or "")[:120]}
+                             for o in _load_jsonl(md / "pending.jsonl") if o.get("status") == "pending"]
+        m_open = _load_jsonl(md / "positions.jsonl")
+        mo = []
+        for p in m_open:
+            entry = float(p.get("entry", 0) or 0); qty = float(p.get("qty", 0) or 0)
+            side = p.get("side"); mark = price_map.get(p.get("symbol"))
+            up = round(((mark - entry) if side == "LONG" else (entry - mark)) * qty, 3) if mark else None
+            so = p.get("scale_out") or {}
+            mo.append({"sym": p.get("symbol"), "side": side, "lev": p.get("leverage"),
+                       "entry": round(entry, 4), "mark": round(float(mark), 4) if mark else None,
+                       "sl": p.get("sl"), "tp": p.get("tp"), "liq": round(float(p.get("liq_px", 0) or 0), 4),
+                       "upnl": up, "chart": p.get("chart"), "chart_kind": "entry",
+                       "scale_out": ({"price": so.get("price"), "done": so.get("done")} if so else None),
+                       "note": (p.get("note") or "")[:140]})
+        manual["open"] = mo
+        cl = [c for c in _load_jsonl(md / "closed.jsonl") if c.get("net") is not None]
+        manual["closed_recent"] = [{"sym": c.get("symbol"), "side": c.get("side"), "net": c.get("net"),
+                                    "r": c.get("r"), "reason": c.get("reason"), "chart": c.get("chart"),
+                                    "ts": int(c.get("closed_ts") or 0)}
+                                   for c in sorted(cl, key=lambda x: int(x.get("closed_ts") or 0), reverse=True)[:10]]
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mode": "PAPER-ONLY · LIVE LOCKED",
         "llm_trader": lt,
+        "manual": manual,
         "account": {"equity": equity, "trades": trades, "open": len(fp_open), "realized": realized},
         "forward_paper": {
             "open": [{"sym": p.get("symbol"), "side": p.get("direction"),
