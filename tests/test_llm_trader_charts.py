@@ -41,6 +41,18 @@ def test_missing_keys_do_not_raise():
     assert out is None or isinstance(out, str)  # must not raise
 
 
+def test_hlines_render_without_error():
+    # entry/SL/TP reference lines must render (in-band) and never raise
+    bars = _bars(120, start=100.0)
+    out = ch.render_chart("BTCUSDT", bars, tf="15m",
+                          hlines=[(bars[-1]["close"], "ENTRY", "#c99a00"),
+                                  (bars[-1]["close"] * 0.98, "SL", "#d43a4b"),
+                                  (bars[-1]["close"] * 1.02, "TP", "#0a9d66"),
+                                  (bars[-1]["close"] * 0.5, "LIQ-far", "#f00")],  # off-screen -> skipped
+                          title_suffix=" · LIVE POSITION")
+    assert isinstance(out, str) and base64.b64decode(out)[:8] == b"\x89PNG\r\n\x1a\n"
+
+
 def test_ema_matches_reference():
     import numpy as np
     vals = np.array([10.0, 11, 12, 11, 13, 14, 13, 15], dtype=float)

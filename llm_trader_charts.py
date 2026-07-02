@@ -43,7 +43,9 @@ def _f(bar: dict[str, Any], *keys: str) -> float:
 
 def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
                  tf: str = "15m", lookback: int = 64,
-                 ema_periods: tuple[int, ...] = (20, 50, 200)) -> str | None:
+                 ema_periods: tuple[int, ...] = (20, 50, 200),
+                 hlines: Sequence[tuple[float, str, str]] | None = None,
+                 title_suffix: str = "") -> str | None:
     """Render the last `lookback` closed candles with EMAs + a volume panel.
     Returns a base64 PNG string (no data-url prefix), or None if unrenderable.
 
@@ -51,6 +53,10 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
     monochrome scheme that stays legible to the model. EMAs are computed over the
     FULL series passed in (so a 200-EMA is meaningful) then the view is cropped to
     the last `lookback` bars.
+
+    hlines: optional [(price, label, color)] reference lines (e.g. entry/SL/TP)
+    drawn on the price panel — used for the live "current position" chart. The
+    y-range is expanded to keep in-band lines visible.
     """
     if not bars or len(bars) < 5:
         return None
@@ -93,7 +99,23 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
         ax.axhline(last, color="black", linewidth=0.6, linestyle=":", alpha=0.5)
         ax.annotate(f"{last:.4g}", xy=(xr[-1], last), xytext=(4, 0),
                     textcoords="offset points", va="center", fontsize=8, fontweight="bold")
-        ax.set_title(f"{symbol} · {tf} · last {len(idx)} closed bars", fontsize=11, fontweight="bold")
+        # --- reference lines (entry/SL/TP for a live position chart) ---
+        if hlines:
+            view = c[idx]
+            vlo, vhi = float(view.min()), float(view.max())
+            band = max((vhi - vlo) * 0.6, vhi * 0.01)
+            for price, label, color in hlines:
+                try:
+                    price = float(price)
+                except Exception:
+                    continue
+                if not (vlo - band <= price <= vhi + band):
+                    continue  # too far off-screen (e.g. distant liq) -> skip
+                ax.axhline(price, color=color, linewidth=1.2, linestyle="--", alpha=0.9, zorder=5)
+                ax.annotate(f"{label} {price:.4g}", xy=(0, price), xytext=(2, 2),
+                            textcoords="offset points", fontsize=7.5, fontweight="bold",
+                            color=color, va="bottom")
+        ax.set_title(f"{symbol} · {tf} · last {len(idx)} closed bars{title_suffix}", fontsize=11, fontweight="bold")
         ax.legend(loc="upper left", fontsize=7, framealpha=0.6)
         ax.grid(True, alpha=0.15, linewidth=0.5)
         ax.margins(x=0.02)

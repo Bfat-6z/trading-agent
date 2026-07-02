@@ -11,6 +11,40 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 UI = ROOT.parent / "horizon-ui"
 OUT = UI / "data.json"
+CHARTS_DIR = UI / "charts"
+
+
+def _live_position_chart(cli, p, now_ms: int) -> str | None:
+    """Render (throttled ~90s) a CURRENT chart for an open position with
+    entry/SL/TP marked, so clicking any open position shows a live picture even
+    if it predates entry-chart saving. Returns a server-relative path or None."""
+    sym = p.get("symbol")
+    if not sym or cli is None:
+        return None
+    fn = f"live_{sym}.png"
+    fp = CHARTS_DIR / fn
+    try:
+        if fp.exists() and (now_ms / 1000 - fp.stat().st_mtime) < 90:
+            return "charts/" + fn   # fresh enough — reuse
+    except Exception:
+        pass
+    try:
+        import base64
+        import llm_trader_charts as ltc
+        import orderflow_data as of
+        bars = of.fetch_klines_with_flow(sym, "15m", months=0.12, end_ms=now_ms, client=cli, sleep_between=0.02)
+        entry = float(p.get("entry", 0) or 0); sl = float(p.get("sl", 0) or 0); tp = float(p.get("tp", 0) or 0)
+        hlines = [(entry, "ENTRY", "#c99a00")]
+        if sl: hlines.append((sl, "SL", "#d43a4b"))
+        if tp: hlines.append((tp, "TP", "#0a9d66"))
+        b64 = ltc.render_chart(sym, bars, tf="15m", hlines=hlines, title_suffix=" · LIVE POSITION")
+        if b64:
+            CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(base64.b64decode(b64))
+            return "charts/" + fn
+    except Exception:
+        pass
+    return None
 
 
 def _load_jsonl(p: Path):
@@ -28,9 +62,11 @@ def _load_jsonl(p: Path):
 
 
 def build() -> dict:
+    import time as _t
     from timebase import utc_now
     import research_governance as rg
 
+    now_ms = int(_t.time() * 1000)
     st = ROOT / "state"
     acct = {}
     try:
@@ -180,11 +216,14 @@ def build() -> dict:
             up = None
             if mark:
                 up = round(((mark - entry) if side == "LONG" else (entry - mark)) * qty, 3)
+            live_chart = _live_position_chart(cli, p, now_ms)
             pos_out.append({"sym": p.get("symbol"), "side": side, "lev": p.get("leverage"),
                             "entry": round(entry, 4), "mark": round(float(mark), 4) if mark else None,
                             "liq": round(float(p.get("liq_px", 0) or 0), 4),
                             "margin": round(float(p.get("margin", 0) or 0), 3),
-                            "upnl": up, "opened_at": p.get("opened_at"), "chart": p.get("chart"),
+                            "upnl": up, "opened_at": p.get("opened_at"),
+                            "chart": live_chart or p.get("chart"),
+                            "chart_kind": ("current" if live_chart else ("entry" if p.get("chart") else None)),
                             "rationale": (p.get("rationale") or "")[:180]})
         lt["open"] = pos_out
         # LIVE TRADE FEED — last 40 closed trades, full detail, newest first.
