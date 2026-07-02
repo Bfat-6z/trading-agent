@@ -188,10 +188,13 @@ def _features(enr, fb) -> dict[str, Any]:
     def ret(n):
         return round(float(c[i] / c[i - n] - 1) * 100, 2) if i >= n else 0.0
     vr = float(enr["vol_ratio"].iloc[i]) if "vol_ratio" in enr and enr["vol_ratio"].iloc[i] == enr["vol_ratio"].iloc[i] else 1.0
+    rsi = float(ltc._rsi(c)[-1])
+    rsi_state = "oversold" if rsi < 30 else "overbought" if rsi > 70 else "neutral"
     return {
         "ema20": round(float(e20), 4), "ema50": round(float(e50), 4), "ema200": round(float(e200), 4),
         "ema_stack": stack, "px_vs_ema20_pct": round(float(px / e20 - 1) * 100, 2) if e20 else 0.0,
         "vol_ratio": round(vr, 2), "ret5_pct": ret(5), "ret50_pct": ret(50),
+        "rsi14": round(rsi, 1), "rsi_state": rsi_state,
         "htf_1h_trend": _htf_trend(c, 4), "htf_4h_trend": _htf_trend(c, 16),
     }
 
@@ -412,9 +415,12 @@ def decide(context: list[dict[str, Any]], equity: float,
     market_overview = [{"symbol": c["symbol"], "ret20_pct": c.get("ret20_pct"),
                         "regime": c.get("regime")} for c in ranked[:20]]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money. You are shown CANDLESTICK charts "
-           "(with EMA20/50/200 and a volume panel) for the most active coins, plus their numeric context and a "
-           "broad market overview. READ THE CHARTS: trend & EMA stack/slope, structure (breakouts, ranges, "
-           "support/resistance), momentum vs exhaustion, volume confirmation. " + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           "(with EMA20/50/200, a volume panel, and an RSI(14) panel) for the most active coins, plus their "
+           "numeric context and a broad market overview. READ THE CHARTS: trend & EMA stack/slope, structure "
+           "(breakouts, ranges, support/resistance), momentum vs exhaustion, volume confirmation, and RSI "
+           "(oversold <30 leans LONG mean-reversion, overbought >70 leans SHORT) — but RSI is a HINT, not a "
+           "rule: in a strong trend oversold can stay oversold, so only fade RSI WITH structure/level support. "
+           + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": memory_context(), "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)

@@ -30,6 +30,26 @@ def _ema(values: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
+def _rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
+    """Wilder's RSI(14). Returns same length as closes (50 until warmed up)."""
+    n = len(closes)
+    out = np.full(n, 50.0)
+    if n <= period:
+        return out
+    d = np.diff(closes)
+    gain = np.where(d > 0, d, 0.0)
+    loss = np.where(d < 0, -d, 0.0)
+    ag = gain[:period].mean()
+    al = loss[:period].mean()
+    for i in range(period, n):
+        if i > period:
+            ag = (ag * (period - 1) + gain[i - 1]) / period
+            al = (al * (period - 1) + loss[i - 1]) / period
+        rs = ag / (al if al > 1e-12 else 1e-12)
+        out[i] = 100.0 - 100.0 / (1.0 + rs)
+    return out
+
+
 def _f(bar: dict[str, Any], *keys: str) -> float:
     for k in keys:
         v = bar.get(k)
@@ -112,11 +132,11 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
     BULL_Z, BEAR_Z = "#26a69a", "#ef5350"
 
     try:
-        fig, (ax, axv) = plt.subplots(
-            2, 1, figsize=(7.4, 4.7), dpi=100, sharex=True,
-            gridspec_kw={"height_ratios": [3.3, 1], "hspace": 0.06})
+        fig, (ax, axv, axr) = plt.subplots(
+            3, 1, figsize=(7.4, 5.5), dpi=100, sharex=True,
+            gridspec_kw={"height_ratios": [3.1, 0.9, 0.9], "hspace": 0.07})
         fig.patch.set_facecolor(BG)
-        for a in (ax, axv):
+        for a in (ax, axv, axr):
             a.set_facecolor(BG)
             a.grid(True, color=GRID, alpha=0.5, linewidth=0.5)
             a.tick_params(colors=TXT, labelsize=6)
@@ -196,7 +216,23 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
         vma = np.convolve(v, np.ones(20) / 20, mode="same") if n >= 20 else v
         axv.plot(xr, vma[idx], color="#f0b90b", linewidth=1.0, alpha=0.8)
         axv.set_ylabel("vol", fontsize=7, color=TXT)
+
+        # --- RSI(14) panel: 70 overbought / 30 oversold ---
+        rsi = _rsi(c)
+        axr.axhspan(70, 100, color=DN, alpha=0.07)
+        axr.axhspan(0, 30, color=UP, alpha=0.07)
+        axr.axhline(70, color=DN, linewidth=0.7, linestyle="--", alpha=0.6)
+        axr.axhline(30, color=UP, linewidth=0.7, linestyle="--", alpha=0.6)
+        axr.plot(xr, rsi[idx], color="#c084fc", linewidth=1.2)
+        axr.set_ylim(0, 100); axr.set_yticks([30, 70])
+        axr.set_ylabel("RSI", fontsize=7, color=TXT)
+        rv = rsi[-1]
+        state = "OVERSOLD" if rv < 30 else "OVERBOUGHT" if rv > 70 else ""
+        axr.annotate(f"{rv:.0f} {state}", xy=(xr[-1], rv), xytext=(4, 0), textcoords="offset points",
+                     va="center", fontsize=7, fontweight="bold",
+                     color=(UP if rv < 30 else DN if rv > 70 else "#c084fc"))
         ax.tick_params(labelbottom=False)
+        axv.tick_params(labelbottom=False)
 
         buf = io.BytesIO()
         fig.savefig(buf, format="png", bbox_inches="tight", facecolor=BG)
