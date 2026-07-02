@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import backtest_chart_signal as cs
+import llm_trader_charts as ltc
 import llm_trader_memory as ltm
 import llm_trader_risk as lr
 import llm_trader_scorecard as ls
@@ -121,6 +122,52 @@ def _regime(df) -> dict[str, Any]:
             "efficiency": er, "regime": chop, "atr_pct": round(float(df["atr"].iloc[i]) / float(c.iloc[i]) * 100, 2)}
 
 
+def _htf_trend(closes, step: int) -> str:
+    """Higher-timeframe trend from the 15m close array, resampled every `step`
+    bars (4=1h, 16=4h). up/down/flat vs a short EMA of the resampled series."""
+    r = closes[::step]
+    if len(r) < 6:
+        return "n/a"
+    import numpy as _np
+    a = 2.0 / (min(20, len(r)) + 1.0)
+    e = r[0]
+    for x in r[1:]:
+        e = a * x + (1 - a) * e
+    last = r[-1]
+    return "up" if last > e * 1.001 else "down" if last < e * 0.999 else "flat"
+
+
+def _features(enr, fb) -> dict[str, Any]:
+    """Rich numeric context (owner request A): EMA20/50/200 stack, volume surge,
+    multi-window returns, multi-timeframe trend — the numbers a chart trader reads
+    alongside the picture."""
+    import numpy as _np
+    c = enr["close"].to_numpy(dtype=float)
+    i = len(c) - 1
+    def ema(p):
+        a = 2.0 / (p + 1.0); e = c[0]
+        for x in c[1:]:
+            e = a * x + (1 - a) * e
+        return e
+    e20, e50, e200 = ema(20), ema(50), ema(200)
+    px = c[i]
+    if px > e20 > e50 > e200:
+        stack = "bull_stack"
+    elif px < e20 < e50 < e200:
+        stack = "bear_stack"
+    else:
+        stack = "mixed"
+    def ret(n):
+        return round(float(c[i] / c[i - n] - 1) * 100, 2) if i >= n else 0.0
+    vr = float(enr["vol_ratio"].iloc[i]) if "vol_ratio" in enr and enr["vol_ratio"].iloc[i] == enr["vol_ratio"].iloc[i] else 1.0
+    return {
+        "ema20": round(float(e20), 4), "ema50": round(float(e50), 4), "ema200": round(float(e200), 4),
+        "ema_stack": stack, "px_vs_ema20_pct": round(float(px / e20 - 1) * 100, 2) if e20 else 0.0,
+        "vol_ratio": round(vr, 2), "ret5_pct": ret(5), "ret50_pct": ret(50),
+        "htf_1h_trend": _htf_trend(c, 4), "htf_4h_trend": _htf_trend(c, 16),
+    }
+
+
 def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str, Any]]:
     import backtest_data_fetcher as bf
     out = []
@@ -140,15 +187,19 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
             i = len(enr) - 1
             closes = [round(float(x), 4) for x in enr["close"].iloc[-8:].tolist()]
             reg = _regime(enr)
+            feats = _features(enr, fb)
             out.append({
                 "symbol": sym, "price": round(float(enr["close"].iloc[i]), 4),
-                "last8_closes": closes, **reg,
+                "last8_closes": closes, **reg, **feats,
                 "funding_rate": round(float(enr["funding_rate"].iloc[i]) if "funding_rate" in enr else 0.0, 6),
                 "cvd_norm": round(float(enr["cvd_delta_norm"].iloc[i]) if "cvd_delta_norm" in enr and enr["cvd_delta_norm"].iloc[i]==enr["cvd_delta_norm"].iloc[i] else 0.0, 3),
                 "atr": round(float(enr["atr"].iloc[i]), 4),
                 # 24h quote volume (96 x 15m bars) drives the fee/slippage
                 # liquidity tier; missing data -> 0.0 -> "micro" (pessimistic).
                 "_quote_vol_24h": round(sum(float(b.get("quote_volume", 0.0)) for b in fb[-96:]), 0),
+                # last ~220 closed bars for chart rendering (underscore -> never
+                # sent as text; used only to draw the candlestick+EMA+vol image).
+                "_bars": fb[-220:],
                 "_ts": int(enr["ts_ms"].iloc[i]),
             })
         except Exception:
@@ -207,44 +258,56 @@ def _extract_json(text: str) -> Any:
     return None
 
 
-def decide(context: list[dict[str, Any]], equity: float,
-           status: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """ONE batched LLM call for ALL symbols (sees them together -> relative
-    selection; 1 call/cycle instead of N). The prompt carries ONE distilled
-    memory block built from ALL closed trades (grouped stats + data-lessons +
-    rationale-vs-outcome recents; plan 260702 #10/#11) — this REPLACED the old
-    per-symbol last-8-raw-rows injection, which discarded most history and was
-    the 'dead learning' path. Rules enforced in code. Returns validated
-    decisions."""
-    if not context:
-        return []
-    by_sym = {c["symbol"]: c for c in context}
-    payload = [{"symbol": ctx["symbol"],
-                **{k: v for k, v in ctx.items() if not k.startswith("_") and k != "symbol"}}
-               for ctx in context]
-    sys = ("You are a discretionary crypto FUTURES scalper on PAPER money. You see several liquid coins with "
-           "live context, plus a MEMORY block distilled from ALL your own closed trades: 'stats' = sample size "
-           "n and mean R by symbol+side / regime / hour bucket, 'lessons' = win/loss counts with mean R, "
-           "'recent' = your last trades with the rationale you gave vs what actually happened. Learn from this "
-           "record CONTEXTUALLY: the counts are evidence to weigh, not bans — a past loss does NOT blanket-ban "
-           "a setup; the same idea can win on another coin or regime or time (markets are non-stationary). Pick "
-           "only the BEST opportunities; SKIP the rest (SKIP is common and fine — no forced trades). For each "
-           "coin you want to trade, return an object. Reply ONLY with a JSON ARRAY (may be empty): "
-           "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT\",\"leverage\":5|10,\"size_pct\":5-10,"
-           "\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,\"rationale\":\"why, citing context\"}]")
-    # status (plan #15): measured scorecard + capacity so the LLM knows its own
-    # track record and how much room governance leaves it this cycle.
-    usr = json.dumps({"equity": round(equity, 2),
-                      "your_status": status or {},
-                      "memory": memory_context(),
-                      "coins": payload}, default=str)
-    raw = _llm(sys, usr)
-    arr = _extract_json(raw) if raw else None
+def _env_llm() -> tuple[str, str]:
+    """(base_url, api_key) for the vision call — os.environ first, then .env."""
+    base = os.environ.get("NINEROUTER_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
+    key = os.environ.get("NINEROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    if not key:
+        try:
+            for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k == "NINEROUTER_BASE_URL" and not base:
+                        base = v
+                    elif k == "NINEROUTER_API_KEY" and not key:
+                        key = v
+        except Exception:
+            pass
+    return (base.rstrip("/") or BASE_URL.rstrip("/")), key
+
+
+def _llm_vision(system: str, text: str, images: list[tuple[str, str]]) -> str | None:
+    """Vision call: send text + rendered chart PNGs to gpt-5.5 (verified to accept
+    images on 9router). images = [(label, base64_png)]. Returns text or None."""
+    base, key = _env_llm()
+    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for label, b64 in images:
+        content.append({"type": "text", "text": f"Chart — {label}:"})
+        content.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}})
+    body = json.dumps({"model": MODEL, "max_tokens": 1200, "temperature": 0.3,
+                       "messages": [{"role": "system", "content": system},
+                                    {"role": "user", "content": content}]}).encode()
+    req = urllib.request.Request(base + "/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + key}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            d = json.loads(r.read().decode())
+        return d["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Parse an LLM decision array and ENFORCE owner rules in code (x5/x10 only,
+    5-10% size, sane SL/TP). LLM only proposes within these bounds."""
     if isinstance(arr, dict):
         arr = [arr]
     if not isinstance(arr, list):
         return []
-    decisions = []
+    out = []
     for dec in arr:
         if not isinstance(dec, dict):
             continue
@@ -252,13 +315,84 @@ def decide(context: list[dict[str, Any]], equity: float,
         action = str(dec.get("action", "SKIP")).upper()
         if not ctx or action not in ("LONG", "SHORT"):
             continue
-        lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5   # ENFORCE x5/x10 only
-        size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # ENFORCE 5-10%
+        lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5          # x5/x10 only
+        size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # 5-10%
         sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))
         tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3)))
-        decisions.append({**ctx, "action": action, "leverage": lev, "size_pct": size_pct,
-                          "sl_pct": sl_pct, "tp_pct": tp_pct, "rationale": str(dec.get("rationale", ""))[:240]})
-    return decisions
+        out.append({**ctx, "action": action, "leverage": lev, "size_pct": size_pct,
+                    "sl_pct": sl_pct, "tp_pct": tp_pct, "rationale": str(dec.get("rationale", ""))[:240]})
+    return out
+
+
+_MEMORY_RULE = ("Learn from your MEMORY block CONTEXTUALLY: the counts are evidence to weigh, not bans — a past "
+                "loss does NOT blanket-ban a setup; the same idea can win on another coin/regime/time (markets are "
+                "non-stationary). Pick only the BEST setups; SKIP is common and fine — no forced trades. "
+                "Owner rules: leverage EXACTLY 5 or 10; size 5-10% of equity; respect your capacity limits.")
+_DECISION_SCHEMA = ("Reply ONLY with a JSON ARRAY (may be empty): [{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\","
+                    "\"leverage\":5|10,\"size_pct\":5-10,\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,\"rationale\":\"cite the chart/levels\"}]")
+
+
+def _decide_numeric(context: list[dict[str, Any]], equity: float,
+                    status: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Numeric-only decision (no charts) — used as the vision fallback and when
+    no charts render. ONE batched text call over the given coins."""
+    if not context:
+        return []
+    by_sym = {c["symbol"]: c for c in context}
+    payload = [{"symbol": c["symbol"], **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
+               for c in context]
+    sys = ("You are a discretionary crypto FUTURES scalper on PAPER money reading numeric context per coin. "
+           + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+    usr = json.dumps({"equity": round(equity, 2), "your_status": status or {},
+                      "memory": memory_context(), "coins": payload}, default=str)
+    return _validate_decisions(_extract_json(_llm(sys, usr)), by_sym)
+
+
+def _activity_score(c: dict[str, Any]) -> float:
+    """Cheap 'is this coin interesting right now' rank — |recent move| +
+    volume surge + order-flow imbalance. Picks which coins get a chart."""
+    return (abs(float(c.get("ret20_pct", 0) or 0))
+            + 4.0 * abs(float(c.get("vol_ratio", 1) or 1) - 1.0)
+            + 3.0 * abs(float(c.get("cvd_norm", 0) or 0)))
+
+
+def decide(context: list[dict[str, Any]], equity: float,
+           status: dict[str, Any] | None = None, *, max_charts: int = 5) -> list[dict[str, Any]]:
+    """CHART-BASED decision (owner request A+B): scan all coins numerically, pick
+    the most active ones, RENDER their candlestick+EMA+volume charts and let
+    gpt-5.5 SEE them (vision) before deciding — the way a discretionary trader
+    scans a watchlist then opens charts. Falls back to a numeric-only decision on
+    the same shortlist if the vision call fails, so it never stalls."""
+    if not context:
+        return []
+    # shortlist the most active coins to chart (wider scope -> better candidates)
+    ranked = sorted(context, key=_activity_score, reverse=True)
+    shortlist = ranked[:max_charts]
+    by_sym = {c["symbol"]: c for c in shortlist}
+    images, charted = [], []
+    for c in shortlist:
+        bars = c.get("_bars")
+        b64 = ltc.render_chart(c["symbol"], bars, tf=TF) if bars else None
+        if b64:
+            images.append((c["symbol"], b64)); charted.append(c)
+    if not images:
+        return _decide_numeric(shortlist, equity, status)   # nothing rendered -> numeric
+    # compact numeric to accompany each chart (no raw bars in text)
+    coins_txt = [{"symbol": c["symbol"], **{k: v for k, v in c.items()
+                  if not k.startswith("_") and k != "symbol"}} for c in charted]
+    market_overview = [{"symbol": c["symbol"], "ret20_pct": c.get("ret20_pct"),
+                        "regime": c.get("regime")} for c in ranked[:20]]
+    sys = ("You are a discretionary crypto FUTURES scalper on PAPER money. You are shown CANDLESTICK charts "
+           "(with EMA20/50/200 and a volume panel) for the most active coins, plus their numeric context and a "
+           "broad market overview. READ THE CHARTS: trend & EMA stack/slope, structure (breakouts, ranges, "
+           "support/resistance), momentum vs exhaustion, volume confirmation. " + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+    text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
+                       "memory": memory_context(), "charted_coins": coins_txt,
+                       "market_overview": market_overview}, default=str)
+    out = _validate_decisions(_extract_json(_llm_vision(sys, text, images)), by_sym)
+    if out:
+        return out
+    return _decide_numeric(charted, equity, status)   # vision failed/empty -> numeric fallback
 
 
 # ---------------------------------------------------------------------------
