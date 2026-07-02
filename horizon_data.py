@@ -184,7 +184,7 @@ def build() -> dict:
                             "entry": round(entry, 4), "mark": round(float(mark), 4) if mark else None,
                             "liq": round(float(p.get("liq_px", 0) or 0), 4),
                             "margin": round(float(p.get("margin", 0) or 0), 3),
-                            "upnl": up, "opened_at": p.get("opened_at"),
+                            "upnl": up, "opened_at": p.get("opened_at"), "chart": p.get("chart"),
                             "rationale": (p.get("rationale") or "")[:180]})
         lt["open"] = pos_out
         # LIVE TRADE FEED — last 40 closed trades, full detail, newest first.
@@ -193,6 +193,7 @@ def build() -> dict:
                        "exit": round(float(c.get("exit", 0) or 0), 4),
                        "net": round(float(c.get("net", 0) or 0), 3), "r": c.get("r"),
                        "reason": c.get("reason"), "ts": int(c.get("closed_ts") or 0),
+                       "chart": c.get("chart"),
                        "rationale": (c.get("rationale") or "")[:160]}
                       for c in sorted(closed_rows, key=lambda x: int(x.get("closed_ts") or 0), reverse=True)[:40]]
         lt["closed_recent"] = [{"sym": c["sym"], "side": c["side"], "r": c["r"], "reason": c["reason"]}

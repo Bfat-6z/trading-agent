@@ -104,6 +104,30 @@ def save_account(a: dict[str, Any]) -> None:
     ACCOUNT.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")
 
 
+# charts saved next to the UI so the static server serves them (/charts/<f>.png),
+# lets the dashboard show the EXACT entry chart the LLM saw for each trade.
+CHARTS_DIR = ROOT.parent / "horizon-ui" / "charts"
+
+
+def _save_entry_chart(b64: str | None, symbol: str, ts: int) -> str | None:
+    """Persist the base64 entry chart to horizon-ui/charts/ and return a
+    server-relative path. Keeps only the most recent ~250 charts."""
+    if not b64:
+        return None
+    try:
+        import base64 as _b64
+        CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+        fn = f"{symbol}_{int(ts)}.png"
+        (CHARTS_DIR / fn).write_bytes(_b64.b64decode(b64))
+        files = sorted(CHARTS_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-250]:
+            try: old.unlink()
+            except Exception: pass
+        return "charts/" + fn
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # context: real market features per symbol
 # ---------------------------------------------------------------------------
@@ -378,7 +402,8 @@ def decide(context: list[dict[str, Any]], equity: float,
         bars = c.get("_bars")
         b64 = ltc.render_chart(c["symbol"], bars, tf=TF) if bars else None
         if b64:
-            images.append((c["symbol"], b64)); charted.append(c)
+            c["_chart_b64"] = b64   # carry to open_positions so the EXACT chart the
+            images.append((c["symbol"], b64)); charted.append(c)  # LLM saw is persisted
     if not images:
         return _decide_numeric(shortlist, equity, status)   # nothing rendered -> numeric
     # compact numeric to accompany each chart (no raw bars in text)
@@ -464,10 +489,12 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
         # can rank liq ahead of SL pessimistically on every bar.
         mmr = lr.mmr_for(d["symbol"])
         liq_px = lr.liquidation_price(entry, lev, side, mmr)
+        chart_rel = _save_entry_chart(d.get("_chart_b64"), d["symbol"], d["_ts"])
         open_pos.append({"symbol": d["symbol"], "side": side, "entry": entry, "qty": qty,
                          "margin": round(margin, 4), "leverage": lev, "sl": sl, "tp": tp,
                          "liq_px": liq_px, "mmr": mmr, "quote_vol_24h": quote_vol, "tier": tier,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
+                         "chart": chart_rel,
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
     _rewrite(POSITIONS, open_pos)
@@ -553,7 +580,7 @@ def resolve(client: Any, now_ms: int) -> int:
         rec = {"symbol": p["symbol"], "side": side, "regime": p.get("regime"), "hour_utc": p.get("hour_utc"),
                "entry": entry, "exit": exit_px, "reason": reason, "net": round(net, 4), "r": round(r, 3),
                "fee": round(fee, 4), "funding": round(funding, 4), "liq_px": round(liq_px, 6), "tier": tier,
-               "leverage": lev, "rationale": p.get("rationale"), "closed_ts": now_ms}
+               "leverage": lev, "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         _append(CLOSED, rec)
         _append(MEMORY, rec)   # self-learning: outcome tagged by context
         closed_n += 1
