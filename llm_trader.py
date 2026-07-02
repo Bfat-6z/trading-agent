@@ -58,12 +58,14 @@ ALLOWED_LEVERAGE = (5, 10)
 # call regardless of coin count, so breadth is ~free on the model side).
 UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "30"))
 UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "20000000"))
-# Isolated margin: each trade only commits its own margin (5-10% of equity) and
-# its max loss is that margin — leverage raises notional, NOT capital-at-risk. So
-# the real limiter is TOTAL MARGIN, not a trade count. max_concurrent is kept
-# high (a sanity backstop) and lets margin govern: e.g. 16x $5 = $80 = 80% cap.
-MAX_CONCURRENT = int(os.environ.get("LLM_TRADER_MAX_CONCURRENT", "20"))
-MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "80"))
+# Owner: UNLIMITED number of positions — accepts correlation risk for bigger
+# upside. No trade-count cap (50 >> the 30-coin universe, 1-per-symbol, so it
+# never binds). MARGIN is the only physical limit: at 5-10%/trade on $100 you can
+# hold ~10-19 positions before capital is fully deployed (95% cap leaves a hair).
+# The daily -15% breaker stays as the sole backstop (stops NEW trades after a bad
+# day; does not close positions).
+MAX_CONCURRENT = int(os.environ.get("LLM_TRADER_MAX_CONCURRENT", "50"))
+MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "95"))
 
 
 # ---------------------------------------------------------------------------
