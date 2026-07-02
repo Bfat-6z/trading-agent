@@ -50,11 +50,24 @@ def build() -> dict:
     price_series, live_price = [], None
     live_sym = (fp_open[0].get("symbol") if fp_open else "BTCUSDT")
     has_pos = bool(fp_open)
+    quotes = []
     try:
         from tradingagents.binance.client import spot_client
-        kl = spot_client().futures_klines(symbol=live_sym, interval="5m", limit=96)
+        cli = spot_client()
+        kl = cli.futures_klines(symbol=live_sym, interval="5m", limit=96)
         price_series = [round(float(r[4]), 2) for r in kl]
         live_price = price_series[-1] if price_series else None
+        # REAL ticker quotes (one bulk call) — the header tape must never show
+        # baked-in numbers next to a live chart.
+        want = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                "DOGEUSDT", "SUIUSDT", "AVAXUSDT", "ADAUSDT", "LINKUSDT"]
+        stats = {t["symbol"]: t for t in cli.futures_ticker() if t.get("symbol") in want}
+        for s in want:
+            t = stats.get(s)
+            if t:
+                quotes.append({"s": s.replace("USDT", ""),
+                               "px": float(t.get("lastPrice", 0) or 0),
+                               "chg": round(float(t.get("priceChangePercent", 0) or 0), 2)})
     except Exception:
         pass
     fp_rs = [float(c.get("r_multiple", 0)) for c in fp_closed]
@@ -145,6 +158,7 @@ def build() -> dict:
             "closed": len(fp_closed), "mean_r": fp_mean, "target": 200,
         },
         "live": {"sym": live_sym, "price": live_price, "series": price_series, "has_pos": has_pos},
+        "quotes": quotes,
         "forward_test": {"labels": ft_labels, "target_per_bucket": 200},
         "research": {
             "global_trials": global_trials, "cells_killed": killed_cells,
