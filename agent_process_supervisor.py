@@ -124,7 +124,7 @@ def specs() -> list[AgentSpec]:
         AgentSpec("whale_flow_observer", "whale_flow_observer.py", ("--interval-seconds", "180"), STATE_DIR / "whale_flow_observer.pid", STATE_DIR / "whale_flow_observer_heartbeat.json", 600),
         AgentSpec("forward_test_harness", "forward_test_harness.py", ("--interval-seconds", "900"), STATE_DIR / "forward_test" / "forward_test_harness.pid", STATE_DIR / "forward_test" / "forward_test_harness_heartbeat.json", 2700),
         AgentSpec("forward_strategy_paper", "forward_strategy_paper.py", ("--interval-seconds", "1800"), STATE_DIR / "forward_strategy" / "forward_strategy_paper.pid", STATE_DIR / "forward_strategy" / "forward_strategy_paper_heartbeat.json", 4200),
-        AgentSpec("llm_trader", "llm_trader.py", ("--interval-seconds", "300"), STATE_DIR / "llm_trader" / "llm_trader.pid", STATE_DIR / "llm_trader" / "llm_trader_heartbeat.json", 1200),
+        AgentSpec("llm_trader", "llm_trader.py", ("--interval-seconds", "90"), STATE_DIR / "llm_trader" / "llm_trader.pid", STATE_DIR / "llm_trader" / "llm_trader_heartbeat.json", 1200),
         AgentSpec("counterfactual_replay_agent", "counterfactual_replay_agent.py", ("--interval-seconds", "300"), STATE_DIR / "counterfactual_replay_agent.pid", STATE_DIR / "counterfactual_replay_agent_heartbeat.json", 900),
         AgentSpec("learning_exam_benchmark", "learning_exam_benchmark.py", ("--interval-seconds", "3600"), STATE_DIR / "learning_exam_benchmark.pid", STATE_DIR / "learning_exam_benchmark_heartbeat.json", 4500),
         AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),

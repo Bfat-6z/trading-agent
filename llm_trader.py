@@ -51,6 +51,14 @@ MAX_HOLD_BARS = 32
 # OWNER RULES (hard):
 SIZE_PCT_MIN, SIZE_PCT_MAX = 5.0, 10.0
 ALLOWED_LEVERAGE = (5, 10)
+# SCOPE + FREQUENCY (owner: wider coin scan, higher frequency). Universe is
+# re-selected each cycle by quote-volume; more concurrent slots so a wider scan
+# actually turns into more live trades (the batched decision is still ONE LLM
+# call regardless of coin count, so breadth is ~free on the model side).
+UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "30"))
+UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "20000000"))
+MAX_CONCURRENT = int(os.environ.get("LLM_TRADER_MAX_CONCURRENT", "8"))
+MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "80"))
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +309,10 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
         raw_px = float(d["price"])
         entry = raw_px * (1 + slip) if side == "LONG" else raw_px * (1 - slip)
         margin = equity * d["size_pct"] / 100.0
-        # Per-open caps (fail-closed): total margin <= 60% equity, <= 4 concurrent.
-        ok, cap_why = lr.can_open(margin, equity, open_pos)
+        # Per-open caps (fail-closed): total margin + concurrent-position limit.
+        ok, cap_why = lr.can_open(margin, equity, open_pos,
+                                  max_total_margin_pct=MAX_TOTAL_MARGIN_PCT,
+                                  max_concurrent=MAX_CONCURRENT)
         if not ok:
             _append(LT_DIR / "governance.jsonl",
                     {"ts_ms": now_ms, "event": "can_open_block", "why": cap_why,
@@ -464,13 +474,13 @@ def run_once() -> dict[str, Any]:
         "scorecard": {"n": card["metrics"]["n"], "win_rate": card["metrics"]["win_rate"],
                       "mean_r": card["metrics"]["mean_r"], "liq_count": card["metrics"]["liq_count"],
                       "verdict": card["verdict"]["code"]},
-        "capacity": {"open": len(open_now), "max_concurrent": 4,
+        "capacity": {"open": len(open_now), "max_concurrent": MAX_CONCURRENT,
                      "margin_used_pct": round(margin_used / equity * 100, 1) if equity > 0 else 100.0,
-                     "margin_cap_pct": 60.0,
+                     "margin_cap_pct": MAX_TOTAL_MARGIN_PCT,
                      "daily_breaker": ("BLOCKED: " + why) if blocked else "ok"},
     }
     uni = us.select_universe(client, end_ms=now_ms, months=1.0, timeframe="1h",
-                             min_daily_quote_volume=50_000_000.0, max_symbols=6)
+                             min_daily_quote_volume=UNIVERSE_MIN_QVOL, max_symbols=UNIVERSE_MAX)
     ctx = build_context(client, uni["selected"], now_ms)
     decisions = decide(ctx, equity, status=status)
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
@@ -493,7 +503,7 @@ if __name__ == "__main__":
     import argparse, time
     ap = argparse.ArgumentParser(description="LLM discretionary PAPER trader (paper-only)")
     ap.add_argument("--once", action="store_true")
-    ap.add_argument("--interval-seconds", type=float, default=300.0)  # higher frequency
+    ap.add_argument("--interval-seconds", type=float, default=90.0)  # higher frequency (cycle is LLM-bound ~2m; small sleep = back-to-back)
     a = ap.parse_args()
     LT_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()), encoding="ascii")
