@@ -51,25 +51,60 @@ def build() -> dict:
     live_sym = (fp_open[0].get("symbol") if fp_open else "BTCUSDT")
     has_pos = bool(fp_open)
     quotes = []
+    price_map = {}   # symbol -> last price, for marking open positions to market
+    # last-good price cache: a transient Binance hiccup must NOT blank the ticker
+    # tape or zero-out open-position MTM (that would read as a wrong number).
+    cache_path = st / "llm_trader" / "price_cache.json"
+    cli = None
     try:
         from tradingagents.binance.client import spot_client
         cli = spot_client()
-        kl = cli.futures_klines(symbol=live_sym, interval="5m", limit=96)
-        price_series = [round(float(r[4]), 2) for r in kl]
-        live_price = price_series[-1] if price_series else None
-        # REAL ticker quotes (one bulk call) — the header tape must never show
-        # baked-in numbers next to a live chart.
-        want = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                "DOGEUSDT", "SUIUSDT", "AVAXUSDT", "ADAUSDT", "LINKUSDT"]
-        stats = {t["symbol"]: t for t in cli.futures_ticker() if t.get("symbol") in want}
-        for s in want:
-            t = stats.get(s)
-            if t:
-                quotes.append({"s": s.replace("USDT", ""),
-                               "px": float(t.get("lastPrice", 0) or 0),
-                               "chg": round(float(t.get("priceChangePercent", 0) or 0), 2)})
     except Exception:
-        pass
+        cli = None
+    # (legacy) 5m series for the live tip fallback — isolated so its failure
+    # can't take down the ticker/MTM fetch below.
+    if cli is not None:
+        try:
+            kl = cli.futures_klines(symbol=live_sym, interval="5m", limit=96)
+            price_series = [round(float(r[4]), 2) for r in kl]
+            live_price = price_series[-1] if price_series else None
+        except Exception:
+            pass
+        # REAL bulk ticker: full price map for MTM + header tape — own try block.
+        try:
+            all_t = cli.futures_ticker()
+            for t in all_t:
+                sym = t.get("symbol")
+                if sym:
+                    price_map[sym] = float(t.get("lastPrice", 0) or 0)
+            want = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                    "DOGEUSDT", "SUIUSDT", "AVAXUSDT", "ADAUSDT", "LINKUSDT"]
+            stats = {t["symbol"]: t for t in all_t if t.get("symbol") in want}
+            for s in want:
+                t = stats.get(s)
+                if t:
+                    quotes.append({"s": s.replace("USDT", ""),
+                                   "px": float(t.get("lastPrice", 0) or 0),
+                                   "chg": round(float(t.get("priceChangePercent", 0) or 0), 2)})
+        except Exception:
+            pass
+    # Fallback to last-good cache when the bulk ticker missed this cycle.
+    if not quotes or not price_map:
+        try:
+            cached = json.loads(cache_path.read_text())
+            if not quotes:
+                quotes = cached.get("quotes", [])
+            if not price_map:
+                price_map = {k: float(v) for k, v in (cached.get("price_map") or {}).items()}
+        except Exception:
+            pass
+    elif quotes and price_map:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps({"quotes": quotes, "price_map": price_map,
+                                              "cached_at": utc_now()}), encoding="utf-8")
+        except Exception:
+            pass
     fp_rs = [float(c.get("r_multiple", 0)) for c in fp_closed]
     fp_mean = round(sum(fp_rs) / len(fp_rs), 4) if fp_rs else 0.0
 
@@ -134,14 +169,43 @@ def build() -> dict:
         lt["pvalue"] = card.get("pvalue")
         lt["liq_count"] = int(card.get("metrics", {}).get("liq_count", 0) or 0)
         lt["mean_r"] = card.get("metrics", {}).get("mean_r")
+        open_rows = _load_jsonl(lt_dir / "positions.jsonl")
         lt["open"] = [{"sym": p.get("symbol"), "side": p.get("side"),
                        "lev": p.get("leverage"),
                        "entry": round(float(p.get("entry", 0) or 0), 4),
                        "liq": round(float(p.get("liq_px", 0) or 0), 4)}
-                      for p in _load_jsonl(lt_dir / "positions.jsonl")]
+                      for p in open_rows]
+        closed_rows = _load_jsonl(lt_dir / "closed.jsonl")
         lt["closed_recent"] = [{"sym": c.get("symbol"), "side": c.get("side"),
                                 "r": c.get("r"), "reason": c.get("reason")}
-                               for c in _load_jsonl(lt_dir / "closed.jsonl")[-5:]]
+                               for c in closed_rows[-5:]]
+
+        # REAL money chart: cumulative equity over closed trades (seeded at the
+        # starting capital), plus a live tip marked-to-market from open positions.
+        START = 100.0
+        closed_sorted = sorted(closed_rows, key=lambda c: int(c.get("closed_ts") or 0))
+        eq = START
+        first_ts = int(closed_sorted[0].get("closed_ts") or 0) if closed_sorted else 0
+        curve = [{"ts": (first_ts - 60000) if first_ts else 0, "equity": round(START, 4)}]
+        for c in closed_sorted:
+            eq += float(c.get("net") or 0)
+            curve.append({"ts": int(c.get("closed_ts") or 0), "equity": round(eq, 4)})
+        realized_eq = round(eq, 4)   # == account equity (both = START + sum(net))
+        # Unrealized MTM of open positions at current prices (gross; before exit
+        # costs — labelled "unrealized" so it isn't mistaken for booked P&L).
+        unreal = 0.0
+        for p in open_rows:
+            cur = price_map.get(p.get("symbol"))
+            if not cur:
+                continue
+            entry, qty = float(p.get("entry", 0) or 0), float(p.get("qty", 0) or 0)
+            g = (cur - entry) * qty if p.get("side") == "LONG" else (entry - cur) * qty
+            unreal += g
+        lt["realized"] = realized_eq
+        lt["unrealized"] = round(unreal, 4)
+        lt["live_equity"] = round(realized_eq + unreal, 4)
+        lt["equity_curve"] = curve
+        lt["start_equity"] = START
     except Exception:
         pass
 
