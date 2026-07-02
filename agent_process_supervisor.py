@@ -70,6 +70,7 @@ CHILD_ENV_ALLOWLIST = {
     "TRADINGAGENTS_JUDGE_LLM",
     "TRADINGAGENTS_LLM_PROVIDER",
     "TRADINGAGENTS_QUICK_THINK_LLM",
+    "TRADING_AGENT_DASHBOARD_TOKEN",
     "TRADING_AGENT_MODE",
     "TRADING_AGENT_PAPER_ACCOUNT_USDT",
     "TRADING_AGENT_PAPER_EXPLORATION",
@@ -104,7 +105,10 @@ class AgentSpec:
 
 def specs() -> list[AgentSpec]:
     return [
-        AgentSpec("dashboard", "agent_status_dashboard.py", ("--host", "127.0.0.1", "--port", "8090"), STATE_DIR / "agent_status_dashboard.pid", None, None),
+        # Bind 0.0.0.0 so the Cloudflare tunnel reaches it; /api/* stays gated by
+        # TRADING_AGENT_DASHBOARD_TOKEN (fleet_watchdog sets it from the token
+        # file). Without that env the dashboard falls back to local-only.
+        AgentSpec("dashboard", "agent_status_dashboard.py", ("--host", "0.0.0.0", "--port", "8090"), STATE_DIR / "agent_status_dashboard.pid", None, None),
         AgentSpec("host_runtime_monitor", "host_runtime_monitor.py", ("--interval-seconds", "300"), STATE_DIR / "host_runtime_monitor.pid", STATE_DIR / "host_runtime_monitor_heartbeat.json", 900),
         AgentSpec("market_observer", "market_observer.py", tuple(), STATE_DIR / "market_observer.pid", STATE_DIR / "market_observer_heartbeat.json", 420),
         AgentSpec("news_observer", "news_observer.py", tuple(), STATE_DIR / "news_observer.pid", STATE_DIR / "news_observer_heartbeat.json", 900),
