@@ -308,6 +308,23 @@ def _extract_json(text: str) -> Any:
     return None
 
 
+_PLAYBOOK_CACHE: str | None = None
+
+
+def _playbook() -> str:
+    """The researched 15m TA playbook (ta_playbook.md) injected into the decision
+    prompt so gpt-5.5 reads charts by an explicit confluence checklist (EMA stack,
+    S/R zones, RSI-50, candle+volume triggers) instead of winging it. Cached;
+    empty string if the file is missing (feature degrades gracefully)."""
+    global _PLAYBOOK_CACHE
+    if _PLAYBOOK_CACHE is None:
+        try:
+            _PLAYBOOK_CACHE = (ROOT / "ta_playbook.md").read_text(encoding="utf-8").strip()
+        except Exception:
+            _PLAYBOOK_CACHE = ""
+    return _PLAYBOOK_CACHE
+
+
 def _env_llm() -> tuple[str, str]:
     """(base_url, api_key) for the vision call — os.environ first, then .env."""
     base = os.environ.get("NINEROUTER_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
@@ -449,7 +466,8 @@ def decide(context: list[dict[str, Any]], equity: float,
            "the nearest SUPPORT and RESISTANCE zone (price range + strength + quality + touch count) drawn on the "
            "chart as SUP/RES lines, and an invalidation level. Prefer LONGs off a strong support zone with bullish "
            "structure, SHORTs off resistance with bearish structure; avoid buying into overhead resistance or "
-           "shorting into support. " + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           "shorting into support.\n\n" + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
+           + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": memory_context(), "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
