@@ -45,6 +45,9 @@ def _rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
         if i > period:
             ag = (ag * (period - 1) + gain[i - 1]) / period
             al = (al * (period - 1) + loss[i - 1]) / period
+        if ag <= 1e-12 and al <= 1e-12:
+            out[i] = 50.0            # flat series -> neutral, not false 'oversold' 0
+            continue
         rs = ag / (al if al > 1e-12 else 1e-12)
         out[i] = 100.0 - 100.0 / (1.0 + rs)
     return out

@@ -206,7 +206,16 @@ def build() -> dict:
         lt["liq_count"] = int(card.get("metrics", {}).get("liq_count", 0) or 0)
         lt["mean_r"] = card.get("metrics", {}).get("mean_r")
         open_rows = _load_jsonl(lt_dir / "positions.jsonl")
-        closed_rows = _load_jsonl(lt_dir / "closed.jsonl")
+        # dedupe double-booked closes (concurrent-loop overlap) by trade identity
+        _cr = _load_jsonl(lt_dir / "closed.jsonl"); _seen = set(); closed_rows = []
+        for _c in _cr:
+            if _c.get("net") is None:
+                closed_rows.append(_c); continue
+            _k = (_c.get("symbol"), _c.get("side"), round(float(_c.get("entry", 0) or 0), 4),
+                  round(float(_c.get("exit", 0) or 0), 4), round(float(_c.get("net", 0) or 0), 4), _c.get("reason"))
+            if _k in _seen:
+                continue
+            _seen.add(_k); closed_rows.append(_c)
         # positions enriched with live mark price + per-position unrealized PnL
         # (Binance-style positions table).
         pos_out = []

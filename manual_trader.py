@@ -128,7 +128,14 @@ def place_limit(symbol: str, side: str, limit_price: float, margin: float, lev: 
     return row
 
 
-def _open(client, symbol, side, entry, margin, lev, sl, tp, scale_out, note, now_ms, kind) -> dict:
+def _open(client, symbol, side, entry, margin, lev, sl, tp, scale_out, note, now_ms, kind,
+          entry_ts=None) -> dict:
+    # entry_ts = the bar the position actually started on. For a LIMIT fill this
+    # MUST be the fill bar's ts_ms, not now_ms — otherwise the resolver's
+    # `ts_ms > entry_ts` filter finds ZERO closed bars (every closed bar has
+    # ts_ms < now_ms) and never evaluates an SL/TP/liq that hit on/after the fill.
+    if entry_ts is None:
+        entry_ts = now_ms
     mmr = lr.mmr_for(symbol)
     liq = lr.liquidation_price(entry, lev, side, mmr)
     qty = (margin * lev) / entry if entry > 0 else 0.0
@@ -142,7 +149,7 @@ def _open(client, symbol, side, entry, margin, lev, sl, tp, scale_out, note, now
            "qty": qty, "qty0": qty, "margin": round(margin, 4), "margin0": round(margin, 4),
            "leverage": int(lev), "sl": sl, "tp": tp, "liq_px": liq, "mmr": mmr,
            "scale_out": so, "no_timeout": True, "source": "manual", "kind": kind,
-           "entry_ts": now_ms, "opened_at_ms": now_ms, "note": note, "chart": chart}
+           "entry_ts": int(entry_ts), "opened_at_ms": now_ms, "note": note, "chart": chart}
     rows = _load(POSITIONS); rows.append(pos); _rewrite(POSITIONS, rows)
     return pos
 
@@ -168,11 +175,12 @@ def _resolve_pending(client, now_ms) -> int:
         except Exception:
             still.append(od); continue
         filled = cancelled = None
+        fill_ts = None
         for b in fut:
             hi, lo = float(b["high"]), float(b["low"])
             # fill: buy-limit fills when price trades DOWN to it; sell-limit when UP to it
             if (side == "LONG" and lo <= lim) or (side == "SHORT" and hi >= lim):
-                filled = lim; break
+                filled = lim; fill_ts = int(b["ts_ms"]); break
             if od.get("cancel_above") and hi >= float(od["cancel_above"]):
                 cancelled = "pumped_above"; break
             if od.get("cancel_below") and lo <= float(od["cancel_below"]):
@@ -180,8 +188,11 @@ def _resolve_pending(client, now_ms) -> int:
         if filled is None and now_ms >= int(od.get("expires_ts", 0)):
             cancelled = "expired"
         if filled is not None:
+            # entry_ts = the FILL bar so the resolver evaluates SL/TP/liq on
+            # every bar AFTER the fill (audit fix: was now_ms -> 0 bars -> missed stops)
             _open(client, sym, side, filled, float(od["margin"]), int(od["leverage"]),
-                  od.get("sl"), od.get("tp"), od.get("scale_out"), od.get("note", "") + " [limit filled]", now_ms, kind="limit")
+                  od.get("sl"), od.get("tp"), od.get("scale_out"), od.get("note", "") + " [limit filled]",
+                  now_ms, kind="limit", entry_ts=fill_ts)
             _append(CLOSED, {"event": "limit_filled", "id": od["id"], "symbol": sym, "side": side,
                              "fill": filled, "ts": now_ms})
             changed += 1

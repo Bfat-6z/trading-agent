@@ -95,6 +95,22 @@ def _append(path: Path, row: dict[str, Any]) -> None:
         fh.write(json.dumps(row, default=str) + "\n")
 
 
+def _dedupe_closed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop double-booked closed trades (a position can only close once; a
+    concurrent-loop overlap can append it twice with different closed_ts). Key on
+    the trade identity, NOT closed_ts, so a re-book collapses to one."""
+    seen, out = set(), []
+    for r in rows:
+        if r.get("net") is None:
+            out.append(r); continue
+        k = (r.get("symbol"), r.get("side"), round(float(r.get("entry", 0) or 0), 4),
+             round(float(r.get("exit", 0) or 0), 4), round(float(r.get("net", 0) or 0), 4), r.get("reason"))
+        if k in seen:
+            continue
+        seen.add(k); out.append(r)
+    return out
+
+
 def load_account() -> dict[str, Any]:
     if ACCOUNT.exists():
         try: return json.loads(ACCOUNT.read_text())
@@ -262,7 +278,7 @@ def memory_context() -> dict[str, Any]:
     llm_trader_memory module — plan 260702 checklist #10/#11. Reads CLOSED
     (canonical append-only log written by resolve); llm_trader_memory
     guarantees malformed rows are skipped, so this can't kill the loop."""
-    return ltm.build_memory_context(_load(CLOSED))
+    return ltm.build_memory_context(_dedupe_closed(_load(CLOSED)))
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +650,7 @@ def refresh_scorecard(client: Any) -> dict[str, Any]:
     """Recompute + persist the measured-edge scorecard (plan #5-#9). This is the
     ONLY thing allowed to answer 'is the LLM any good?' — measured P&L with
     bootstrap CI + permutation p-value, never vibes."""
-    closed = _load(CLOSED)
+    closed = _dedupe_closed(_load(CLOSED))   # never let a double-booked trade inflate the edge
     card = ls.scorecard(closed, benchmark=_benchmark(client, closed))
     LT_DIR.mkdir(parents=True, exist_ok=True)
     SCORECARD.write_text(json.dumps(card, indent=1, default=str), encoding="utf-8")

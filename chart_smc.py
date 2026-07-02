@@ -86,13 +86,17 @@ def smc_summary(bars: list[dict[str, Any]], symbol: str, timeframe: str = "15m")
                     "strength": round(_num(z.get("strength"), 0), 2), "quality": z.get("quality"),
                     "touches": z.get("touch_count"), "rel": z.get("price_relation")}
 
-        events = sd.get("events") or []
+        # CORRECT keys (audit fix): the structure bundle emits `structure_events`
+        # (each with `event_type` e.g. CHOCH_UP/BOS_UP), and swing labels live on
+        # each pivot row under `structure_label` — not events/kind/swing_labels.
+        events = sd.get("structure_events") or []
         summary = {
             "trend": sd.get("trend_state"), "bias": sd.get("side_bias"),
             "confidence": sd.get("confidence"),
             "invalidation": sd.get("invalidation_level"),
-            "last_structure_event": (events[-1].get("kind") or events[-1].get("event")) if events else None,
-            "swing_labels": (sd.get("swing_labels") or sd.get("labels") or [])[-6:],
+            "last_structure_event": events[-1].get("event_type") if events else None,
+            "swing_labels": [p.get("structure_label") for p in (sd.get("pivots") or [])
+                             if p.get("structure_label")][-6:],
             "nearest_support": zfmt(n_sup), "nearest_resistance": zfmt(n_res),
             "n_zones": len(zones), "n_pivots": pd.get("pivot_count"),
         }
