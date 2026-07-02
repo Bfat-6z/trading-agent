@@ -170,15 +170,33 @@ def build() -> dict:
         lt["liq_count"] = int(card.get("metrics", {}).get("liq_count", 0) or 0)
         lt["mean_r"] = card.get("metrics", {}).get("mean_r")
         open_rows = _load_jsonl(lt_dir / "positions.jsonl")
-        lt["open"] = [{"sym": p.get("symbol"), "side": p.get("side"),
-                       "lev": p.get("leverage"),
-                       "entry": round(float(p.get("entry", 0) or 0), 4),
-                       "liq": round(float(p.get("liq_px", 0) or 0), 4)}
-                      for p in open_rows]
         closed_rows = _load_jsonl(lt_dir / "closed.jsonl")
-        lt["closed_recent"] = [{"sym": c.get("symbol"), "side": c.get("side"),
-                                "r": c.get("r"), "reason": c.get("reason")}
-                               for c in closed_rows[-5:]]
+        # positions enriched with live mark price + per-position unrealized PnL
+        # (Binance-style positions table).
+        pos_out = []
+        for p in open_rows:
+            entry = float(p.get("entry", 0) or 0); qty = float(p.get("qty", 0) or 0)
+            side = p.get("side"); mark = price_map.get(p.get("symbol"))
+            up = None
+            if mark:
+                up = round(((mark - entry) if side == "LONG" else (entry - mark)) * qty, 3)
+            pos_out.append({"sym": p.get("symbol"), "side": side, "lev": p.get("leverage"),
+                            "entry": round(entry, 4), "mark": round(float(mark), 4) if mark else None,
+                            "liq": round(float(p.get("liq_px", 0) or 0), 4),
+                            "margin": round(float(p.get("margin", 0) or 0), 3),
+                            "upnl": up, "opened_at": p.get("opened_at"),
+                            "rationale": (p.get("rationale") or "")[:180]})
+        lt["open"] = pos_out
+        # LIVE TRADE FEED — last 40 closed trades, full detail, newest first.
+        lt["feed"] = [{"sym": c.get("symbol"), "side": c.get("side"), "lev": c.get("leverage"),
+                       "entry": round(float(c.get("entry", 0) or 0), 4),
+                       "exit": round(float(c.get("exit", 0) or 0), 4),
+                       "net": round(float(c.get("net", 0) or 0), 3), "r": c.get("r"),
+                       "reason": c.get("reason"), "ts": int(c.get("closed_ts") or 0),
+                       "rationale": (c.get("rationale") or "")[:160]}
+                      for c in sorted(closed_rows, key=lambda x: int(x.get("closed_ts") or 0), reverse=True)[:40]]
+        lt["closed_recent"] = [{"sym": c["sym"], "side": c["side"], "r": c["r"], "reason": c["reason"]}
+                               for c in lt["feed"][:5]]
 
         # REAL money chart: cumulative equity over closed trades (seeded at the
         # starting capital), plus a live tip marked-to-market from open positions.
