@@ -106,9 +106,36 @@ def build() -> dict:
         "status": ("FORWARD-PAPER · unconfirmed" if len(fp_closed) < 200 else "readable"),
     }
 
+    # LLM discretionary trader (llm_trader.py) — separate paper account, its
+    # measured scorecard is the only edge claim allowed on the dashboard.
+    lt = {"equity": None, "trades": 0, "win_rate": None, "verdict": "—",
+          "pvalue": None, "open": [], "closed_recent": [], "liq_count": 0}
+    try:
+        lt_dir = st / "llm_trader"
+        la = json.loads((lt_dir / "account.json").read_text())
+        lt["equity"] = round(float(la.get("equity", 0) or 0), 2)
+        lt["trades"] = int(la.get("trades", 0) or 0)
+        lt["win_rate"] = (round(int(la.get("wins", 0)) / lt["trades"], 3) if lt["trades"] else None)
+        card = json.loads((lt_dir / "scorecard.json").read_text())
+        lt["verdict"] = str(card.get("verdict", {}).get("code", "—"))
+        lt["pvalue"] = card.get("pvalue")
+        lt["liq_count"] = int(card.get("metrics", {}).get("liq_count", 0) or 0)
+        lt["mean_r"] = card.get("metrics", {}).get("mean_r")
+        lt["open"] = [{"sym": p.get("symbol"), "side": p.get("side"),
+                       "lev": p.get("leverage"),
+                       "entry": round(float(p.get("entry", 0) or 0), 4),
+                       "liq": round(float(p.get("liq_px", 0) or 0), 4)}
+                      for p in _load_jsonl(lt_dir / "positions.jsonl")]
+        lt["closed_recent"] = [{"sym": c.get("symbol"), "side": c.get("side"),
+                                "r": c.get("r"), "reason": c.get("reason")}
+                               for c in _load_jsonl(lt_dir / "closed.jsonl")[-5:]]
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mode": "PAPER-ONLY · LIVE LOCKED",
+        "llm_trader": lt,
         "account": {"equity": equity, "trades": trades, "open": len(fp_open), "realized": realized},
         "forward_paper": {
             "open": [{"sym": p.get("symbol"), "side": p.get("direction"),
