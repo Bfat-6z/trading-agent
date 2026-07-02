@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import backtest_chart_signal as cs
+import chart_smc as smc
 import llm_trader_charts as ltc
 import llm_trader_memory as ltm
 import llm_trader_risk as lr
@@ -405,15 +406,21 @@ def decide(context: list[dict[str, Any]], equity: float,
     images, charted = [], []
     for c in shortlist:
         bars = c.get("_bars")
-        b64 = ltc.render_chart(c["symbol"], bars, tf=TF) if bars else None
+        if not bars:
+            continue
+        # SMC read (owner's revived detectors): trend/bias + nearest S/R zones.
+        sm = smc.smc_summary(bars, c["symbol"], TF)
+        c["_smc"] = sm.get("summary") or {}
+        b64 = ltc.render_chart(c["symbol"], bars, tf=TF, hlines=(sm.get("hlines") or None))
         if b64:
             c["_chart_b64"] = b64   # carry to open_positions so the EXACT chart the
             images.append((c["symbol"], b64)); charted.append(c)  # LLM saw is persisted
     if not images:
         return _decide_numeric(shortlist, equity, status)   # nothing rendered -> numeric
-    # compact numeric to accompany each chart (no raw bars in text)
-    coins_txt = [{"symbol": c["symbol"], **{k: v for k, v in c.items()
-                  if not k.startswith("_") and k != "symbol"}} for c in charted]
+    # compact numeric + SMC read to accompany each chart (no raw bars in text)
+    coins_txt = [{"symbol": c["symbol"], "smc": c.get("_smc", {}),
+                  **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
+                 for c in charted]
     market_overview = [{"symbol": c["symbol"], "ret20_pct": c.get("ret20_pct"),
                         "regime": c.get("regime")} for c in ranked[:20]]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money. You are shown CANDLESTICK charts "
@@ -422,7 +429,11 @@ def decide(context: list[dict[str, Any]], equity: float,
            "(breakouts, ranges, support/resistance), momentum vs exhaustion, volume confirmation, and RSI "
            "(oversold <30 leans LONG mean-reversion, overbought >70 leans SHORT) — but RSI is a HINT, not a "
            "rule: in a strong trend oversold can stay oversold, so only fade RSI WITH structure/level support. "
-           + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           "Each coin also has an 'smc' block from a no-lookahead market-structure engine: trend/bias/confidence, "
+           "the nearest SUPPORT and RESISTANCE zone (price range + strength + quality + touch count) drawn on the "
+           "chart as SUP/RES lines, and an invalidation level. Prefer LONGs off a strong support zone with bullish "
+           "structure, SHORTs off resistance with bearish structure; avoid buying into overhead resistance or "
+           "shorting into support. " + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": memory_context(), "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
