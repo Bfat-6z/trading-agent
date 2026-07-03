@@ -314,11 +314,29 @@ def build() -> dict:
     except Exception:
         pass
 
+    # Whale flow (public Telegram t.me scraping via whale_flow_observer).
+    whale = {"updated_at": None, "status": None, "events": 0, "channels": [], "top": []}
+    try:
+        wf = json.loads((st / "agent_memory" / "whale_flow_latest.json").read_text())
+        whale["updated_at"] = wf.get("updated_at"); whale["status"] = wf.get("status")
+        whale["events"] = wf.get("event_count", 0)
+        whale["channels"] = wf.get("channels", [])
+        top = wf.get("top_symbols") or list((wf.get("by_symbol") or {}).values())
+        whale["top"] = [{"sym": r.get("symbol"), "side": r.get("pressure_side"),
+                         "score": round(float(r.get("pressure_score", 0) or 0), 3),
+                         "events": r.get("event_count"),
+                         "long_liq": round(float(r.get("long_liquidation_notional", 0) or 0), 0),
+                         "short_liq": round(float(r.get("short_liquidation_notional", 0) or 0), 0)}
+                        for r in top if r.get("pressure_side") in ("LONG", "SHORT")][:12]
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mode": "PAPER-ONLY · LIVE LOCKED",
         "llm_trader": lt,
         "manual": manual,
+        "whale": whale,
         "account": {"equity": equity, "trades": trades, "open": len(fp_open), "realized": realized},
         "forward_paper": {
             "open": [{"sym": p.get("symbol"), "side": p.get("direction"),
