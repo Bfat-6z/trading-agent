@@ -331,12 +331,31 @@ def build() -> dict:
     except Exception:
         pass
 
+    # Method Lab (autonomous research -> backtest -> curate).
+    lab = {"tested": 0, "survived": 0, "killed": 0, "survivors": [], "killed_top": []}
+    try:
+        mldir = st / "method_lab"
+        led = json.loads((mldir / "ledger.json").read_text())
+        lab.update({k: led.get(k, 0) for k in ("tested", "survived", "killed", "coins")})
+        surv = json.loads((mldir / "survivors.json").read_text())
+        lab["survivors"] = [{"id": s.get("id"), "side": s.get("side"), "desc": s.get("desc"),
+                             "mean_r": s.get("oos_mean_r"), "win": s.get("oos_win_rate"),
+                             "p": s.get("pvalue"), "n": s.get("oos_n"),
+                             "net": s.get("oos_total_net_pct")} for s in surv][:8]
+        killed = [json.loads(l) for l in (mldir / "killed.jsonl").read_text().splitlines() if l.strip()]
+        killed.sort(key=lambda r: (r.get("oos_mean_r") or -9), reverse=True)
+        lab["killed_top"] = [{"id": r.get("id"), "mean_r": r.get("oos_mean_r"),
+                              "reason": r.get("reason"), "p": r.get("pvalue")} for r in killed][:8]
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mode": "PAPER-ONLY · LIVE LOCKED",
         "llm_trader": lt,
         "manual": manual,
         "whale": whale,
+        "method_lab": lab,
         "account": {"equity": equity, "trades": trades, "open": len(fp_open), "realized": realized},
         "forward_paper": {
             "open": [{"sym": p.get("symbol"), "side": p.get("direction"),
