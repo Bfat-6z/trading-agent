@@ -1,0 +1,9 @@
+{
+ "tested": 10,
+ "survived": 1,
+ "killed": 9,
+ "coins": 15,
+ "survivor_ids": [
+  "capitulation_long"
+ ]
+}

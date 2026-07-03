@@ -1,0 +1,17 @@
+[
+ {
+  "id": "capitulation_long",
+  "name": "Capitulation reversion",
+  "desc": "Long deep RSI<22 + high volume flush (mean-revert the panic)",
+  "side": "LONG",
+  "survived": true,
+  "n": 88,
+  "oos_n": 27,
+  "oos_mean_r": 0.6037,
+  "oos_total_net_pct": 40.746,
+  "oos_win_rate": 0.8148,
+  "pvalue": 0.0004,
+  "p_bar": 0.005,
+  "reason": "survived"
+ }
+]

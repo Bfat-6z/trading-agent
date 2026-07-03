@@ -292,6 +292,30 @@ def relevant_lessons(symbol: str, regime: str, k: int = 8) -> list[dict[str, Any
     return (same or mem)[-k:]
 
 
+_LAB_SURVIVORS = ROOT / "state" / "method_lab" / "survivors.json"
+
+
+def _proven_methods_block() -> str:
+    """Inject the Method Lab survivors — mechanical methods that beat a walk-forward
+    out-of-sample + Bonferroni permutation test on real history — so the bot FAVORS
+    setups that are actually proven, not just plausible. Auto-updates as the lab
+    re-curates: a method that stops surviving simply disappears from the prompt."""
+    try:
+        surv = json.loads(_LAB_SURVIVORS.read_text(encoding="utf-8"))
+    except Exception:
+        surv = []
+    surv = [s for s in surv if s.get("survived")]
+    if not surv:
+        return ""
+    lines = []
+    for s in surv[:6]:
+        lines.append(f"- {s.get('side')} \"{s.get('desc')}\" — PROVEN out-of-sample: mean R "
+                     f"{s.get('oos_mean_r')}, win {s.get('oos_win_rate')}, p={s.get('pvalue')} over "
+                     f"{s.get('oos_n')} trades. When this exact setup appears, strongly favor taking it.")
+    return ("=== PROVEN METHODS (survived walk-forward on real data — these have measured edge; "
+            "prioritize them) ===\n" + "\n".join(lines) + "\n=== END PROVEN METHODS ===\n\n")
+
+
 def _mistakes_block() -> str:
     """Surface the measured failure-mode lessons PROMINENTLY in the system prompt
     (not buried in the memory JSON) so the model actually corrects them — the
@@ -446,7 +470,7 @@ def _decide_numeric(context: list[dict[str, Any]], equity: float,
     payload = [{"symbol": c["symbol"], **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                for c in context]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money reading numeric context per coin. "
-           + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     usr = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                       "memory": memory_context(), "coins": payload}, default=str)
     return _validate_decisions(_extract_json(_llm(sys, usr)), by_sym)
@@ -509,7 +533,7 @@ def decide(context: list[dict[str, Any]], equity: float,
            "confluence hint ONLY — whale pressure agreeing with your chart setup adds a little confidence; a big "
            "opposite-side liquidation can mark a flush/reversal; NEVER trade on whale flow alone or chase it.\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
-           + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": mem, "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
