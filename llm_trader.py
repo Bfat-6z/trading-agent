@@ -39,6 +39,7 @@ LT_DIR = ROOT / "state" / "llm_trader"
 ACCOUNT = LT_DIR / "account.json"
 POSITIONS = LT_DIR / "positions.jsonl"
 CLOSED = LT_DIR / "closed.jsonl"
+PENDING = LT_DIR / "pending.jsonl"        # limit orders waiting to fill (no FOMO market entry)
 MEMORY = LT_DIR / "memory.jsonl"          # context-tagged trade outcomes (self-learning)
 SCORECARD = LT_DIR / "scorecard.json"     # measured-edge scorecard (plan #5-#9)
 PID_FILE = LT_DIR / "llm_trader.pid"
@@ -561,8 +562,20 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
         size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # 5-10%
         sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))
         tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3)))
+        # LIMIT entry: keep entry_px only if it's a FAVORABLE pullback limit within
+        # ~5% (LONG limit below price, SHORT limit above); else treat as market.
+        entry_px = None
+        try:
+            ep = float(dec.get("entry_px") or 0)
+            px = float(ctx["price"])
+            if ep > 0 and abs(ep / px - 1) <= 0.05 and (
+                    (action == "LONG" and ep < px) or (action == "SHORT" and ep > px)):
+                entry_px = round(ep, 8)
+        except Exception:
+            entry_px = None
         out.append({**ctx, "action": action, "leverage": lev, "size_pct": size_pct,
-                    "sl_pct": sl_pct, "tp_pct": tp_pct, "rationale": str(dec.get("rationale", ""))[:240]})
+                    "sl_pct": sl_pct, "tp_pct": tp_pct, "entry_px": entry_px,
+                    "rationale": str(dec.get("rationale", ""))[:240]})
     return out
 
 
@@ -582,10 +595,14 @@ _DECISION_SCHEMA = (
        "each cycle. Still hard-SKIP the exact traps you keep losing on (chasing extended RSI>75 with no stop room, "
        "shorting into support)." if EXPLORE_MODE else
        "Be STRICT: default SKIP — most coins should be SKIP, taking a marginal trade is the mistake you keep making.")
-    + "\n"
+    + " PREFER A LIMIT ENTRY: set entry_px at a PULLBACK level (support-zone edge / EMA20 for a long, "
+    "resistance edge / EMA20 for a short) so you buy the dip / sell the rip at a GOOD price — do NOT FOMO-chase the "
+    "current extended price. Only omit entry_px (market enter) for a confirmed breakout that won't retrace. A limit "
+    "waits for price to come to you and cancels if it runs away — this is how a disciplined trader enters.\n"
     "===DECISIONS===\nThen a JSON ARRAY (may be empty) of ONLY coins that PASSED the gate: "
     "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\",\"leverage\":5|10,\"size_pct\":5-10,"
-    "\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,\"rationale\":\"cite levels + how many confluences\"}]")
+    "\"entry_px\":<limit price, or omit for market>,\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,"
+    "\"rationale\":\"cite levels + how many confluences\"}]")
 
 
 _THINK_PATH = LT_DIR / "thinking_latest.json"
@@ -711,6 +728,48 @@ def _day_anchor(acct: dict[str, Any], now_ms: int, equity: float) -> float:
     return float(acct.get("day_start_equity") or equity)
 
 
+def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float, float]:
+    """Place the stop BEYOND real structure (the nearest S/R zone edge or the SMC
+    invalidation level) + a 0.5*ATR buffer — not the LLM's arbitrary %, so a correct
+    trade isn't wicked out of noise. TP goes to the opposing zone, floored at 1.5x
+    the risk. Falls back to the LLM's sl_pct/tp_pct when no structure is available.
+    Owner request: 'SL/TP must fit the chart.'"""
+    smc = d.get("_smc") or {}
+    atr = float(d.get("atr") or 0.0)
+    buf = 0.5 * atr
+    sup = smc.get("nearest_support") or {}
+    res = smc.get("nearest_resistance") or {}
+    inval = smc.get("invalidation")
+    sl = tp = None
+    try:
+        if side == "LONG":
+            base = (float(sup["lo"]) if sup.get("lo") and float(sup["lo"]) < entry
+                    else float(inval) if inval and float(inval) < entry else None)
+            if base:
+                sl = base - buf
+            if res.get("lo") and float(res["lo"]) > entry:
+                tp = float(res["lo"])
+        else:
+            base = (float(res["hi"]) if res.get("hi") and float(res["hi"]) > entry
+                    else float(inval) if inval and float(inval) > entry else None)
+            if base:
+                sl = base + buf
+            if sup.get("hi") and float(sup["hi"]) < entry:
+                tp = float(sup["hi"])
+    except Exception:
+        sl = tp = None
+    if sl is None:                                   # no structure -> LLM's stop
+        sl = entry * (1 - d["sl_pct"] / 100) if side == "LONG" else entry * (1 + d["sl_pct"] / 100)
+    # clamp risk to a sane band so a far zone can't create an absurd stop
+    risk = min(entry * 0.06, max(entry * 0.004, abs(entry - sl)))
+    sl = entry - risk if side == "LONG" else entry + risk
+    # TP: opposing zone if it clears 1.5 R:R, else 1.8x risk
+    min_tp = 1.5 * risk
+    if tp is None or (side == "LONG" and tp - entry < min_tp) or (side == "SHORT" and entry - tp < min_tp):
+        tp = entry + 1.8 * risk if side == "LONG" else entry - 1.8 * risk
+    return sl, tp
+
+
 def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                    now_ms: int | None = None) -> int:
     """Open paper positions for validated decisions, behind fail-closed
@@ -731,8 +790,22 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
         _rewrite(POSITIONS, open_pos)
         return 0
     n = 0
+    pend_syms = {q["symbol"] for q in _load(PENDING)}
     for d in decisions:
         if d["symbol"] in open_syms:
+            continue
+        # LIMIT entry (owner: 'wait for the pullback, don't FOMO market in'): queue a
+        # pending order at the limit price instead of a market fill; _resolve_pending
+        # fills it if price comes to the level, cancels if it runs away / expires.
+        if d.get("entry_px") and d["symbol"] not in pend_syms:
+            _append(PENDING, {"symbol": d["symbol"], "side": d["action"], "entry_px": float(d["entry_px"]),
+                              "leverage": d["leverage"], "size_pct": d["size_pct"],
+                              "sl_pct": d["sl_pct"], "tp_pct": d["tp_pct"], "smc": d.get("_smc") or {},
+                              "atr": float(d.get("atr") or 0), "quote_vol_24h": float(d.get("_quote_vol_24h", 0) or 0),
+                              "regime": d.get("regime"), "chart_b64": d.get("_chart_b64"),
+                              "price0": float(d["price"]), "placed_ms": now_ms, "ts": d.get("_ts"),
+                              "rationale": d.get("rationale", "")})
+            pend_syms.add(d["symbol"])
             continue
         side = d["action"]; lev = d["leverage"]
         # Entry is a MARKET fill: apply adverse slippage by liquidity tier
@@ -754,8 +827,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
             continue
         notional = margin * lev
         qty = notional / entry if entry > 0 else 0.0
-        sl = entry * (1 - d["sl_pct"]/100) if side == "LONG" else entry * (1 + d["sl_pct"]/100)
-        tp = entry * (1 + d["tp_pct"]/100) if side == "LONG" else entry * (1 - d["tp_pct"]/100)
+        sl, tp = _structure_sl_tp(side, entry, d)   # SL beyond structure, not arbitrary %
         # Forced-liquidation price (plan item #1): stored at open so resolve()
         # can rank liq ahead of SL pessimistically on every bar.
         mmr = lr.mmr_for(d["symbol"])
@@ -770,6 +842,52 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
         open_syms.add(d["symbol"]); n += 1
     _rewrite(POSITIONS, open_pos)
     return n
+
+
+def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> int:
+    """Fill / cancel limit orders (owner: 'set a pending order, don't FOMO in'). A
+    limit fills when a CLOSED bar's range touches it (LONG: low<=limit; SHORT:
+    high>=limit) -> opens via the normal open path at the limit price. It cancels if
+    price runs >2% past the level (ran away) or after ~2h (expired)."""
+    pend = _load(PENDING)
+    if not pend:
+        return 0
+    open_syms = {p["symbol"] for p in _load(POSITIONS)}
+    bar_ms = of._TF_MS[TF]
+    EXPIRE_MS = 8 * bar_ms
+    still, filled = [], 0
+    for po in pend:
+        sym, side, limit = po["symbol"], po["side"], float(po["entry_px"])
+        if sym in open_syms:
+            continue                                 # already in a position -> drop
+        try:
+            fb = of.fetch_klines_with_flow(sym, TF, months=0.05, end_ms=now_ms, client=client, sleep_between=0.02)
+            fut = [b for b in fb if int(b["ts_ms"]) > int(po["placed_ms"]) and int(b["ts_ms"]) + bar_ms <= now_ms]
+        except Exception:
+            still.append(po); continue
+        fill_ts = None
+        for b in fut:
+            if (side == "LONG" and float(b["low"]) <= limit) or (side == "SHORT" and float(b["high"]) >= limit):
+                fill_ts = int(b["ts_ms"]); break
+        if fill_ts is not None:                       # FILLED -> open at the limit price
+            d = {"symbol": sym, "action": side, "price": limit, "leverage": po["leverage"],
+                 "size_pct": po["size_pct"], "sl_pct": po["sl_pct"], "tp_pct": po["tp_pct"], "entry_px": None,
+                 "_smc": po.get("smc") or {}, "atr": po.get("atr", 0), "_quote_vol_24h": po.get("quote_vol_24h", 0),
+                 "regime": po.get("regime"), "_chart_b64": po.get("chart_b64"), "_ts": fill_ts,
+                 "rationale": (po.get("rationale") or "") + " [limit filled]"}
+            open_positions([d], equity, now_iso, now_ms=now_ms)
+            filled += 1
+            continue
+        expired = now_ms - int(po["placed_ms"]) > EXPIRE_MS
+        px_now = float(fut[-1]["close"]) if fut else float(po.get("price0") or limit)
+        ran = (side == "LONG" and px_now > limit * 1.02) or (side == "SHORT" and px_now < limit * 0.98)
+        if expired or ran:
+            _append(CLOSED, {"symbol": sym, "side": side, "event": "limit_cancelled",
+                             "why": "expired" if expired else "ran_away", "closed_ts": now_ms})
+            continue
+        still.append(po)
+    _rewrite(PENDING, still)
+    return filled
 
 
 def resolve(client: Any, now_ms: int) -> int:
@@ -929,6 +1047,9 @@ def run_once() -> dict[str, Any]:
     resolved = resolve(client, now_ms)
     acct = load_account()
     equity = float(acct["equity"])
+    pend_filled = _resolve_pending(client, equity, utc_now(), now_ms)   # fill/cancel limit orders
+    if pend_filled:
+        acct = load_account(); equity = float(acct["equity"])
     card = refresh_scorecard(client)
     _maybe_reflect(now_ms)   # meta-cognition: bot reasons about its own results ~every 30 min
     open_now = _load(POSITIONS)

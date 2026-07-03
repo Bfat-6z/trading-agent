@@ -51,3 +51,23 @@ def test_split_thinking_handles_brackets_and_delimiter():
     # no delimiter -> whole text extraction still works
     assert l._split_thinking('[{"symbol":"ETHUSDT"}]')[0]["symbol"] == "ETHUSDT"
     assert l._split_thinking(None) is None
+
+
+def test_structure_sl_and_limit_entry():
+    import llm_trader as l
+    # structure SL: stop goes beyond the support zone, R:R >= 1.5 enforced
+    d = {"_smc": {"nearest_support": {"lo": 97, "hi": 98}, "nearest_resistance": {"lo": 103, "hi": 104},
+                  "invalidation": 96}, "atr": 1.0, "sl_pct": 2, "tp_pct": 3}
+    sl, tp = l._structure_sl_tp("LONG", 100, d)
+    assert sl < 97 and (tp - 100) / (100 - sl) >= 1.5      # below support, >=1.5 R:R
+    # no structure -> falls back to the LLM %
+    sl2, _ = l._structure_sl_tp("LONG", 100, {"sl_pct": 2, "tp_pct": 3})
+    assert abs(sl2 - 98.0) < 1e-6
+    # entry_px: keep a favorable pullback limit, drop a FOMO (wrong-side) one
+    by = {"X": {"symbol": "X", "price": 100.0}}
+    keep = l._validate_decisions([{"symbol": "X", "action": "LONG", "entry_px": 98,
+                                   "leverage": 10, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by)
+    assert keep[0]["entry_px"] == 98.0
+    drop = l._validate_decisions([{"symbol": "X", "action": "LONG", "entry_px": 103,
+                                   "leverage": 10, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by)
+    assert drop[0]["entry_px"] is None                     # above price for a long = FOMO -> market
