@@ -218,9 +218,30 @@ def _features(enr, fb) -> dict[str, Any]:
     }
 
 
+_WHALE_PATH = ROOT / "state" / "agent_memory" / "whale_flow_latest.json"
+
+
+def _whale_flow_map() -> dict[str, dict[str, Any]]:
+    """Per-symbol whale/liquidation pressure from whale_flow_observer (public
+    Telegram t.me scraping — BinanceLiquidations/WhaleBotAlerts/whale_alert_io...).
+    Compact + best-effort; {} if the observer hasn't written yet."""
+    try:
+        wf = json.loads(_WHALE_PATH.read_text(encoding="utf-8"))
+        out = {}
+        for sym, r in (wf.get("by_symbol") or {}).items():
+            out[sym] = {"side": r.get("pressure_side"), "score": r.get("pressure_score"),
+                        "events": r.get("event_count"),
+                        "long_liq": round(float(r.get("long_liquidation_notional", 0) or 0), 0),
+                        "short_liq": round(float(r.get("short_liquidation_notional", 0) or 0), 0)}
+        return out
+    except Exception:
+        return {}
+
+
 def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str, Any]]:
     import backtest_data_fetcher as bf
     out = []
+    whale = _whale_flow_map()   # per-symbol Telegram whale/liquidation pressure
     for sym in symbols:
         try:
             fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02)
@@ -241,6 +262,7 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
             out.append({
                 "symbol": sym, "price": round(float(enr["close"].iloc[i]), 4),
                 "last8_closes": closes, **reg, **feats,
+                "whale": whale.get(sym),   # Telegram whale/liquidation pressure (may be None)
                 "funding_rate": round(float(enr["funding_rate"].iloc[i]) if "funding_rate" in enr else 0.0, 6),
                 "cvd_norm": round(float(enr["cvd_delta_norm"].iloc[i]) if "cvd_delta_norm" in enr and enr["cvd_delta_norm"].iloc[i]==enr["cvd_delta_norm"].iloc[i] else 0.0, 3),
                 "atr": round(float(enr["atr"].iloc[i]), 4),
@@ -466,7 +488,11 @@ def decide(context: list[dict[str, Any]], equity: float,
            "the nearest SUPPORT and RESISTANCE zone (price range + strength + quality + touch count) drawn on the "
            "chart as SUP/RES lines, and an invalidation level. Prefer LONGs off a strong support zone with bullish "
            "structure, SHORTs off resistance with bearish structure; avoid buying into overhead resistance or "
-           "shorting into support.\n\n" + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
+           "shorting into support. Each coin may also carry a 'whale' block (public Telegram whale/liquidation "
+           "flow: pressure_side LONG/SHORT + score, and long/short liquidation $). Treat it as a LAGGING, NOISY "
+           "confluence hint ONLY — whale pressure agreeing with your chart setup adds a little confidence; a big "
+           "opposite-side liquidation can mark a flush/reversal; NEVER trade on whale flow alone or chase it.\n\n"
+           + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
            + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": memory_context(), "charted_coins": coins_txt,
