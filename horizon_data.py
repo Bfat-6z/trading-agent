@@ -362,6 +362,21 @@ def build() -> dict:
     except Exception:
         pass
 
+    # Signal Follower (paper-trade Telegram alerts, measure per-channel win rate).
+    sigf = {"open": 0, "total": 0, "by_kind": [], "by_channel": []}
+    try:
+        sfdir = st / "signal_follower"
+        hb = json.loads((st / "signal_follower_heartbeat.json").read_text())
+        sigf["open"] = hb.get("open", 0)
+        bd = json.loads((sfdir / "scoreboard.json").read_text())
+        sigf["total"] = bd.get("total", 0)
+        sigf["by_kind"] = sorted([{"k": k, **v} for k, v in (bd.get("by_kind") or {}).items()],
+                                 key=lambda x: (x.get("win_rate") or 0), reverse=True)
+        sigf["by_channel"] = sorted([{"k": k, **v} for k, v in (bd.get("by_channel") or {}).items()],
+                                    key=lambda x: (x.get("win_rate") or 0), reverse=True)
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mode": "PAPER-ONLY · LIVE LOCKED",
@@ -370,6 +385,7 @@ def build() -> dict:
         "whale": whale,
         "method_lab": lab,
         "mind": mind,
+        "signal_follower": sigf,
         "account": {"equity": equity, "trades": trades, "open": len(fp_open), "realized": realized},
         "forward_paper": {
             "open": [{"sym": p.get("symbol"), "side": p.get("direction"),
