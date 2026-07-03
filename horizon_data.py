@@ -243,7 +243,7 @@ def build() -> dict:
                        "net": round(float(c.get("net", 0) or 0), 3), "r": c.get("r"),
                        "reason": c.get("reason"), "ts": int(c.get("closed_ts") or 0),
                        "chart": c.get("chart")}
-                      for c in sorted(closed_rows, key=lambda x: int(x.get("closed_ts") or 0), reverse=True)[:40]]
+                      for c in sorted(closed_rows, key=lambda x: int(x.get("closed_ts") or 0), reverse=True)[:400]]
         lt["closed_recent"] = [{"sym": c["sym"], "side": c["side"], "r": c["r"], "reason": c["reason"]}
                                for c in lt["feed"][:5]]
 
