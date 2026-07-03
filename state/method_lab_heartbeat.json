@@ -1,8 +1,9 @@
 {
+ "ts": 1783067828368,
  "tested": 16,
+ "coins": 18,
  "survived": 1,
  "killed": 15,
- "coins": 18,
  "survivor_ids": [
   "capitulation_long"
  ]
