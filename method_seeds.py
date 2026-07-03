@@ -60,6 +60,24 @@ SEED_METHODS = [
                               {"feat": "vol_ratio", "op": ">", "val": 1.8}],
      "sl_pct": 2.5, "tp_pct": 4.0},
 
+    # --- OWNER'S METHOD: 4h EMA cross -> "kieu gi cung dump" (short the cross) ---
+    {"id": "owner_4h_death_cross_short", "name": "Owner 4h death-cross short",
+     "desc": "SHORT when 4h EMA9 crosses BELOW EMA21 (owner: 4h bear cross -> dump)",
+     "side": "SHORT", "when": [{"feat": "ema4h_cross", "op": "==", "val": -1}],
+     "sl_pct": 2.5, "tp_pct": 4.5},
+    {"id": "owner_4h_golden_cross_short", "name": "Owner 4h golden-cross short (test 'any cross dumps')",
+     "desc": "SHORT when 4h EMA9 crosses ABOVE EMA21 (test owner's 'kieu gi cung dump')",
+     "side": "SHORT", "when": [{"feat": "ema4h_cross", "op": "==", "val": 1}],
+     "sl_pct": 2.5, "tp_pct": 4.5},
+    {"id": "owner_4h_bear_state_short", "name": "Owner 4h bear-state short",
+     "desc": "SHORT while 4h EMA9<EMA21 (persistent 4h bearish) + 15m momentum down",
+     "side": "SHORT", "when": [{"feat": "ema4h_state", "op": "==", "val": -1},
+                               {"feat": "ret5", "op": "<", "val": -0.3}], "sl_pct": 2.0, "tp_pct": 4.0},
+    {"id": "owner_4h_golden_cross_long", "name": "Owner 4h golden-cross long (comparison)",
+     "desc": "LONG when 4h EMA9 crosses ABOVE EMA21 (trend-follow the bull cross)",
+     "side": "LONG", "when": [{"feat": "ema4h_cross", "op": "==", "val": 1}],
+     "sl_pct": 2.5, "tp_pct": 4.5},
+
     # --- trend pullback to EMA20 (buy the dip to the fast EMA in an uptrend) ---
     {"id": "ema20_pullback_long", "name": "EMA20 pullback long",
      "desc": "Long when price dips to/below EMA20 but stack still bullish (EMA50<price)",

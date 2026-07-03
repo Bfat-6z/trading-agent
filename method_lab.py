@@ -73,10 +73,23 @@ def feature_frame(bars: list[dict[str, Any]]) -> list[dict[str, float]]:
     e20, e50, e200 = _ema(c, 20), _ema(c, 50), _ema(c, 200)
     rsi = _rsi(c)
     volma = np.convolve(v, np.ones(20) / 20, mode="full")[:len(v)]
+    # 4h EMA cross (owner's method: "4h EMA cross -> dump"). Resample 15m->4h
+    # (every 16 bars); state = fast>slow; cross fires on the first 15m bar of a new
+    # 4h bucket where the state flipped. No lookahead: bucket k uses close[16k] (past).
+    h4 = c[::16]
+    if len(h4) >= 25:
+        ef4, es4 = _ema(h4, 9), _ema(h4, 21)
+        st4 = np.where(ef4 > es4, 1, -1)
+    else:
+        st4 = np.zeros(len(h4), dtype=int)
     rows = []
     for i in range(len(bars)):
         vr = float(v[i] / volma[i]) if i >= 20 and volma[i] > 0 else 1.0
+        k = i // 16
+        state4 = int(st4[k]) if k < len(st4) else 0
+        cross4 = int(st4[k]) if (0 < k < len(st4) and i % 16 == 0 and st4[k] != st4[k - 1]) else 0
         rows.append({
+            "ema4h_state": state4, "ema4h_cross": cross4,
             "i": i, "close": float(c[i]), "high": float(h[i]), "low": float(lo[i]),
             "rsi14": float(rsi[i]),
             "px_vs_ema20": float(c[i] / e20[i] - 1) * 100 if e20[i] else 0.0,
