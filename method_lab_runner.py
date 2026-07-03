@@ -97,7 +97,8 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6)
             "ret5, ret20 (percent). Allowed op: <,<=,>,>=,==. Use 1-4 conditions, sl_pct 0.5-4, tp_pct 1-8, and "
             "aim for tp_pct >= 1.5*sl_pct. Be creative and DIVERSE — combine features across families. Do NOT "
             "re-propose these already-FAILED ideas: " + "; ".join(killed_descs[:16]))
-        body = json.dumps({"model": lt.MODEL, "max_tokens": 1500, "temperature": 0.8,
+        body = json.dumps({"model": lt.MODEL, "max_tokens": 8000, "temperature": 0.8,
+                           "reasoning_effort": getattr(lt, "REASONING_EFFORT", "high"),
                            "messages": [{"role": "system", "content": sys},
                                         {"role": "user", "content": "Propose the methods as a JSON array now."}]}).encode()
         req = urllib.request.Request(base + "/chat/completions", data=body,

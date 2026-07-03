@@ -47,6 +47,14 @@ HEARTBEAT = LT_DIR / "llm_trader_heartbeat.json"
 
 MODEL = os.environ.get("LLM_TRADER_MODEL", "cx/gpt-5.5")
 BASE_URL = os.environ.get("LLM_TRADER_BASE", "http://localhost:20128/v1")
+# Squeeze the model: no artificial token ceiling + max reasoning effort. The
+# endpoint accepts reasoning_effort=high (verified: it engages deeper reasoning)
+# and large max_tokens, so let it THINK as long as it needs. These are ceilings,
+# not forced usage; a slow deep cycle just runs less often (loop is sequential).
+MAX_DECISION_TOKENS = int(os.environ.get("LLM_TRADER_MAX_TOKENS", "16000"))
+MAX_REFLECT_TOKENS = int(os.environ.get("LLM_TRADER_REFLECT_TOKENS", "6000"))
+REASONING_EFFORT = os.environ.get("LLM_TRADER_REASONING_EFFORT", "high")
+LLM_TIMEOUT = float(os.environ.get("LLM_TRADER_LLM_TIMEOUT", "300"))
 TF = "15m"
 START_EQUITY = 100.0
 MAX_HOLD_BARS = 32
@@ -347,7 +355,7 @@ def _reflect() -> dict[str, Any]:
                 "what is genuinely working (proven_methods) versus your reflexive habits, and what you must change. "
                 "Reply ONLY a JSON object: {\"reflection\":\"3-4 sentences of honest self-analysis\","
                 "\"directives\":[\"3-5 concrete changes to apply to your next decisions\"]}")
-        raw = _llm(sysp, json.dumps(state, default=str), max_tokens=900)
+        raw = _llm(sysp, json.dumps(state, default=str), max_tokens=MAX_REFLECT_TOKENS)
         obj = None
         if raw:                          # parse the OBJECT (not _extract_json, which
             a, b = raw.find("{"), raw.rfind("}")   # would grab the inner directives array)
@@ -422,9 +430,12 @@ def memory_context() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # LLM decision (9router, OpenAI-compatible)
 # ---------------------------------------------------------------------------
-def _llm(system: str, user: str, max_tokens: int = 2000) -> str | None:
+def _llm(system: str, user: str, max_tokens: int | None = None) -> str | None:
     """Text-only chat call via the SAME direct 9router path that _llm_vision uses
-    (reliable), not call_large_model (which hangs here). Returns text or None."""
+    (reliable), not call_large_model (which hangs here). Full reasoning effort + no
+    tight token ceiling. Returns text or None."""
+    if max_tokens is None:
+        max_tokens = MAX_DECISION_TOKENS
     base, key = _env_llm()
     if not base or not key:
         try:
@@ -433,13 +444,14 @@ def _llm(system: str, user: str, max_tokens: int = 2000) -> str | None:
         except Exception:
             return None
     body = json.dumps({"model": MODEL, "max_tokens": max_tokens, "temperature": 0.3,
+                       "reasoning_effort": REASONING_EFFORT,
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}]}).encode()
     req = urllib.request.Request(base + "/chat/completions", data=body,
                                  headers={"Content-Type": "application/json",
                                           "Authorization": "Bearer " + key}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=150) as r:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
             return json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception:
         return None
@@ -504,14 +516,15 @@ def _llm_vision(system: str, text: str, images: list[tuple[str, str]]) -> str | 
     for label, b64 in images:
         content.append({"type": "text", "text": f"Chart — {label}:"})
         content.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}})
-    body = json.dumps({"model": MODEL, "max_tokens": 2600, "temperature": 0.3,
+    body = json.dumps({"model": MODEL, "max_tokens": MAX_DECISION_TOKENS, "temperature": 0.3,
+                       "reasoning_effort": REASONING_EFFORT,
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": content}]}).encode()
     req = urllib.request.Request(base + "/chat/completions", data=body,
                                  headers={"Content-Type": "application/json",
                                           "Authorization": "Bearer " + key}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
             d = json.loads(r.read().decode())
         return d["choices"][0]["message"]["content"]
     except Exception:
