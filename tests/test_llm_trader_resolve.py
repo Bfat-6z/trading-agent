@@ -149,3 +149,39 @@ def test_breakeven_trailing_protects_a_winner():
     # genuinely wrong entry (drops straight) still takes the full stop
     r2, px2 = ratchet_exit("LONG", 100, 98, 130, [bar(100, 100, 97, 97)])
     assert r2 == "sl" and px2 <= 98.0
+
+
+def test_fill_bar_never_arms_the_trailing_ratchet():
+    """The fill bar's high may PRE-DATE the fill — it must not feed the trailing
+    peak (else a reversal books a fake 'trail' BE instead of the honest full SL)."""
+    def sim(entry, sl0, tp, bars, fb_ts, be_buf=0.001, skip_fill_bar_ratchet=True):
+        sl, risk, peak = sl0, entry - sl0, entry
+        for b in bars:
+            lo, hi = b["low"], b["high"]
+            if b["ts"] == fb_ts:
+                hit = ("sl", sl) if lo <= sl else None
+            else:
+                hit = ("sl", sl) if lo <= sl else (("tp", tp) if hi >= tp else None)
+            if hit:
+                kind, px = hit
+                if kind == "sl" and sl >= entry * (1 + be_buf):
+                    kind = "trail"
+                return kind, px
+            if skip_fill_bar_ratchet and b["ts"] == fb_ts:
+                continue
+            peak = max(peak, hi)
+            mr = (peak - entry) / risk
+            if mr >= 1.0 and be_buf * entry < 0.9 * risk:
+                sl = max(sl, entry * (1 + be_buf))
+            if mr >= 2.0:
+                sl = max(sl, peak - risk)
+        return "open", None
+
+    bars = [{"ts": 1, "high": 103.0, "low": 99.9},   # fill bar: high may pre-date the fill
+            {"ts": 2, "high": 100.5, "low": 96.0}]   # reversal straight to below SL
+    kind, px = sim(100, 98, 106, bars, fb_ts=1)
+    assert (kind, px) == ("sl", 98)                   # honest full stop, no fake BE
+    # and the live code contains the guard
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "llm_trader.py").read_text(encoding="utf-8")
+    assert "The ratchet starts from the NEXT bar" in src

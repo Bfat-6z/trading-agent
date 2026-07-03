@@ -919,7 +919,9 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
     for po in pend:
         sym, side, limit = po["symbol"], po["side"], float(po["entry_px"])
         if sym in open_syms:
-            continue                                 # already in a position -> drop
+            _append(LT_DIR / "pending_events.jsonl",   # drop, but never silently
+                    {"symbol": sym, "side": side, "event": "dropped_position_exists", "ts": now_ms})
+            continue
         try:
             fb = of.fetch_klines_with_flow(sym, TF, months=0.05, end_ms=now_ms, client=client, sleep_between=0.02)
             fut = [b for b in fb if int(b["ts_ms"]) > int(po["placed_ms"]) and int(b["ts_ms"]) + bar_ms <= now_ms]
@@ -1041,6 +1043,12 @@ def resolve(client: Any, now_ms: int) -> int:
             if k + 1 >= MAX_HOLD_BARS:
                 exit_px, reason = float(b["close"]), "timeout"
                 exit_ts = int(b["ts_ms"]); break
+            if int(b["ts_ms"]) == fb_ts:
+                # fill bar's HIGH/LOW may pre-date our fill — feeding it into the
+                # trailing peak would arm a breakeven stop off a move we may never
+                # have held through (optimistic leak, twin of the TP-off-fill-bar
+                # bug). The ratchet starts from the NEXT bar.
+                continue
             if risk > 0:                       # ratchet AFTER surviving this bar
                 if side == "LONG":
                     peak = max(peak, float(b["high"]))
