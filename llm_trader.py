@@ -837,7 +837,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "margin": round(margin, 4), "leverage": lev, "sl": sl, "tp": tp,
                          "liq_px": liq_px, "mmr": mmr, "quote_vol_24h": quote_vol, "tier": tier,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
-                         "chart": chart_rel,
+                         "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
     _rewrite(POSITIONS, open_pos)
@@ -882,8 +882,9 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
         px_now = float(fut[-1]["close"]) if fut else float(po.get("price0") or limit)
         ran = (side == "LONG" and px_now > limit * 1.02) or (side == "SHORT" and px_now < limit * 0.98)
         if expired or ran:
-            _append(CLOSED, {"symbol": sym, "side": side, "event": "limit_cancelled",
-                             "why": "expired" if expired else "ran_away", "closed_ts": now_ms})
+            _append(LT_DIR / "pending_events.jsonl",   # NOT closed.jsonl (would pollute the feed/stats)
+                    {"symbol": sym, "side": side, "event": "limit_cancelled",
+                     "why": "expired" if expired else "ran_away", "ts": now_ms})
             continue
         still.append(po)
     _rewrite(PENDING, still)
@@ -996,7 +997,8 @@ def resolve(client: Any, now_ms: int) -> int:
         rec = {"symbol": p["symbol"], "side": side, "regime": p.get("regime"), "hour_utc": p.get("hour_utc"),
                "entry": entry, "exit": exit_px, "reason": reason, "net": round(net, 4), "r": round(r, 3),
                "fee": round(fee, 4), "funding": round(funding, 4), "liq_px": round(liq_px, 6), "tier": tier,
-               "leverage": lev, "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
+               "leverage": lev, "vol": p.get("vol"), "rationale": p.get("rationale"),
+               "chart": p.get("chart"), "closed_ts": now_ms}
         _append(CLOSED, rec)
         _append(MEMORY, rec)   # self-learning: outcome tagged by context
         closed_n += 1

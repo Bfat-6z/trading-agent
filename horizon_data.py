@@ -209,8 +209,8 @@ def build() -> dict:
         # dedupe double-booked closes (concurrent-loop overlap) by trade identity
         _cr = _load_jsonl(lt_dir / "closed.jsonl"); _seen = set(); closed_rows = []
         for _c in _cr:
-            if _c.get("net") is None:
-                closed_rows.append(_c); continue
+            if _c.get("event") or _c.get("net") is None:
+                continue                            # event rows (limit_cancelled) are NOT trades — skip
             _k = (_c.get("symbol"), _c.get("side"), round(float(_c.get("entry", 0) or 0), 4),
                   round(float(_c.get("exit", 0) or 0), 4), round(float(_c.get("net", 0) or 0), 4), _c.get("reason"))
             if _k in _seen:
@@ -237,12 +237,12 @@ def build() -> dict:
         lt["open"] = pos_out
         # LIVE TRADE FEED — last 40 closed trades, full detail, newest first.
         lt["feed"] = [{"sym": c.get("symbol"), "side": c.get("side"), "lev": c.get("leverage"),
+                       "vol": c.get("vol"),                       # volume ratio at entry (owner watches this)
                        "entry": round(float(c.get("entry", 0) or 0), 4),
                        "exit": round(float(c.get("exit", 0) or 0), 4),
                        "net": round(float(c.get("net", 0) or 0), 3), "r": c.get("r"),
                        "reason": c.get("reason"), "ts": int(c.get("closed_ts") or 0),
-                       "chart": c.get("chart"),
-                       "rationale": (c.get("rationale") or "")[:160]}
+                       "chart": c.get("chart")}
                       for c in sorted(closed_rows, key=lambda x: int(x.get("closed_ts") or 0), reverse=True)[:40]]
         lt["closed_recent"] = [{"sym": c["sym"], "side": c["side"], "r": c["r"], "reason": c["reason"]}
                                for c in lt["feed"][:5]]
