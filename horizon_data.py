@@ -227,6 +227,7 @@ def build() -> dict:
                 up = round(((mark - entry) if side == "LONG" else (entry - mark)) * qty, 3)
             live_chart = _live_position_chart(cli, p, now_ms)
             pos_out.append({"sym": p.get("symbol"), "side": side, "lev": p.get("leverage"),
+                            "margin": round(float(p.get("margin", 0) or 0), 2),
                             "entry": round(entry, 4), "mark": round(float(mark), 4) if mark else None,
                             "liq": round(float(p.get("liq_px", 0) or 0), 4),
                             "margin": round(float(p.get("margin", 0) or 0), 3),
@@ -238,6 +239,10 @@ def build() -> dict:
         # LIVE TRADE FEED — last 40 closed trades, full detail, newest first.
         lt["feed"] = [{"sym": c.get("symbol"), "side": c.get("side"), "lev": c.get("leverage"),
                        "vol": c.get("vol"),                       # volume ratio at entry (owner watches this)
+                       # margin $ per trade; old rows lack it -> derive from r = net/margin
+                       "margin": (round(float(c["margin"]), 2) if c.get("margin")
+                                  else (round(abs(float(c.get("net", 0) or 0) / float(c["r"])), 2)
+                                        if c.get("r") not in (None, 0) else None)),
                        "entry": round(float(c.get("entry", 0) or 0), 4),
                        "exit": round(float(c.get("exit", 0) or 0), 4),
                        "net": round(float(c.get("net", 0) or 0), 3), "r": c.get("r"),

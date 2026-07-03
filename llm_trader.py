@@ -1095,8 +1095,8 @@ def resolve(client: Any, now_ms: int) -> int:
         rec = {"symbol": p["symbol"], "side": side, "regime": p.get("regime"), "hour_utc": p.get("hour_utc"),
                "entry": entry, "exit": exit_px, "reason": reason, "net": round(net, 4), "r": round(r, 3),
                "fee": round(fee, 4), "funding": round(funding, 4), "liq_px": round(liq_px, 6), "tier": tier,
-               "leverage": lev, "vol": p.get("vol"), "rationale": p.get("rationale"),
-               "chart": p.get("chart"), "closed_ts": now_ms}
+               "leverage": lev, "margin": round(margin, 4), "vol": p.get("vol"),
+               "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         _append(CLOSED, rec)
         _append(MEMORY, rec)   # self-learning: outcome tagged by context
         closed_n += 1
