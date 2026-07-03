@@ -134,7 +134,10 @@ def ingest(client) -> int:
         except Exception:
             continue
         for msg in msgs:
-            mid = f"{ch}:{msg.get('permalink') or msg.get('text','')[:40]}"
+            import hashlib as _h
+            mid = msg.get("permalink") or _h.sha1(
+                f"{ch}|{msg.get('posted_at') or msg.get('source_posted_at') or ''}|{msg.get('text','')}".encode()).hexdigest()
+            mid = f"{ch}:{mid}"
             if mid in seen:
                 continue
             seen.add(mid)
@@ -171,9 +174,13 @@ def resolve(client, now_ms: int) -> int:
         return 0
     still, closed = [], 0
     bar_ms = of._TF_MS["15m"]
+    # fetch window must cover the OLDEST open position, else its early bars fall
+    # outside the window (missed SL/TP; a 40h-old trade once "resolved" as tp).
+    oldest = min(int(p["opened_ms"]) for p in rows)
+    months = max(0.05, (now_ms - oldest) / (30 * 86400000.0) * 1.2)
     for pos in rows:
         try:
-            bars = of.fetch_klines_with_flow(pos["symbol"], "15m", months=0.05,
+            bars = of.fetch_klines_with_flow(pos["symbol"], "15m", months=months,
                                               end_ms=now_ms, client=client, sleep_between=0.02)
             fut = [b for b in bars if int(b["ts_ms"]) > int(pos["opened_ms"]) and int(b["ts_ms"]) + bar_ms <= now_ms]
         except Exception:
@@ -190,11 +197,11 @@ def resolve(client, now_ms: int) -> int:
             else:
                 if hi >= sl: exit_px, reason = sl, "sl"; break
                 if low <= tp: exit_px, reason = tp, "tp"; break
-            if i + 1 >= TIMEOUT_BARS:
-                exit_px, reason = float(b["close"]), "timeout"; break
+            if int(b["ts_ms"]) - int(pos["opened_ms"]) >= TIMEOUT_BARS * bar_ms:
+                exit_px, reason = float(b["close"]), "timeout"; break   # age-based, not window-index
         if exit_px is None:
             still.append(pos); continue
-        gross = (exit_px / entry - 1) if side == "LONG" else (entry / exit_px - 1)
+        gross = (exit_px / entry - 1) if side == "LONG" else (entry - exit_px) / entry
         net = gross - FEE_RT
         hit = net > 0
         ssr.update_source_outcome(pos["channel"], hit)
@@ -232,7 +239,9 @@ def run_once(client) -> dict[str, Any]:
     opened = ingest(client)
     board = scoreboard()
     HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT.write_text(json.dumps({"ts": now, "opened": opened, "resolved": resolved,
+    from datetime import datetime, timezone
+    HEARTBEAT.write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                     "ts_ms": now, "opened": opened, "resolved": resolved,
                                      "open": len(_load(OPEN)), "total_closed": board["total"]}, indent=1),
                          encoding="utf-8")
     return {"opened": opened, "resolved": resolved, "open": len(_load(OPEN)),

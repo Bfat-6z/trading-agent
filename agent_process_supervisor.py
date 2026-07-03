@@ -165,6 +165,7 @@ def default_python() -> str:
 def scrub_child_env(env: dict[str, str] | None = None) -> dict[str, str]:
     source = dict(env or os.environ)
     clean = {key: value for key, value in source.items() if key.upper() in CHILD_ENV_ALLOWLIST and key.upper() not in LIVE_ENV_DENYLIST}
+    clean["PYTHONUNBUFFERED"] = "1"   # crash tracebacks must hit the log before a kill
     clean["TRADING_AGENT_LIVE_ORDERS"] = "false"
     clean["TRADING_AGENT_CHILD_ENV_SCRUBBED"] = "1"
     return clean
@@ -307,6 +308,16 @@ def supervisor_loop_pids() -> list[int]:
 def parse_ts(value: object) -> datetime | None:
     if not value:
         return None
+    # numeric epoch timestamps (seconds or ms) — some agents write int ts; without
+    # this they parse as None -> "permanently stale" -> kill-loop -> quarantine.
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+        try:
+            num = float(value)
+            if num > 1e12:
+                num /= 1000.0
+            return datetime.fromtimestamp(num, tz=timezone.utc)
+        except Exception:
+            return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
@@ -353,14 +364,24 @@ def restart_gate(agent: str, *, now: datetime | None = None, state_path: Path = 
     agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
     row = agents.get(agent) if isinstance(agents.get(agent), dict) else {}
     if row.get("state") == "quarantined":
-        return {
-            "allowed": False,
-            "reason": "restart_quarantined",
-            "original_reason": row.get("reason") or "restart_circuit_breaker",
-            "restart_count_window": int(row.get("restart_count_window") or 0),
-            "backoff_seconds": None,
-            "quarantined_at": row.get("quarantined_at"),
-        }
+        # TTL: auto-release after 6h — quarantine protects against crash-loops, it
+        # must not be a permanent death sentence (a heartbeat-format bug killed two
+        # healthy agents for good before this).
+        qat = parse_ts(row.get("quarantined_at"))
+        if qat and (current - qat).total_seconds() > 6 * 3600:
+            row = {"attempts": [], "state": "active", "released_from_quarantine_at": current.isoformat(timespec="seconds")}
+            agents[agent] = row
+            state["agents"] = agents
+            write_json(state_path, state)
+        else:
+            return {
+                "allowed": False,
+                "reason": "restart_quarantined",
+                "original_reason": row.get("reason") or "restart_circuit_breaker",
+                "restart_count_window": int(row.get("restart_count_window") or 0),
+                "backoff_seconds": None,
+                "quarantined_at": row.get("quarantined_at"),
+            }
     attempts = []
     for value in row.get("attempts", []) if isinstance(row.get("attempts"), list) else []:
         parsed = parse_ts(value)

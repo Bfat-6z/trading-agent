@@ -172,7 +172,7 @@ def backtest_method(rows: list[dict[str, float]], method: dict[str, Any], symbol
         if exit_px is None:
             exit_px, reason = rows[min(i + TIMEOUT_BARS, n - 1)]["close"], "timeout"
             j = min(i + TIMEOUT_BARS, n - 1)
-        gross = (exit_px / entry - 1) if side == "LONG" else (entry / exit_px - 1)
+        gross = (exit_px / entry - 1) if side == "LONG" else (entry - exit_px) / entry
         net = gross - FEE_RT
         trades.append({"symbol": symbol, "side": side, "entry": entry, "exit": exit_px,
                        "reason": reason, "r": net / sl_pct, "net": net, "bar": i})
@@ -192,12 +192,14 @@ def evaluate_method(method: dict[str, Any], frames: dict[str, list[dict[str, flo
     all_tr: list[dict[str, Any]] = []
     for sym, rows in frames.items():
         all_tr.extend(backtest_method(rows, method, sym))
-    all_tr.sort(key=lambda t: (t["symbol"], t["bar"]))
     if len(all_tr) < 20:
         return {"id": method["id"], "survived": False, "reason": "too_few_trades",
                 "n": len(all_tr), "oos_mean_r": None, "pvalue": None}
-    cut = int(len(all_tr) * (1 - oos_frac))
-    oos = all_tr[cut:]
+    # TEMPORAL split per symbol: every coin contributes its EARLY bars to
+    # in-sample and its LATE bars to OOS — no calendar overlap across coins
+    # (the old symbol-major cut let correlated coins leak the same window).
+    cutbar = {sym: int(len(rows) * (1 - oos_frac)) for sym, rows in frames.items()}
+    oos = [t for t in all_tr if t["bar"] >= cutbar.get(t["symbol"], 1 << 60)]
     if len(oos) < 15:
         return {"id": method["id"], "survived": False, "reason": "too_few_oos",
                 "n": len(all_tr), "oos_n": len(oos), "oos_mean_r": None, "pvalue": None}
@@ -221,9 +223,37 @@ def evaluate_method(method: dict[str, Any], frames: dict[str, list[dict[str, flo
 
 
 def run_lab(methods: list[dict[str, Any]], frames: dict[str, list[dict[str, float]]]) -> dict[str, Any]:
-    """Backtest + curate every candidate method; persist survivors + killed ledger."""
+    """Backtest + curate every candidate method; persist survivors + killed ledger.
+
+    Multiple-testing control is BH-FDR (q=0.05), NOT Bonferroni-over-the-pool:
+    the audit showed 0.05/n crosses the permutation p-floor once the growing pool
+    passes ~250 methods, after which NOTHING could ever survive; and survivors
+    flipped on pool growth alone. Hysteresis: a previous survivor keeps its seat
+    while it stays individually significant (p<=0.05, positive OOS), so one round
+    of pool churn can't evict a working method."""
     n = len(methods)
-    results = [evaluate_method(mth, frames, n_methods=n) for mth in methods]
+    results = [evaluate_method(mth, frames, n_methods=1) for mth in methods]   # raw p
+    try:
+        prev = {r.get("id") for r in json.loads(SURVIVORS.read_text(encoding="utf-8")) if r.get("survived")}
+    except Exception:
+        prev = set()
+    # BH-FDR over methods with a valid, positive-OOS result
+    cand = sorted([r for r in results if r.get("pvalue") is not None
+                   and (r.get("oos_mean_r") or 0) > 0 and (r.get("oos_total_net_pct") or 0) > 0],
+                  key=lambda r: r["pvalue"])
+    m = max(1, len(results)); q = 0.05; thr = 0.0
+    for i, r in enumerate(cand, 1):
+        if r["pvalue"] <= q * i / m:
+            thr = max(thr, r["pvalue"])
+    for r in results:
+        pos = (r.get("pvalue") is not None and (r.get("oos_mean_r") or 0) > 0
+               and (r.get("oos_total_net_pct") or 0) > 0)
+        bh = bool(pos and thr > 0 and r["pvalue"] <= thr)
+        grace = bool(pos and r["id"] in prev and r["pvalue"] <= 0.05)
+        r["survived"] = bh or grace
+        r["reason"] = ("survived_bh" if bh else "survived_grace" if grace
+                       else r.get("reason") if r.get("reason") in ("too_few_trades", "too_few_oos")
+                       else ("p>fdr" if pos else "not_positive"))
     survivors = [r for r in results if r.get("survived")]
     killed = [r for r in results if not r.get("survived")]
     LAB_DIR.mkdir(parents=True, exist_ok=True)

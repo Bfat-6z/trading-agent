@@ -79,10 +79,19 @@ def smc_summary(bars: list[dict[str, Any]], symbol: str, timeframe: str = "15m")
         n_sup = max(sup, key=lambda z: _num(z.get("upper"), 0), default=None)
         n_res = min(res, key=lambda z: _num(z.get("lower"), 1e18), default=None)
 
+        def _sig(x):
+            # significant figures, not fixed decimals — 4-dp rounding collapsed
+            # zones to identical prices on sub-$0.05 coins (micro-tier), wrecking
+            # the structure anchors _structure_sl_tp depends on.
+            try:
+                return float(f"{float(x):.6g}")
+            except Exception:
+                return 0.0
+
         def zfmt(z):
             if not z:
                 return None
-            return {"lo": round(_num(z.get("lower"), 0), 4), "hi": round(_num(z.get("upper"), 0), 4),
+            return {"lo": _sig(_num(z.get("lower"), 0)), "hi": _sig(_num(z.get("upper"), 0)),
                     "strength": round(_num(z.get("strength"), 0), 2), "quality": z.get("quality"),
                     "touches": z.get("touch_count"), "rel": z.get("price_relation")}
 

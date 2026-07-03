@@ -1,0 +1,227 @@
+{
+  "agents": {
+    "autonomous_paper_trading_loop": {
+      "attempts": [
+        "2026-07-03T21:51:47+00:00",
+        "2026-07-03T22:00:26+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:26+00:00",
+      "restart_count_window": 2,
+      "state": "active"
+    },
+    "cognitive_supervisor": {
+      "attempts": [
+        "2026-07-03T22:00:23+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:23+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "counterfactual_replay_agent": {
+      "attempts": [
+        "2026-07-03T21:59:45+00:00",
+        "2026-07-03T22:00:36+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:36+00:00",
+      "restart_count_window": 2,
+      "state": "active"
+    },
+    "daily_exam_agent": {
+      "attempts": [
+        "2026-07-03T22:01:05+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:01:05+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "dashboard": {
+      "attempts": [
+        "2026-07-03T22:00:19+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:19+00:00",
+      "released_from_quarantine_at": "2026-07-03T22:00:19+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "dream_cycle": {
+      "attempts": [
+        "2026-07-03T22:00:21+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:21+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "host_runtime_monitor": {
+      "attempts": [
+        "2026-07-03T22:00:19+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:19+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "learning_exam_benchmark": {
+      "attempts": [
+        "2026-07-03T22:00:51+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:51+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "llm_reasoning_agent": {
+      "attempts": [
+        "2026-07-03T22:00:24+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:24+00:00",
+      "released_from_quarantine_at": "2026-07-03T22:00:23+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "market_observer": {
+      "attempts": [
+        "2026-07-03T22:00:20+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:20+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "memory_consolidation_agent": {
+      "attempts": [
+        "2026-07-03T22:01:00+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:01:00+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "method_lab_runner": {
+      "attempts": [
+        "2026-07-03T22:00:35+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:35+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "microstructure_flow_factory": {
+      "attempts": [
+        "2026-07-03T22:00:29+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:29+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "microstructure_observer_loop": {
+      "attempts": [
+        "2026-07-03T22:00:28+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:28+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "news_observer": {
+      "attempts": [
+        "2026-07-03T22:00:20+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:20+00:00",
+      "released_from_quarantine_at": "2026-07-03T22:00:20+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "paper_candidate_feeder": {
+      "attempts": [
+        "2026-07-03T22:00:25+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:25+00:00",
+      "released_from_quarantine_at": "2026-07-03T22:00:25+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "paper_execution_lifecycle_loop": {
+      "attempts": [
+        "2026-07-03T22:00:27+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:27+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "promotion_evaluator_loop": {
+      "attempts": [
+        "2026-07-03T22:00:57+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:57+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "reflection_agent": {
+      "attempts": [
+        "2026-07-03T22:00:21+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:21+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "self_improvement_agent": {
+      "attempts": [
+        "2026-07-03T22:01:02+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:01:02+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "self_model": {
+      "attempts": [
+        "2026-07-03T22:00:59+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:59+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "shadow_trade_evaluator_loop": {
+      "attempts": [
+        "2026-07-03T21:57:07+00:00",
+        "2026-07-03T22:00:56+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:56+00:00",
+      "restart_count_window": 2,
+      "state": "active"
+    },
+    "signal_follower": {
+      "attempts": [
+        "2026-07-03T22:00:36+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:36+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "skill_forge_agent": {
+      "attempts": [
+        "2026-07-03T22:01:01+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:01:01+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "test_result_memory_agent": {
+      "attempts": [
+        "2026-07-03T22:00:53+00:00"
+      ],
+      "last_restart_at": "2026-07-03T22:00:53+00:00",
+      "restart_count_window": 1,
+      "state": "active"
+    },
+    "whale_flow_observer": {
+      "attempts": [
+        "2026-07-03T19:30:00+00:00",
+        "2026-07-03T19:33:45+00:00",
+        "2026-07-03T19:35:34+00:00"
+      ],
+      "last_restart_at": "2026-07-03T19:35:34+00:00",
+      "quarantined_at": "2026-07-03T19:38:25+00:00",
+      "reason": "restart_circuit_breaker",
+      "restart_count_window": 3,
+      "state": "quarantined"
+    }
+  },
+  "max_per_window": 3,
+  "schema_version": 1,
+  "updated_at": "2026-07-03T22:01:05+00:00",
+  "window_seconds": 900
+}

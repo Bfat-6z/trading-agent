@@ -101,7 +101,9 @@ def _load(path: Path) -> list[dict[str, Any]]:
 
 def _rewrite(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r, default=str) + "\n" for r in rows), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("".join(json.dumps(r, default=str) + "\n" for r in rows), encoding="utf-8")
+    os.replace(tmp, path)   # atomic: concurrent readers never see a half-written file
 
 
 def _append(path: Path, row: dict[str, Any]) -> None:
@@ -377,6 +379,10 @@ def _reflect() -> dict[str, Any]:
                 except Exception:
                     obj = None
         if isinstance(obj, dict) and obj.get("directives"):
+            # strip markup — this text reaches a publicly tunneled page via innerHTML
+            _cln = lambda x: str(x).replace("<", "").replace(">", "")
+            obj["reflection"] = _cln(obj.get("reflection", ""))
+            obj["directives"] = [_cln(d) for d in obj.get("directives", [])][:6]
             import time as _t
             obj["ts"] = int(_t.time() * 1000)
             LT_DIR.mkdir(parents=True, exist_ok=True)
@@ -562,22 +568,8 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
         size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # 5-10%
         sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))
         tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3)))
-        # HARD GATE (enforced in code because the model ignores its own prompt bans):
-        # its measured #1 mistake is chasing extended longs — 'Best only' labels on
-        # RSI>65 breakout entries that the lab KILLED (ema-stack chase, p=0.97).
-        # A LONG at RSI>=65 must be a PULLBACK (near/below EMA20), not a chase.
-        try:
-            rsi = float(ctx.get("rsi14") or 50)
-            ext = float(ctx.get("px_vs_ema20_pct") or 0)
-            if action == "LONG" and rsi >= 65 and ext > 0.5:
-                _append(LT_DIR / "governance.jsonl",
-                        {"event": "gate_block_chase", "symbol": sym, "rsi": rsi, "ext_pct": ext,
-                         "note": "LONG RSI>=65 extended above EMA20 — the measured noise-stop chase"})
-                continue
-        except Exception:
-            pass
-        # LIMIT entry: keep entry_px only if it's a FAVORABLE pullback limit within
-        # ~5% (LONG limit below price, SHORT limit above); else treat as market.
+        # LIMIT entry FIRST: keep entry_px only if it's a FAVORABLE pullback limit
+        # within ~5% (LONG below price / SHORT above); else treat as market.
         entry_px = None
         try:
             ep = float(dec.get("entry_px") or 0)
@@ -587,6 +579,23 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
                 entry_px = round(ep, 8)
         except Exception:
             entry_px = None
+        # HARD GATE (code-enforced; the model ignores prompt bans): block the
+        # measured chase — LONG at RSI>=65 while EXTENDED above EMA20. Judged at the
+        # EFFECTIVE entry: a pullback LIMIT at/below the EMA20 zone is exactly the
+        # disciplined behavior we want, so it passes (audit: the old order blocked it).
+        try:
+            rsi = float(ctx.get("rsi14") or 50)
+            ext = float(ctx.get("px_vs_ema20_pct") or 0)
+            px = float(ctx["price"])
+            eff_ext = ext if entry_px is None else ((entry_px / px) * (1 + ext / 100.0) - 1) * 100.0
+            if action == "LONG" and rsi >= 65 and eff_ext > 0.5:
+                _append(LT_DIR / "governance.jsonl",
+                        {"event": "gate_block_chase", "symbol": sym, "rsi": rsi, "ext_pct": ext,
+                         "entry_px": entry_px, "eff_ext_pct": round(eff_ext, 3),
+                         "note": "LONG RSI>=65 extended at effective entry — the measured noise-stop chase"})
+                continue
+        except Exception:
+            pass
         out.append({**ctx, "action": action, "leverage": lev, "size_pct": size_pct,
                     "sl_pct": sl_pct, "tp_pct": tp_pct, "entry_px": entry_px,
                     "rationale": str(dec.get("rationale", ""))[:240]})
@@ -752,12 +761,15 @@ def _day_anchor(acct: dict[str, Any], now_ms: int, equity: float) -> float:
     return float(acct.get("day_start_equity") or equity)
 
 
-def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float, float]:
-    """Place the stop BEYOND real structure (the nearest S/R zone edge or the SMC
-    invalidation level) + a 0.5*ATR buffer — not the LLM's arbitrary %, so a correct
-    trade isn't wicked out of noise. TP goes to the opposing zone, floored at 1.5x
-    the risk. Falls back to the LLM's sl_pct/tp_pct when no structure is available.
-    Owner request: 'SL/TP must fit the chart.'"""
+def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Place the stop BEYOND real structure (nearest S/R zone edge or SMC
+    invalidation) + 0.5*ATR — not the LLM's arbitrary %. TP targets the opposing
+    zone. Two hard audit rules: (a) if the structure stop is further than 6% we do
+    NOT clamp the stop back INSIDE the zone (that engineers a noise-stop in a known
+    bounce area) — we fall back to the LLM %; (b) if a REAL opposing zone caps the
+    reward below 1.5R we return (None, None) = SKIP, never synthesize a TP through
+    the zone the SMC engine says will reject price. The 1.8R synthetic TP is used
+    only when NO opposing zone exists. Owner: 'SL/TP must fit the chart.'"""
     smc = d.get("_smc") or {}
     atr = float(d.get("atr") or 0.0)
     buf = 0.5 * atr
@@ -765,6 +777,7 @@ def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float,
     res = smc.get("nearest_resistance") or {}
     inval = smc.get("invalidation")
     sl = tp = None
+    zone_tp = False
     try:
         if side == "LONG":
             base = (float(sup["lo"]) if sup.get("lo") and float(sup["lo"]) < entry
@@ -772,24 +785,32 @@ def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float,
             if base:
                 sl = base - buf
             if res.get("lo") and float(res["lo"]) > entry:
-                tp = float(res["lo"])
+                tp = float(res["lo"]); zone_tp = True
         else:
             base = (float(res["hi"]) if res.get("hi") and float(res["hi"]) > entry
                     else float(inval) if inval and float(inval) > entry else None)
             if base:
                 sl = base + buf
             if sup.get("hi") and float(sup["hi"]) < entry:
-                tp = float(sup["hi"])
+                tp = float(sup["hi"]); zone_tp = True
     except Exception:
         sl = tp = None
-    if sl is None:                                   # no structure -> LLM's stop
+        zone_tp = False
+    if sl is not None:
+        risk = abs(entry - sl)
+        if risk > entry * 0.06:
+            sl = None                       # structure too far -> NOT a structure trade (never clamp into the zone)
+        elif risk < entry * 0.004:          # widen a hair AWAY from the zone (deeper beyond structure)
+            sl = entry * (1 - 0.004) if side == "LONG" else entry * (1 + 0.004)
+    if sl is None:                          # no usable structure -> the LLM's stop
         sl = entry * (1 - d["sl_pct"] / 100) if side == "LONG" else entry * (1 + d["sl_pct"] / 100)
-    # clamp risk to a sane band so a far zone can't create an absurd stop
-    risk = min(entry * 0.06, max(entry * 0.004, abs(entry - sl)))
-    sl = entry - risk if side == "LONG" else entry + risk
-    # TP: opposing zone if it clears 1.5 R:R, else 1.8x risk
+    risk = abs(entry - sl)
     min_tp = 1.5 * risk
-    if tp is None or (side == "LONG" and tp - entry < min_tp) or (side == "SHORT" and entry - tp < min_tp):
+    if zone_tp:
+        reward = (tp - entry) if side == "LONG" else (entry - tp)
+        if reward < min_tp:
+            return None, None               # structurally bad R:R -> SKIP the trade
+    else:
         tp = entry + 1.8 * risk if side == "LONG" else entry - 1.8 * risk
     return sl, tp
 
@@ -821,24 +842,34 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
         # LIMIT entry (owner: 'wait for the pullback, don't FOMO market in'): queue a
         # pending order at the limit price instead of a market fill; _resolve_pending
         # fills it if price comes to the level, cancels if it runs away / expires.
-        if d.get("entry_px") and d["symbol"] not in pend_syms:
-            _append(PENDING, {"symbol": d["symbol"], "side": d["action"], "entry_px": float(d["entry_px"]),
-                              "leverage": d["leverage"], "size_pct": d["size_pct"],
-                              "sl_pct": d["sl_pct"], "tp_pct": d["tp_pct"], "smc": d.get("_smc") or {},
-                              "atr": float(d.get("atr") or 0), "quote_vol_24h": float(d.get("_quote_vol_24h", 0) or 0),
-                              "regime": d.get("regime"), "chart_b64": d.get("_chart_b64"),
-                              "price0": float(d["price"]), "placed_ms": now_ms, "ts": d.get("_ts"),
-                              "rationale": d.get("rationale", "")})
-            pend_syms.add(d["symbol"])
+        if d.get("entry_px"):
+            if d["symbol"] not in pend_syms:
+                _append(PENDING, {"symbol": d["symbol"], "side": d["action"], "entry_px": float(d["entry_px"]),
+                                  "leverage": d["leverage"], "size_pct": d["size_pct"],
+                                  "sl_pct": d["sl_pct"], "tp_pct": d["tp_pct"], "smc": d.get("_smc") or {},
+                                  "atr": float(d.get("atr") or 0), "quote_vol_24h": float(d.get("_quote_vol_24h", 0) or 0),
+                                  "vol": d.get("vol_ratio"), "regime": d.get("regime"), "chart_b64": d.get("_chart_b64"),
+                                  "price0": float(d["price"]), "placed_ms": now_ms, "ts": d.get("_ts"),
+                                  "rationale": d.get("rationale", "")})
+                pend_syms.add(d["symbol"])
+            else:
+                _append(LT_DIR / "governance.jsonl",
+                        {"ts_ms": now_ms, "event": "pending_duplicate_skip", "symbol": d["symbol"]})
+            # a limit-intent decision NEVER falls through to a market open — the
+            # audit repro'd exactly that (market-bought the FOMO price it was
+            # built to avoid) whenever the symbol already had a pending order.
             continue
         side = d["action"]; lev = d["leverage"]
         # Entry is a MARKET fill: apply adverse slippage by liquidity tier
         # (plan item #3 — the zero-slip entry was structurally optimistic).
         quote_vol = float(d.get("_quote_vol_24h", 0.0) or 0.0)
         tier = pcm.liquidity_tier(quote_vol)
-        slip = float(pcm.fill_bps(tier)) / 10000.0
         raw_px = float(d["price"])
-        entry = raw_px * (1 + slip) if side == "LONG" else raw_px * (1 - slip)
+        if d.get("_maker"):
+            entry = raw_px                    # resting limit fills AT its price (maker)
+        else:
+            slip = float(pcm.fill_bps(tier)) / 10000.0
+            entry = raw_px * (1 + slip) if side == "LONG" else raw_px * (1 - slip)
         margin = equity * d["size_pct"] / 100.0
         # Per-open caps (fail-closed): total margin + concurrent-position limit.
         ok, cap_why = lr.can_open(margin, equity, open_pos,
@@ -852,6 +883,10 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
         notional = margin * lev
         qty = notional / entry if entry > 0 else 0.0
         sl, tp = _structure_sl_tp(side, entry, d)   # SL beyond structure, not arbitrary %
+        if sl is None:                                # structurally bad R:R (TP would shoot through a real zone)
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "gate_block_tp_through_zone", "symbol": d["symbol"]})
+            continue
         # Forced-liquidation price (plan item #1): stored at open so resolve()
         # can rank liq ahead of SL pessimistically on every bar.
         mmr = lr.mmr_for(d["symbol"])
@@ -861,6 +896,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "margin": round(margin, 4), "leverage": lev, "sl": sl, "tp": tp,
                          "liq_px": liq_px, "mmr": mmr, "quote_vol_24h": quote_vol, "tier": tier,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
+                         "fill_bar_ts": d.get("_fill_bar_ts"),
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
@@ -897,14 +933,24 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
             d = {"symbol": sym, "action": side, "price": limit, "leverage": po["leverage"],
                  "size_pct": po["size_pct"], "sl_pct": po["sl_pct"], "tp_pct": po["tp_pct"], "entry_px": None,
                  "_smc": po.get("smc") or {}, "atr": po.get("atr", 0), "_quote_vol_24h": po.get("quote_vol_24h", 0),
-                 "regime": po.get("regime"), "_chart_b64": po.get("chart_b64"), "_ts": fill_ts,
+                 "vol_ratio": po.get("vol"), "_maker": True,
+                 "regime": po.get("regime"), "_chart_b64": po.get("chart_b64"),
+                 "_ts": fill_ts - 1, "_fill_bar_ts": fill_ts,
                  "rationale": (po.get("rationale") or "") + " [limit filled]"}
-            open_positions([d], equity, now_iso, now_ms=now_ms)
-            filled += 1
+            got = open_positions([d], equity, now_iso, now_ms=now_ms)
+            if got:
+                filled += 1
+            else:
+                _append(LT_DIR / "pending_events.jsonl",
+                        {"symbol": sym, "side": side, "event": "fill_blocked", "ts": now_ms})
             continue
         expired = now_ms - int(po["placed_ms"]) > EXPIRE_MS
         px_now = float(fut[-1]["close"]) if fut else float(po.get("price0") or limit)
-        ran = (side == "LONG" and px_now > limit * 1.02) or (side == "SHORT" and px_now < limit * 0.98)
+        # run-away must measure movement SINCE PLACEMENT — measuring from the limit
+        # level insta-cancelled every deep (A+ flush) limit even with price flat.
+        p0 = float(po.get("price0") or limit)
+        ran = ((side == "LONG" and px_now > max(p0, limit) * 1.02)
+               or (side == "SHORT" and px_now < min(p0, limit) * 0.98))
         if expired or ran:
             _append(LT_DIR / "pending_events.jsonl",   # NOT closed.jsonl (would pollute the feed/stats)
                     {"symbol": sym, "side": side, "event": "limit_cancelled",
@@ -963,13 +1009,33 @@ def resolve(client: Any, now_ms: int) -> int:
         sl_orig = sl
         risk = abs(entry - sl_orig)
         peak = entry
-        BE_BUF = 0.0012                       # breakeven a hair above round-trip fees
+        # TRUE breakeven must cover round-trip fees + the STOP slippage resolve()
+        # itself charges by tier (audit: 12bps flat made every 'BE' exit a
+        # guaranteed loss — micro tier slips 150bps). Skip the BE ratchet entirely
+        # when the buffer eats most of 1R (placing a fake-BE stop is worse).
+        _stop_slip = float(pcm.fill_bps(tier, is_stop=True)) / 10000.0
+        BE_BUF = 2 * float(pcm.TAKER_FEE_RATE) + _stop_slip + 0.0002
+        fb_ts = int(p.get("fill_bar_ts") or -1)
         for k, b in enumerate(fut):
-            hit = lr.exit_check(b, side, liq_px, sl, tp)  # pessimistic: liq -> sl -> tp
+            if int(b["ts_ms"]) == fb_ts:
+                # the bar our limit filled on: intrabar sequence is unknown — a TP
+                # touch may have happened BEFORE the fill, so only ADVERSE exits
+                # (liq/sl) may fire here; TP is never booked off the fill bar.
+                lo_, hi_ = float(b["low"]), float(b["high"])
+                hit = None
+                if side == "LONG":
+                    if lo_ <= liq_px: hit = (liq_px, "liquidation")
+                    elif lo_ <= sl: hit = (sl, "sl")
+                else:
+                    if hi_ >= liq_px: hit = (liq_px, "liquidation")
+                    elif hi_ >= sl: hit = (sl, "sl")
+            else:
+                hit = lr.exit_check(b, side, liq_px, sl, tp)  # pessimistic: liq -> sl -> tp
             if hit is not None:
                 exit_px, reason = hit
                 # a stop that has ratcheted to/above breakeven is a managed exit
-                if reason == "sl" and ((side == "LONG" and sl >= entry) or (side == "SHORT" and sl <= entry)):
+                if reason == "sl" and ((side == "LONG" and sl >= entry * (1 + BE_BUF))
+                                        or (side == "SHORT" and sl <= entry * (1 - BE_BUF))):
                     reason = "trail"
                 exit_ts = int(b["ts_ms"]); break
             if k + 1 >= MAX_HOLD_BARS:
@@ -979,14 +1045,14 @@ def resolve(client: Any, now_ms: int) -> int:
                 if side == "LONG":
                     peak = max(peak, float(b["high"]))
                     mr = (peak - entry) / risk
-                    if mr >= 1.0:
+                    if mr >= 1.0 and BE_BUF * entry < 0.9 * risk:
                         sl = max(sl, entry * (1 + BE_BUF))
                     if mr >= 2.0:
                         sl = max(sl, peak - risk)
                 else:
                     peak = min(peak, float(b["low"]))
                     mr = (entry - peak) / risk
-                    if mr >= 1.0:
+                    if mr >= 1.0 and BE_BUF * entry < 0.9 * risk:
                         sl = min(sl, entry * (1 - BE_BUF))
                     if mr >= 2.0:
                         sl = min(sl, peak + risk)
@@ -1117,11 +1183,26 @@ if __name__ == "__main__":
     ap.add_argument("--interval-seconds", type=float, default=90.0)  # higher frequency (cycle is LLM-bound ~2m; small sleep = back-to-back)
     a = ap.parse_args()
     LT_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()), encoding="ascii")
     if a.once:
+        # --once must not claim the loop's PID file (audit: it confused the
+        # supervisor's duplicate detection into killing/keeping the wrong one).
         print(json.dumps(run_once(), default=str))
     else:
+        # single-instance lock: a second resident loop double-books closes (the
+        # duplicate LINK trade) — refuse to start if another loop is fresh.
+        lock = LT_DIR / "loop.lock"
+        try:
+            import time as _t
+            if lock.exists() and (_t.time() - lock.stat().st_mtime) < 600:
+                print(json.dumps({"error": "another llm_trader loop is active (loop.lock fresh)"}))
+                raise SystemExit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+        PID_FILE.write_text(str(os.getpid()), encoding="ascii")
         while not STOP_FILE.exists():
+            lock.write_text(str(os.getpid()), encoding="ascii")   # touch: proves liveness
             try: res = run_once()
             except Exception as exc: res = {"error": str(exc)[:200]}
             _hb(res)

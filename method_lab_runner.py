@@ -52,7 +52,9 @@ def validate_method(m: dict[str, Any]) -> dict[str, Any] | None:
         tp = float(m.get("tp_pct", 2.5))
         if not (0.3 <= sl <= 6 and 0.3 <= tp <= 12):
             return None
-        return {"id": mid, "name": str(m.get("name", mid))[:60], "desc": str(m.get("desc", ""))[:160],
+        # strip markup chars — proposed text reaches the dashboard via innerHTML
+        _cln = lambda x: str(x).replace("<", "").replace(">", "").replace("&", " ")
+        return {"id": _cln(mid), "name": _cln(m.get("name", mid))[:60], "desc": _cln(m.get("desc", ""))[:160],
                 "side": side, "when": clean, "sl_pct": round(sl, 2), "tp_pct": round(tp, 2)}
     except Exception:
         return None
@@ -73,6 +75,10 @@ def _load_pool() -> list[dict[str, Any]]:
 
 def _save_pool(methods: list[dict[str, Any]]) -> None:
     ml.LAB_DIR.mkdir(parents=True, exist_ok=True)
+    # evict oldest beyond a cap — an ever-growing pool re-tests dead ideas forever
+    # and (pre-BH) was tightening the significance bar toward impossibility.
+    if len(methods) > 150:
+        methods = methods[-150:]
     with POOL.open("w", encoding="utf-8") as fh:
         for m in methods:
             fh.write(json.dumps(m) + "\n")
@@ -151,7 +157,9 @@ def run_once(client: Any, propose: bool = True) -> dict[str, Any]:
             continue
     out = ml.run_lab(methods, frames)
     HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT.write_text(json.dumps({"ts": now, "tested": len(methods), "coins": len(frames),
+    from datetime import datetime, timezone
+    HEARTBEAT.write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                     "ts_ms": now, "tested": len(methods), "coins": len(frames),
                                      **out["ledger"]}, indent=1), encoding="utf-8")
     return out
 

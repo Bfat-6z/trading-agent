@@ -188,11 +188,20 @@ def _resolve_pending(client, now_ms) -> int:
         if filled is None and now_ms >= int(od.get("expires_ts", 0)):
             cancelled = "expired"
         if filled is not None:
-            # entry_ts = the FILL bar so the resolver evaluates SL/TP/liq on
-            # every bar AFTER the fill (audit fix: was now_ms -> 0 bars -> missed stops)
-            _open(client, sym, side, filled, float(od["margin"]), int(od["leverage"]),
-                  od.get("sl"), od.get("tp"), od.get("scale_out"), od.get("note", "") + " [limit filled]",
-                  now_ms, kind="limit", entry_ts=fill_ts)
+            # entry_ts = fill bar MINUS 1 so the resolver evaluates the fill bar
+            # itself too (adverse-only there via fill_bar_ts: SL/liq can fire on
+            # it, TP never — the intrabar order vs our fill is unknown).
+            newp = _open(client, sym, side, filled, float(od["margin"]), int(od["leverage"]),
+                         od.get("sl"), od.get("tp"), od.get("scale_out"), od.get("note", "") + " [limit filled]",
+                         now_ms, kind="limit", entry_ts=fill_ts - 1)
+            try:
+                rows_ = _load(POSITIONS)
+                for rp in rows_:
+                    if rp.get("id") == newp.get("id"):
+                        rp["fill_bar_ts"] = fill_ts
+                _rewrite(POSITIONS, rows_)
+            except Exception:
+                pass
             _append(CLOSED, {"event": "limit_filled", "id": od["id"], "symbol": sym, "side": side,
                              "fill": filled, "ts": now_ms})
             changed += 1
@@ -233,6 +242,7 @@ def _resolve_positions(client, now_ms) -> int:
         except Exception:
             still.append(p); continue
         exit_px = reason = None
+        fb_ts = int(p.get("fill_bar_ts") or -1)
         for b in fut:
             hi, lo = float(b["high"]), float(b["low"])
             # pessimistic: liquidation -> SL -> TP
@@ -240,6 +250,8 @@ def _resolve_positions(client, now_ms) -> int:
                 exit_px, reason = liq, "liquidation"; break
             if sl and ((side == "LONG" and lo <= sl) or (side == "SHORT" and hi >= sl)):
                 exit_px, reason = sl, "sl"; break
+            if int(b["ts_ms"]) == fb_ts:
+                continue   # limit-fill bar: adverse-only (a TP touch may predate the fill)
             if tp and ((side == "LONG" and hi >= tp) or (side == "SHORT" and lo <= tp)):
                 exit_px, reason = tp, "tp"; break
             # scale-out (take partial at +trigger%), only if not stopped this bar
