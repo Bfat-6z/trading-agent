@@ -562,6 +562,20 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
         size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # 5-10%
         sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))
         tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3)))
+        # HARD GATE (enforced in code because the model ignores its own prompt bans):
+        # its measured #1 mistake is chasing extended longs — 'Best only' labels on
+        # RSI>65 breakout entries that the lab KILLED (ema-stack chase, p=0.97).
+        # A LONG at RSI>=65 must be a PULLBACK (near/below EMA20), not a chase.
+        try:
+            rsi = float(ctx.get("rsi14") or 50)
+            ext = float(ctx.get("px_vs_ema20_pct") or 0)
+            if action == "LONG" and rsi >= 65 and ext > 0.5:
+                _append(LT_DIR / "governance.jsonl",
+                        {"event": "gate_block_chase", "symbol": sym, "rsi": rsi, "ext_pct": ext,
+                         "note": "LONG RSI>=65 extended above EMA20 — the measured noise-stop chase"})
+                continue
+        except Exception:
+            pass
         # LIMIT entry: keep entry_px only if it's a FAVORABLE pullback limit within
         # ~5% (LONG limit below price, SHORT limit above); else treat as market.
         entry_px = None
@@ -591,9 +605,10 @@ _DECISION_SCHEMA = (
     f"/ whale); RSI+candle+volume = ONE family. (4) GATE — does it clear >={MIN_CONFLUENCE} confluences AND give "
     "R:R>=1.5 after ~0.1% fees to a REAL zone? Which of YOUR MEASURED MISTAKES would this setup repeat? "
     + ("You are in DATA-ACCUMULATION mode: ACT on solid B+ setups that clear the gate to build a measured track "
-       "record — do NOT skip everything waiting for the rare perfect A+. Aim to take the best 1-3 qualifying coins "
-       "each cycle. Still hard-SKIP the exact traps you keep losing on (chasing extended RSI>75 with no stop room, "
-       "shorting into support)." if EXPLORE_MODE else
+       "record — do NOT skip everything waiting for the rare perfect A+. Take up to 1-3 qualifying coins per cycle, "
+       "but ZERO is the correct answer when every candidate is the same trap: a LONG at RSI>=65 extended above "
+       "EMA20 is a CHASE (your measured #1 loss pattern — code will reject it anyway); wait for the PULLBACK to the "
+       "zone/EMA20 or set a limit there instead. Do not relabel a chase as 'Best only'." if EXPLORE_MODE else
        "Be STRICT: default SKIP — most coins should be SKIP, taking a marginal trade is the mistake you keep making.")
     + " PREFER A LIMIT ENTRY: set entry_px at a PULLBACK level (support-zone edge / EMA20 for a long, "
     "resistance edge / EMA20 for a short) so you buy the dip / sell the rip at a GOOD price — do NOT FOMO-chase the "
