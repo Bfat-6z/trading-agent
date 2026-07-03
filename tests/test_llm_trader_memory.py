@@ -426,3 +426,29 @@ def test_llm_trader_source_wires_memory_module():
     assert "build_memory_context" in src
     assert "your_past_outcomes" not in src
     assert src.count("relevant_lessons(") == 1  # the def only, zero call sites
+
+
+def _mk(side, net, reason="tp", regime="trending"):
+    return {"symbol": "BTCUSDT", "side": side, "net": net, "reason": reason,
+            "regime": regime, "r": net}
+
+
+def test_mistake_lessons_detects_failure_modes():
+    import llm_trader_memory as m
+    # 30 trades: 8/30 win, shorts all lose, SL dominates, R:R inverted
+    closed = []
+    for i in range(22):   # losers via SL
+        closed.append(_mk("LONG" if i % 3 else "SHORT", -0.45, "sl"))
+    for i in range(8):    # small winners via TP
+        closed.append(_mk("LONG", 0.30, "tp"))
+    ms = m.mistake_lessons(closed)
+    blob = " ".join(ms)
+    assert any("OVER-TRADING" in x for x in ms)      # <35% win
+    assert any("NOISE-STOPPED" in x for x in ms)     # SL >> TP
+    assert any("AVOID SHORT" in x for x in ms)       # shorts 0%
+    assert "R:R" in blob                              # inverted r:r flagged
+
+
+def test_mistake_lessons_empty_when_thin():
+    import llm_trader_memory as m
+    assert m.mistake_lessons([_mk("LONG", 0.3) for _ in range(4)]) == []

@@ -192,6 +192,80 @@ def distill_lessons(stats: dict, min_n: int = 3, max_lines: int = 12) -> list[st
     return [line for _, _, _, line in scored[:cap]]
 
 
+def mistake_lessons(closed: list[dict[str, Any]], min_n: int = 8) -> list[str]:
+    """Diagnose the RECURRING failure modes from realized P&L and phrase them as
+    pointed corrective directives for the decide() prompt — the honest 'learn from
+    your own mistakes' loop. Unlike distill_lessons (per-group expectancy), this
+    finds STRUCTURAL leaks: noise-stops, inverted R:R, a side that's always wrong,
+    a losing regime, over-trading. Each line cites the numbers so the LLM weighs
+    it, not blind rules. Empty until there's enough evidence (min_n trades)."""
+    trades = [t for t in closed if isinstance(t, dict) and _num(t.get("net")) is not None]
+    n = len(trades)
+    if n < min_n:
+        return []
+    nets = [_num(t["net"]) for t in trades]
+    wins = [t for t, v in zip(trades, nets) if v > 0]
+    losses = [t for t, v in zip(trades, nets) if v <= 0]
+    wr = len(wins) / n
+    out: list[str] = []
+
+    # 1. Over-trading marginal setups (win rate below a coin flip).
+    if wr < 0.35:
+        out.append(f"OVER-TRADING: {n} trades but only {wr*100:.0f}% win — worse than a coin flip, so your "
+                   f"entries are actively bad. SKIP is the default. Require >=3 strong confluences (trend + a real "
+                   f"zone location + a trigger candle with volume) or stand aside. Fewer, higher-quality trades.")
+
+    # 2. Inverted risk/reward: losses bigger than wins.
+    aw = sum(_num(t["net"]) for t in wins) / len(wins) if wins else 0.0
+    al = sum(_num(t["net"]) for t in losses) / len(losses) if losses else 0.0
+    if al < 0 and wins and abs(aw / al) < 1.3:
+        out.append(f"LOSSES BIGGER THAN WINS: realized R:R {abs(aw/al):.2f} (avg win ${aw:.2f} < avg loss "
+                   f"${abs(al):.2f}). Only take setups where the TP to a REAL opposing zone is >=1.5x the SL "
+                   f"distance; if a sensible stop doesn't leave >=1.5:1, SKIP. Never widen TP to force it.")
+
+    # 3. Noise-stopped: SL exits dominate and almost never win.
+    reason = {}
+    for t, v in zip(trades, nets):
+        r = (t.get("reason") or "?")
+        cell = reason.setdefault(r, [0, 0])
+        cell[0] += 1
+        if v > 0:
+            cell[1] += 1
+    sl_c, sl_w = reason.get("sl", [0, 0])
+    tp_c = reason.get("tp", [0, 0])[0]
+    if sl_c >= 6 and sl_c > tp_c * 1.5 and (sl_w / sl_c if sl_c else 1) < 0.12:
+        out.append(f"NOISE-STOPPED: {sl_c} SL exits ({sl_c/n*100:.0f}% of trades) vs {tp_c} TP wins — your stops "
+                   f"sit inside 15m noise and get clipped before the move. Place the stop BEYOND the structure "
+                   f"swing/zone (+~0.5x ATR, past equal-highs/lows); if that stop is too far for >=1.5 R:R, the "
+                   f"entry is wrong — wait for price to come to the zone instead of chasing.")
+
+    # 4. A side that is systematically wrong.
+    for side in ("LONG", "SHORT"):
+        ss = [t for t in trades if t.get("side") == side]
+        if len(ss) >= 6:
+            sw = sum(1 for t in ss if _num(t["net"]) > 0) / len(ss)
+            snet = sum(_num(t["net"]) for t in ss)
+            if sw < 0.25:
+                out.append(f"AVOID {side}: {len(ss)} {side} trades, {sw*100:.0f}% win, net ${snet:.2f} — they are "
+                           f"systematically wrong right now. Only {side} when trend + MTF + structure (BOS) + whale "
+                           f"flow ALL agree; otherwise skip {side} entirely.")
+
+    # 5. A regime that isn't working.
+    reg = {}
+    for t, v in zip(trades, nets):
+        rg = t.get("regime") or "?"
+        cell = reg.setdefault(rg, [0, 0])
+        cell[0] += 1
+        if v > 0:
+            cell[1] += 1
+    for rg, (c, w) in sorted(reg.items(), key=lambda kv: -kv[1][0]):
+        if rg != "?" and c >= 6 and (w / c) < 0.2:
+            out.append(f"STAND ASIDE in '{rg}': {c} trades there, only {w/c*100:.0f}% win — this regime is not "
+                       f"tradeable for you; wait for a cleaner trend/structure before engaging.")
+
+    return out[:6]
+
+
 def recent_trades(closed: list[dict[str, Any]], k: int = 10) -> list[dict[str, Any]]:
     """Last k closed trades for rationale-vs-outcome review, oldest first.
 

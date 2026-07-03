@@ -292,6 +292,21 @@ def relevant_lessons(symbol: str, regime: str, k: int = 8) -> list[dict[str, Any
     return (same or mem)[-k:]
 
 
+def _mistakes_block() -> str:
+    """Surface the measured failure-mode lessons PROMINENTLY in the system prompt
+    (not buried in the memory JSON) so the model actually corrects them — the
+    'learn from your own mistakes' channel. Computed from realized P&L each cycle."""
+    try:
+        ms = ltm.mistake_lessons(_dedupe_closed(_load(CLOSED)))
+    except Exception:
+        ms = []
+    if not ms:
+        return ""
+    lines = "\n".join(f"- {m}" for m in ms)
+    return ("=== YOUR MEASURED MISTAKES (from your OWN losing trades — actively correct these; "
+            "do NOT repeat them) ===\n" + lines + "\n=== END MISTAKES ===\n\n")
+
+
 def memory_context() -> dict[str, Any]:
     """Distilled learning context injected into decide()'s prompt each cycle.
 
@@ -431,7 +446,7 @@ def _decide_numeric(context: list[dict[str, Any]], equity: float,
     payload = [{"symbol": c["symbol"], **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                for c in context]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money reading numeric context per coin. "
-           + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     usr = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                       "memory": memory_context(), "coins": payload}, default=str)
     return _validate_decisions(_extract_json(_llm(sys, usr)), by_sym)
@@ -478,6 +493,7 @@ def decide(context: list[dict[str, Any]], equity: float,
                  for c in charted]
     market_overview = [{"symbol": c["symbol"], "ret20_pct": c.get("ret20_pct"),
                         "regime": c.get("regime")} for c in ranked[:20]]
+    mem = memory_context()   # stats + lessons + MISTAKES + recent (computed once)
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money. You are shown CANDLESTICK charts "
            "(with EMA20/50/200, a volume panel, and an RSI(14) panel) for the most active coins, plus their "
            "numeric context and a broad market overview. READ THE CHARTS: trend & EMA stack/slope, structure "
@@ -493,9 +509,9 @@ def decide(context: list[dict[str, Any]], equity: float,
            "confluence hint ONLY — whale pressure agreeing with your chart setup adds a little confidence; a big "
            "opposite-side liquidation can mark a flush/reversal; NEVER trade on whale flow alone or chase it.\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
-           + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
-                       "memory": memory_context(), "charted_coins": coins_txt,
+                       "memory": mem, "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
     out = _validate_decisions(_extract_json(_llm_vision(sys, text, images)), by_sym)
     if out:
