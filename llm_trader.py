@@ -75,6 +75,12 @@ UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "20000000"))
 # day; does not close positions).
 MAX_CONCURRENT = int(os.environ.get("LLM_TRADER_MAX_CONCURRENT", "50"))
 MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "95"))
+# DATA-ACCUMULATION mode (owner): trade B+ setups to build a measured track record
+# fast, instead of sitting idle waiting for the rare A+. Lower confluence gate +
+# an explicit "act, don't over-skip" directive. Honest tradeoff: more trades on a
+# not-yet-proven strategy = faster data AND faster bleed; the scorecard is the judge.
+MIN_CONFLUENCE = int(os.environ.get("LLM_TRADER_MIN_CONFLUENCE", "2"))
+EXPLORE_MODE = os.environ.get("LLM_TRADER_EXPLORE", "1") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +355,15 @@ def _reflect() -> dict[str, Any]:
                  "measured_mistakes": ltm.mistake_lessons(closed),
                  "proven_methods": [s.get("desc") for s in surv if s.get("survived")],
                  "recent_rationale_vs_outcome": recent}
+        mode = ("You are in DATA-ACCUMULATION mode: the goal is to build a measured track record, so your directives "
+                "must IMPROVE trade SELECTION (avoid the specific traps that lose), NOT stop trading altogether. "
+                "Do NOT say 'default SKIP' or 'max 1 trade' — instead say which setups to PREFER vs AVOID. "
+                if EXPLORE_MODE else "")
         sysp = ("You are the trading agent reflecting on your OWN performance (meta-cognition). Think HARD and be "
                 "brutally honest: you are losing money, so vague optimism is useless. Reason about WHY you lose, "
                 "whether your stated rationales actually matched outcomes (did 'bull stack' setups get stopped?), "
                 "what is genuinely working (proven_methods) versus your reflexive habits, and what you must change. "
+                + mode +
                 "Reply ONLY a JSON object: {\"reflection\":\"3-4 sentences of honest self-analysis\","
                 "\"directives\":[\"3-5 concrete changes to apply to your next decisions\"]}")
         raw = _llm(sysp, json.dumps(state, default=str), max_tokens=MAX_REFLECT_TOKENS)
@@ -564,9 +575,14 @@ _DECISION_SCHEMA = (
     "THINKING:\nReason out loud. For EACH charted coin, in order: (1) TREND — EMA stack + slope + MTF agree? "
     "(2) LOCATION — is price AT a proven support/resistance zone or a BOS/CHoCH retest, or stranded mid-range? "
     "(3) CONFLUENCE — count INDEPENDENT signals from DISTINCT families (trend / location / momentum-trigger+volume "
-    "/ whale); RSI+candle+volume = ONE family. (4) GATE — does it clear >=3 confluences AND give R:R>=1.5 after "
-    "~0.1% fees to a REAL zone? Which of YOUR MEASURED MISTAKES would this setup repeat? Be STRICT: default SKIP — "
-    "most coins should be SKIP, taking a marginal trade is the mistake you keep making.\n"
+    f"/ whale); RSI+candle+volume = ONE family. (4) GATE — does it clear >={MIN_CONFLUENCE} confluences AND give "
+    "R:R>=1.5 after ~0.1% fees to a REAL zone? Which of YOUR MEASURED MISTAKES would this setup repeat? "
+    + ("You are in DATA-ACCUMULATION mode: ACT on solid B+ setups that clear the gate to build a measured track "
+       "record — do NOT skip everything waiting for the rare perfect A+. Aim to take the best 1-3 qualifying coins "
+       "each cycle. Still hard-SKIP the exact traps you keep losing on (chasing extended RSI>75 with no stop room, "
+       "shorting into support)." if EXPLORE_MODE else
+       "Be STRICT: default SKIP — most coins should be SKIP, taking a marginal trade is the mistake you keep making.")
+    + "\n"
     "===DECISIONS===\nThen a JSON ARRAY (may be empty) of ONLY coins that PASSED the gate: "
     "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\",\"leverage\":5|10,\"size_pct\":5-10,"
     "\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,\"rationale\":\"cite levels + how many confluences\"}]")
