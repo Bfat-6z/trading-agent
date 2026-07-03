@@ -812,20 +812,47 @@ def resolve(client: Any, now_ms: int) -> int:
         tier = pcm.liquidity_tier(quote_vol)
         exit_px = reason = None
         exit_ts = int(p["entry_ts"])
+        # Breakeven + trailing stop (fixes 'trade went into profit then closed at a
+        # full loss'): after a bar CLOSES having reached +1R, ratchet the stop to
+        # breakeven+fees; past +2R, trail 1R behind the run's peak. No lookahead —
+        # the stop only moves AFTER a bar is survived (the old stop is checked
+        # first, pessimistically, so an intrabar dip to the old stop still counts).
+        sl_orig = sl
+        risk = abs(entry - sl_orig)
+        peak = entry
+        BE_BUF = 0.0012                       # breakeven a hair above round-trip fees
         for k, b in enumerate(fut):
             hit = lr.exit_check(b, side, liq_px, sl, tp)  # pessimistic: liq -> sl -> tp
             if hit is not None:
                 exit_px, reason = hit
+                # a stop that has ratcheted to/above breakeven is a managed exit
+                if reason == "sl" and ((side == "LONG" and sl >= entry) or (side == "SHORT" and sl <= entry)):
+                    reason = "trail"
                 exit_ts = int(b["ts_ms"]); break
             if k + 1 >= MAX_HOLD_BARS:
                 exit_px, reason = float(b["close"]), "timeout"
                 exit_ts = int(b["ts_ms"]); break
+            if risk > 0:                       # ratchet AFTER surviving this bar
+                if side == "LONG":
+                    peak = max(peak, float(b["high"]))
+                    mr = (peak - entry) / risk
+                    if mr >= 1.0:
+                        sl = max(sl, entry * (1 + BE_BUF))
+                    if mr >= 2.0:
+                        sl = max(sl, peak - risk)
+                else:
+                    peak = min(peak, float(b["low"]))
+                    mr = (entry - peak) / risk
+                    if mr >= 1.0:
+                        sl = min(sl, entry * (1 - BE_BUF))
+                    if mr >= 2.0:
+                        sl = min(sl, peak + risk)
         if exit_px is None:
             still.append(p); continue
         # Exit slippage: stop-market gaps through the stop, timeout is a plain
         # market order, TP is a resting limit (fills at its price), liquidation
         # net is pinned to -margin by net_pnl so its fill is informational.
-        if reason == "sl":
+        if reason in ("sl", "trail"):
             slip = float(pcm.fill_bps(tier, is_stop=True)) / 10000.0
             exit_px = exit_px * (1 - slip) if side == "LONG" else exit_px * (1 + slip)
         elif reason == "timeout":

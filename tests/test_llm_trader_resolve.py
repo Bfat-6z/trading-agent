@@ -114,3 +114,38 @@ def test_sl_fill_slips_through_stop_price(env, monkeypatch):
     assert rec["reason"] == "sl"
     assert rec["exit"] < 95.0                          # never the exact stop px
     assert rec["exit"] == pytest.approx(95.0 * (1 - 0.015))
+
+
+def test_breakeven_trailing_protects_a_winner():
+    """A trade that reaches +1R then reverses must NOT close at a full-stop loss —
+    it exits at ~breakeven (the owner's 'won then closed at a loss' fix)."""
+    import llm_trader_risk as lr
+
+    def ratchet_exit(side, entry, sl0, tp, bars):
+        liq = entry * 0.5 if side == "LONG" else entry * 1.5
+        sl, risk, peak, BE = sl0, abs(entry - sl0), entry, 0.0012
+        for b in bars:
+            hit = lr.exit_check(b, side, liq, sl, tp)
+            if hit is not None:
+                px, reason = hit
+                if reason == "sl" and ((side == "LONG" and sl >= entry) or (side == "SHORT" and sl <= entry)):
+                    reason = "trail"
+                return reason, px
+            if risk > 0:
+                if side == "LONG":
+                    peak = max(peak, b["high"]); mr = (peak - entry) / risk
+                    if mr >= 1.0: sl = max(sl, entry * (1 + BE))
+                    if mr >= 2.0: sl = max(sl, peak - risk)
+                else:
+                    peak = min(peak, b["low"]); mr = (entry - peak) / risk
+                    if mr >= 1.0: sl = min(sl, entry * (1 - BE))
+                    if mr >= 2.0: sl = min(sl, peak + risk)
+        return "open", None
+    def bar(o, h, l, c): return {"open": o, "high": h, "low": l, "close": c}
+
+    # LONG +1.5R then reverses -> breakeven exit, not the -2% stop
+    r, px = ratchet_exit("LONG", 100, 98, 130, [bar(100, 103, 100, 102), bar(102, 102, 96, 96)])
+    assert r == "trail" and px >= 100.0            # exited at/above entry, not 98
+    # genuinely wrong entry (drops straight) still takes the full stop
+    r2, px2 = ratchet_exit("LONG", 100, 98, 130, [bar(100, 100, 97, 97)])
+    assert r2 == "sl" and px2 <= 98.0
