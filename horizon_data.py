@@ -349,6 +349,19 @@ def build() -> dict:
     except Exception:
         pass
 
+    # Mind: the bot's step-by-step thinking + self-reflection (meta-cognition).
+    mind = {"thinking": None, "thinking_ts": None, "reflection": None, "directives": []}
+    try:
+        th = json.loads((st / "llm_trader" / "thinking_latest.json").read_text(encoding="utf-8"))
+        mind["thinking"] = th.get("thinking"); mind["thinking_ts"] = th.get("ts")
+    except Exception:
+        pass
+    try:
+        rf = json.loads((st / "llm_trader" / "self_reflection.json").read_text(encoding="utf-8"))
+        mind["reflection"] = rf.get("reflection"); mind["directives"] = (rf.get("directives") or [])[:6]
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mode": "PAPER-ONLY · LIVE LOCKED",
@@ -356,6 +369,7 @@ def build() -> dict:
         "manual": manual,
         "whale": whale,
         "method_lab": lab,
+        "mind": mind,
         "account": {"equity": equity, "trades": trades, "open": len(fp_open), "realized": realized},
         "forward_paper": {
             "open": [{"sym": p.get("symbol"), "side": p.get("direction"),

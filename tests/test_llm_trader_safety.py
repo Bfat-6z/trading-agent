@@ -41,3 +41,13 @@ def test_owner_rules_pinned():
     text = (ROOT / "llm_trader.py").read_text(encoding="utf-8")
     assert "SIZE_PCT_MIN, SIZE_PCT_MAX = 5.0, 10.0" in text
     assert "ALLOWED_LEVERAGE = (5, 10)" in text
+
+
+def test_split_thinking_handles_brackets_and_delimiter():
+    import llm_trader as l
+    raw = 'THINKING:\nBTC [strong] 3 conf [ok]\n===DECISIONS===\n[{"symbol":"BTCUSDT","action":"LONG"}]'
+    out = l._split_thinking(raw)
+    assert isinstance(out, list) and out[0]["symbol"] == "BTCUSDT"   # array parsed despite [ ] in thinking
+    # no delimiter -> whole text extraction still works
+    assert l._split_thinking('[{"symbol":"ETHUSDT"}]')[0]["symbol"] == "ETHUSDT"
+    assert l._split_thinking(None) is None
