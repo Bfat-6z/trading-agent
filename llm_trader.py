@@ -680,6 +680,15 @@ def decide(context: list[dict[str, Any]], equity: float,
     # shortlist the most active coins to chart (wider scope -> better candidates)
     ranked = sorted(context, key=_activity_score, reverse=True)
     shortlist = ranked[:max_charts]
+    # A+ OVERRIDE: the lab-proven capitulation setup (rsi<22 + vol>=1.8) is too rare
+    # to ever miss — a coin printing it gets charted regardless of activity rank
+    # (top-5-only scanning would have missed the LTC/INJ flushes outside the list).
+    aplus = [c for c in ranked if float(c.get("rsi14") or 50) < 22
+             and float(c.get("vol_ratio") or 1) >= 1.8]
+    for c in aplus:
+        if c not in shortlist:
+            shortlist = [c] + shortlist[:max_charts - 1]
+            c["a_plus_pure"] = True   # flagged in coins_txt so the model sees it
     by_sym = {c["symbol"]: c for c in shortlist}
     images, charted = [], []
     for c in shortlist:
