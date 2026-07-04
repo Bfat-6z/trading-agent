@@ -77,7 +77,7 @@ PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "1") == "1"
 # re-selected each cycle by quote-volume; more concurrent slots so a wider scan
 # actually turns into more live trades (the batched decision is still ONE LLM
 # call regardless of coin count, so breadth is ~free on the model side).
-UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "30"))
+UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "60"))   # wider net for proven fires (owner: scope must be broad)
 UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "20000000"))
 # Owner: UNLIMITED number of positions — accepts correlation risk for bigger
 # upside. No trade-count cap (50 >> the 30-coin universe, 1-per-symbol, so it

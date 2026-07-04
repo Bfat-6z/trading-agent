@@ -1,0 +1,15 @@
+[
+ {
+  "id": "capitulation_long",
+  "side": "LONG",
+  "desc": "Long deep RSI<22 + high volume flush (mean-revert the panic)",
+  "survived": true,
+  "reason": "survived_full_scale_203coins_5mo",
+  "oos_n": 1943,
+  "oos_mean_r": 0.1464,
+  "oos_win_rate": 0.5466,
+  "oos_total_net_pct": 710.96,
+  "pvalue": 0.0002,
+  "note": "full-scale: 203 coins x 5mo, 5629 trades, BH-FDR passed; rsi_oversold_bounce DISARMED (p=0.28 at scale = breadth-luck false positive)"
+ }
+]
