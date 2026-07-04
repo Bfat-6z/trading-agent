@@ -66,6 +66,13 @@ ALLOWED_LEVERAGE = (5, 10)
 # entries need strong participation: vol_ratio >= this (his method: EMA+VOL+price;
 # research: breakout on sub-1.5x volume = fakeout). A+ capitulation needs >=1.8 anyway.
 MIN_ENTRY_VOL = float(os.environ.get("LLM_TRADER_MIN_ENTRY_VOL", "1.5"))
+# PROVEN-ONLY (the fix for the bleed, owner 2026-07-04 'fix cai bat on do di'):
+# 77 measured trades say LLM discretionary entries are -EV (-$0.14/trade); the one
+# measured +EV play is the lab survivor set. In this mode the bot trades ONLY when
+# a survivor's mechanical condition fires on live bars — evaluated by the SAME
+# method_lab code that backtested it (zero mapping drift). The lab keeps testing
+# new methods 24/7; new survivors auto-arm, dropped survivors auto-disarm.
+PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "1") == "1"
 # SCOPE + FREQUENCY (owner: wider coin scan, higher frequency). Universe is
 # re-selected each cycle by quote-volume; more concurrent slots so a wider scan
 # actually turns into more live trades (the batched decision is still ONE LLM
@@ -421,6 +428,68 @@ def _reflection_block() -> str:
     head = (obj.get("reflection", "").strip() + "\n") if obj.get("reflection") else ""
     return ("=== YOUR SELF-REFLECTION (you reasoned about your own results — follow your own conclusions) ===\n"
             + head + "\n".join(f"- {d}" for d in ds[:6]) + "\n=== END REFLECTION ===\n\n")
+
+
+def _survivor_methods() -> list[dict[str, Any]]:
+    """Current lab survivors joined to their full method definitions (conditions
+    live in seeds + the runner's growing pool; survivors.json only carries ids)."""
+    try:
+        surv = json.loads(_LAB_SURVIVORS.read_text(encoding="utf-8"))
+        ids = [s["id"] for s in surv if s.get("survived")]
+        if not ids:
+            return []
+        from method_seeds import SEED_METHODS
+        defs = {m["id"]: m for m in SEED_METHODS}
+        pool = ROOT / "state" / "method_lab" / "methods_pool.jsonl"
+        if pool.exists():
+            for line in pool.read_text(encoding="utf-8").splitlines():
+                try:
+                    m = json.loads(line)
+                    defs[m["id"]] = m
+                except Exception:
+                    pass
+        return [defs[i] for i in ids if i in defs]
+    except Exception:
+        return []
+
+
+def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PROVEN-ONLY decide: fire a trade ONLY where a lab-survivor method's DSL
+    condition holds on the coin's live CLOSED bars — evaluated with method_lab's
+    own feature_frame/method_fires (the exact code that proved it). Execution is
+    faithful to what was backtested: the method's own sl/tp %, x10 (owner wants
+    size at max conviction), no structure override, no trailing, 16-bar timeout."""
+    import method_lab as ml
+    methods = _survivor_methods()
+    if not methods:
+        return []
+    out = []
+    for c in context:
+        bars = c.get("_bars")
+        if not bars or len(bars) < 220:
+            continue
+        try:
+            row = ml.feature_frame(bars)[-1]
+        except Exception:
+            continue
+        for m in methods:
+            if not ml.method_fires(row, m):
+                continue
+            chart = None
+            try:
+                chart = ltc.render_chart(c["symbol"], bars, tf=TF, title_suffix=" · PROVEN " + m["id"])
+            except Exception:
+                pass
+            out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
+                        "size_pct": SIZE_PCT_MAX, "sl_pct": float(m.get("sl_pct", 2.5)),
+                        "tp_pct": float(m.get("tp_pct", 4.0)), "entry_px": None,
+                        "_mech": True, "_chart_b64": chart,
+                        "rationale": f"PROVEN {m['id']}: {m.get('desc','')} (OOS-verified survivor)"})
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "proven_fire", "symbol": c["symbol"], "method": m["id"],
+                     "rsi": row.get("rsi14"), "vol": row.get("vol_ratio")})
+            break                                   # one method per coin per cycle
+    return out
 
 
 def _mistakes_block() -> str:
@@ -897,11 +966,17 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
             continue
         notional = margin * lev
         qty = notional / entry if entry > 0 else 0.0
-        sl, tp = _structure_sl_tp(side, entry, d)   # SL beyond structure, not arbitrary %
-        if sl is None:                                # structurally bad R:R (TP would shoot through a real zone)
-            _append(LT_DIR / "governance.jsonl",
-                    {"ts_ms": now_ms, "event": "gate_block_tp_through_zone", "symbol": d["symbol"]})
-            continue
+        if d.get("_mech"):
+            # PROVEN method: execute EXACTLY what was backtested — its own sl/tp %,
+            # no structure override (that machinery wasn't part of the proof).
+            sl = entry * (1 - d["sl_pct"] / 100) if side == "LONG" else entry * (1 + d["sl_pct"] / 100)
+            tp = entry * (1 + d["tp_pct"] / 100) if side == "LONG" else entry * (1 - d["tp_pct"] / 100)
+        else:
+            sl, tp = _structure_sl_tp(side, entry, d)   # SL beyond structure, not arbitrary %
+            if sl is None:                                # structurally bad R:R (TP would shoot through a real zone)
+                _append(LT_DIR / "governance.jsonl",
+                        {"ts_ms": now_ms, "event": "gate_block_tp_through_zone", "symbol": d["symbol"]})
+                continue
         # Forced-liquidation price (plan item #1): stored at open so resolve()
         # can rank liq ahead of SL pessimistically on every bar.
         mmr = lr.mmr_for(d["symbol"])
@@ -912,6 +987,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "liq_px": liq_px, "mmr": mmr, "quote_vol_24h": quote_vol, "tier": tier,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
                          "fill_bar_ts": d.get("_fill_bar_ts"),
+                         "mech": bool(d.get("_mech")), "max_hold": 16 if d.get("_mech") else None,
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
@@ -1033,6 +1109,8 @@ def resolve(client: Any, now_ms: int) -> int:
         _stop_slip = float(pcm.fill_bps(tier, is_stop=True)) / 10000.0
         BE_BUF = 2 * float(pcm.TAKER_FEE_RATE) + _stop_slip + 0.0002
         fb_ts = int(p.get("fill_bar_ts") or -1)
+        is_mech = bool(p.get("mech"))
+        hold_cap = int(p.get("max_hold") or MAX_HOLD_BARS)   # proven methods: 16 bars, as backtested
         for k, b in enumerate(fut):
             if int(b["ts_ms"]) == fb_ts:
                 # the bar our limit filled on: intrabar sequence is unknown — a TP
@@ -1055,7 +1133,7 @@ def resolve(client: Any, now_ms: int) -> int:
                                         or (side == "SHORT" and sl <= entry * (1 - BE_BUF))):
                     reason = "trail"
                 exit_ts = int(b["ts_ms"]); break
-            if k + 1 >= MAX_HOLD_BARS:
+            if k + 1 >= hold_cap:
                 exit_px, reason = float(b["close"]), "timeout"
                 exit_ts = int(b["ts_ms"]); break
             if int(b["ts_ms"]) == fb_ts:
@@ -1064,6 +1142,8 @@ def resolve(client: Any, now_ms: int) -> int:
                 # have held through (optimistic leak, twin of the TP-off-fill-bar
                 # bug). The ratchet starts from the NEXT bar.
                 continue
+            if is_mech:
+                continue                       # proven methods run EXACTLY as backtested: no trailing
             if risk > 0:                       # ratchet AFTER surviving this bar
                 if side == "LONG":
                     peak = max(peak, float(b["high"]))
@@ -1182,12 +1262,17 @@ def run_once() -> dict[str, Any]:
     uni = us.select_universe(client, end_ms=now_ms, months=1.0, timeframe="1h",
                              min_daily_quote_volume=UNIVERSE_MIN_QVOL, max_symbols=UNIVERSE_MAX)
     ctx = build_context(client, uni["selected"], now_ms)
-    decisions = decide(ctx, equity, status=status)
+    if PROVEN_ONLY:
+        # the bleed fix: no discretionary entries — only lab-proven survivors fire.
+        decisions = _mechanical_decisions(ctx)
+    else:
+        decisions = decide(ctx, equity, status=status)
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
     wr = round(acct["wins"] / acct["trades"], 3) if acct["trades"] else None
     return {"equity": acct["equity"], "trades": acct["trades"], "win_rate": wr,
             "opened": opened, "resolved": resolved, "open": len(_load(POSITIONS)),
             "considered": len(ctx), "acted": len(decisions), "model": MODEL,
+            "mode": "PROVEN_ONLY" if PROVEN_ONLY else "DISCRETIONARY",
             "verdict": card["verdict"]["code"], "breaker": status["capacity"]["daily_breaker"],
             "live": "LOCKED"}
 
