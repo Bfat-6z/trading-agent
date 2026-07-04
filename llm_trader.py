@@ -81,7 +81,7 @@ PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "1") == "1"
 # x5/x10 law. Caps (95% total margin) + daily breaker still govern.
 MISSION_START = float(os.environ.get("LLM_TRADER_MISSION_START", "100"))
 MISSION_TARGET = float(os.environ.get("LLM_TRADER_MISSION_TARGET", "1000"))
-MECH_SIZE_PCT = float(os.environ.get("LLM_TRADER_MECH_SIZE_PCT", "20"))
+MECH_SIZE_PCT = float(os.environ.get("LLM_TRADER_MECH_SIZE_PCT", "30"))   # owner: max speed -> aggregate-Kelly (7.5% risk/fire, 3 concurrent slots)
 # SCOPE + FREQUENCY (owner: wider coin scan, higher frequency). Universe is
 # re-selected each cycle by quote-volume; more concurrent slots so a wider scan
 # actually turns into more live trades (the batched decision is still ONE LLM
