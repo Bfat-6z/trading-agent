@@ -1,15 +1,50 @@
 [
  {
+  "id": "cap2_rsi18_vol25",
+  "side": "LONG",
+  "desc": "RSI18 + 2.5x volume \u2014 the 2/3/4x volume grid from the curupira cascade-fade evidence, appl",
+  "survived": true,
+  "reason": "survived_full_scale_205coins_5mo_r2",
+  "oos_n": 741,
+  "oos_mean_r": 0.2735,
+  "oos_win_rate": 0.5857,
+  "oos_total_net_pct": 405.39,
+  "pvalue": 0.0002
+ },
+ {
+  "id": "sun23_long",
+  "side": "LONG",
+  "desc": "The single hourly window the 'Monday effect' collapses into (US retail re-entry Sunday eve",
+  "survived": true,
+  "reason": "survived_full_scale_205coins_5mo_r2",
+  "oos_n": 1306,
+  "oos_mean_r": 0.2072,
+  "oos_win_rate": 0.526,
+  "oos_total_net_pct": 270.63,
+  "pvalue": 0.0002
+ },
+ {
   "id": "capitulation_long",
   "side": "LONG",
   "desc": "Long deep RSI<22 + high volume flush (mean-revert the panic)",
   "survived": true,
-  "reason": "survived_full_scale_203coins_5mo",
-  "oos_n": 1943,
-  "oos_mean_r": 0.1464,
-  "oos_win_rate": 0.5466,
-  "oos_total_net_pct": 710.96,
-  "pvalue": 0.0002,
-  "note": "full-scale: 203 coins x 5mo, 5629 trades, BH-FDR passed; rsi_oversold_bounce DISARMED (p=0.28 at scale = breadth-luck false positive)"
+  "reason": "survived_full_scale_205coins_5mo_r2",
+  "oos_n": 1980,
+  "oos_mean_r": 0.1542,
+  "oos_win_rate": 0.5515,
+  "oos_total_net_pct": 763.37,
+  "pvalue": 0.0002
+ },
+ {
+  "id": "lowvol_snapback_long",
+  "side": "LONG",
+  "desc": "ATR% = 0.6 (quiet regime) with price stretched =1.5% below EMA20 (~2.5 ATR) and oversold \u2014",
+  "survived": true,
+  "reason": "survived_full_scale_205coins_5mo_r2",
+  "oos_n": 852,
+  "oos_mean_r": 0.153,
+  "oos_win_rate": 0.5376,
+  "oos_total_net_pct": 156.41,
+  "pvalue": 0.0002
  }
 ]
