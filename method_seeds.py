@@ -78,6 +78,36 @@ SEED_METHODS = [
      "side": "LONG", "when": [{"feat": "ema4h_cross", "op": "==", "val": 1}],
      "sl_pct": 2.5, "tp_pct": 4.5},
 
+    # --- TIKTOK research 2026-07-04 (Avin/UnderDogVN batch, 11 videos) ---
+    # Video 7 (habits): trade a FIXED SESSION -> London/NY overlap filter variant.
+    {"id": "tiktok_session_rsi_dip", "name": "RSI dip, London/NY session only",
+     "desc": "TikTok: fixed-session discipline — RSI<30 long ONLY during 07-16 UTC",
+     "side": "LONG", "when": [{"feat": "rsi14", "op": "<", "val": 30},
+                              {"feat": "hour_utc", "op": ">=", "val": 7},
+                              {"feat": "hour_utc", "op": "<=", "val": 16}],
+     "sl_pct": 1.5, "tp_pct": 2.5},
+    # Video 9 (Traders Notes): symmetrical-triangle breakout -> proxy = 20-bar
+    # range COMPRESSION then close breaks the prior 20-bar extreme on volume.
+    {"id": "tiktok_triangle_brk_long", "name": "Compression breakout long (triangle proxy)",
+     "desc": "TikTok: tight range (<3.5%) then close breaks prior 20-bar high + vol>=1.5",
+     "side": "LONG", "when": [{"feat": "range20_pct", "op": "<=", "val": 3.5},
+                              {"feat": "brk20_pct", "op": ">", "val": 0},
+                              {"feat": "vol_ratio", "op": ">=", "val": 1.5}],
+     "sl_pct": 1.5, "tp_pct": 3.0},
+    {"id": "tiktok_triangle_brk_short", "name": "Compression breakdown short (triangle proxy)",
+     "desc": "TikTok: tight range (<3.5%) then close breaks prior 20-bar low + vol>=1.5",
+     "side": "SHORT", "when": [{"feat": "range20_pct", "op": "<=", "val": 3.5},
+                               {"feat": "brkdn20_pct", "op": "<", "val": 0},
+                               {"feat": "vol_ratio", "op": ">=", "val": 1.5}],
+     "sl_pct": 1.5, "tp_pct": 3.0},
+    # Patterns post #24 tip codified: breakout WITHOUT volume = fakeout -> test the
+    # no-volume variant too so the lab PROVES the volume filter matters (A/B).
+    {"id": "tiktok_triangle_brk_long_novol", "name": "Compression breakout long, NO vol filter (A/B)",
+     "desc": "TikTok A/B: same breakout without the volume confirm — expected to be worse",
+     "side": "LONG", "when": [{"feat": "range20_pct", "op": "<=", "val": 3.5},
+                              {"feat": "brk20_pct", "op": ">", "val": 0}],
+     "sl_pct": 1.5, "tp_pct": 3.0},
+
     # --- trend pullback to EMA20 (buy the dip to the fast EMA in an uptrend) ---
     {"id": "ema20_pullback_long", "name": "EMA20 pullback long",
      "desc": "Long when price dips to/below EMA20 but stack still bullish (EMA50<price)",

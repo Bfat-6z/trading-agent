@@ -30,7 +30,8 @@ COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAX
 
 # whitelist for validating proposed methods (must match feature_frame keys)
 FEATS = {"rsi14", "px_vs_ema20", "px_vs_ema50", "px_vs_ema200", "ema_stack",
-         "vol_ratio", "ret5", "ret20", "close", "ema4h_state", "ema4h_cross"}
+         "vol_ratio", "ret5", "ret20", "close", "ema4h_state", "ema4h_cross",
+         "hour_utc", "range20_pct", "brk20_pct", "brkdn20_pct"}
 OPS = {"<", "<=", ">", ">=", "=="}
 
 

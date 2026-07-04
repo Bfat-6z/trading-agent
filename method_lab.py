@@ -88,7 +88,23 @@ def feature_frame(bars: list[dict[str, Any]]) -> list[dict[str, float]]:
         k = i // 16
         state4 = int(st4[k]) if k < len(st4) else 0
         cross4 = int(st4[k]) if (0 < k < len(st4) and i % 16 == 0 and st4[k] != st4[k - 1]) else 0
+        # TikTok-research features (2026-07-04): session hour (UTC), 20-bar range
+        # compression, and breakout vs the PRIOR 20-bar extreme (current bar
+        # excluded from the reference -> no self-breakout, no lookahead).
+        try:
+            hour_utc = int((int(bars[i].get("ts_ms") or 0) // 3600000) % 24)
+        except Exception:
+            hour_utc = -1
+        if i >= 21:
+            hi20 = float(h[i - 20:i].max()); lo20 = float(lo[i - 20:i].min())
+            rng20 = (hi20 - lo20) / c[i] * 100 if c[i] else 99.0
+            brk20 = (c[i] / hi20 - 1) * 100 if hi20 else 0.0
+            brkdn20 = (c[i] / lo20 - 1) * 100 if lo20 else 0.0
+        else:
+            rng20, brk20, brkdn20 = 99.0, 0.0, 0.0
         rows.append({
+            "hour_utc": hour_utc, "range20_pct": round(float(rng20), 3),
+            "brk20_pct": round(float(brk20), 3), "brkdn20_pct": round(float(brkdn20), 3),
             "ema4h_state": state4, "ema4h_cross": cross4,
             "i": i, "close": float(c[i]), "high": float(h[i]), "low": float(lo[i]),
             "rsi14": float(rsi[i]),
