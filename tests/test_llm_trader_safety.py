@@ -39,7 +39,7 @@ def test_no_live_env_assignment():
 def test_owner_rules_pinned():
     """Owner's hard rules stay in code: 5-10% sizing, x5/x10 only."""
     text = (ROOT / "llm_trader.py").read_text(encoding="utf-8")
-    assert "SIZE_PCT_MIN, SIZE_PCT_MAX = 5.0, 10.0" in text
+    assert "SIZE_PCT_MIN, SIZE_PCT_MAX = float(os.environ.get(" in text   # owner law floor now env-tunable (8 default)
     assert "ALLOWED_LEVERAGE = (5, 10)" in text
 
 
@@ -73,7 +73,7 @@ def test_structure_sl_and_limit_entry():
     sl2, _ = l._structure_sl_tp("LONG", 100, {"sl_pct": 2, "tp_pct": 3})
     assert abs(sl2 - 98.0) < 1e-6
     # entry_px: keep a favorable pullback limit, drop a FOMO (wrong-side) one
-    by = {"X": {"symbol": "X", "price": 100.0}}
+    by = {"X": {"symbol": "X", "price": 100.0, "vol_ratio": 2.0}}
     keep = l._validate_decisions([{"symbol": "X", "action": "LONG", "entry_px": 98,
                                    "leverage": 10, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by)
     assert keep[0]["entry_px"] == 98.0
@@ -82,7 +82,7 @@ def test_structure_sl_and_limit_entry():
     assert drop[0]["entry_px"] is None                     # above price for a long = FOMO -> market
     # chase gate judges the EFFECTIVE entry: extended RSI68 market = blocked,
     # but the same coin with a pullback LIMIT at the EMA passes (audit fix)
-    by2 = {"C": {"symbol": "C", "price": 100.0, "rsi14": 68, "px_vs_ema20_pct": 1.6}}
+    by2 = {"C": {"symbol": "C", "price": 100.0, "rsi14": 68, "px_vs_ema20_pct": 1.6, "vol_ratio": 2.0}}
     blocked = l._validate_decisions([{"symbol": "C", "action": "LONG",
                                       "leverage": 5, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by2)
     assert blocked == []

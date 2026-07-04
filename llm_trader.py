@@ -59,9 +59,13 @@ LLM_TIMEOUT = float(os.environ.get("LLM_TRADER_LLM_TIMEOUT", "300"))
 TF = "15m"
 START_EQUITY = 100.0
 MAX_HOLD_BARS = 32
-# OWNER RULES (hard):
-SIZE_PCT_MIN, SIZE_PCT_MAX = 5.0, 10.0
+# OWNER RULES (hard): law = 5-10% size, x5/x10 only. Owner 2026-07-04 ('danh vol
+# to len'): bias to the TOP of his size law (8-10%) and require BIG entry volume.
+SIZE_PCT_MIN, SIZE_PCT_MAX = float(os.environ.get("LLM_TRADER_SIZE_MIN", "8")), 10.0
 ALLOWED_LEVERAGE = (5, 10)
+# entries need strong participation: vol_ratio >= this (his method: EMA+VOL+price;
+# research: breakout on sub-1.5x volume = fakeout). A+ capitulation needs >=1.8 anyway.
+MIN_ENTRY_VOL = float(os.environ.get("LLM_TRADER_MIN_ENTRY_VOL", "1.5"))
 # SCOPE + FREQUENCY (owner: wider coin scan, higher frequency). Universe is
 # re-selected each cycle by quote-volume; more concurrent slots so a wider scan
 # actually turns into more live trades (the batched decision is still ONE LLM
@@ -594,6 +598,15 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
                          "entry_px": entry_px, "eff_ext_pct": round(eff_ext, 3),
                          "note": "LONG RSI>=65 extended at effective entry — the measured noise-stop chase"})
                 continue
+            # VOL GATE (owner 'danh vol to len' + his EMA+VOL+price method): no
+            # entry without strong participation. The one recent TP win entered at
+            # vol 2.99x; the stopped-out losers mostly entered on quiet bars.
+            vr = float(ctx.get("vol_ratio") or 1.0)
+            if vr < MIN_ENTRY_VOL:
+                _append(LT_DIR / "governance.jsonl",
+                        {"event": "gate_block_low_vol", "symbol": sym, "vol_ratio": vr,
+                         "min": MIN_ENTRY_VOL})
+                continue
         except Exception:
             pass
         out.append({**ctx, "action": action, "leverage": lev, "size_pct": size_pct,
@@ -605,7 +618,9 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
 _MEMORY_RULE = ("Learn from your MEMORY block CONTEXTUALLY: the counts are evidence to weigh, not bans — a past "
                 "loss does NOT blanket-ban a setup; the same idea can win on another coin/regime/time (markets are "
                 "non-stationary). Pick only the BEST setups; SKIP is common and fine — no forced trades. "
-                "Owner rules: leverage EXACTLY 5 or 10; size 5-10% of equity; respect your capacity limits.")
+                "Owner rules: leverage EXACTLY 5 or 10; size 8-10% of equity (owner wants size at the TOP of his "
+                "5-10 law); entries REQUIRE vol_ratio>=1.5 (his EMA+VOLUME+price method — quiet-bar entries are "
+                "code-rejected, so don't propose them; wait for the volume bar or set a limit into it).")
 _DECISION_SCHEMA = (
     "THINK step-by-step FIRST, then decide. Output EXACTLY two sections separated by a line '===DECISIONS==='.\n"
     "THINKING:\nReason out loud. For EACH charted coin, in order: (1) TREND — EMA stack + slope + MTF agree? "
