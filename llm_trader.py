@@ -1269,9 +1269,22 @@ def run_once() -> dict[str, Any]:
                      "margin_cap_pct": MAX_TOTAL_MARGIN_PCT,
                      "daily_breaker": ("BLOCKED: " + why) if blocked else "ok"},
     }
-    uni = us.select_universe(client, end_ms=now_ms, months=1.0, timeframe="1h",
-                             min_daily_quote_volume=UNIVERSE_MIN_QVOL, max_symbols=UNIVERSE_MAX)
-    ctx = build_context(client, uni["selected"], now_ms)
+    # DYNAMIC universe straight from the 24h ticker (one call) — the old
+    # select_universe ranked within a hardcoded ~24-coin candidate list, silently
+    # capping the net at 23 no matter what max_symbols said.
+    try:
+        ticks = client.futures_ticker()
+        rows_u = [(t["symbol"], float(t.get("quoteVolume", 0) or 0)) for t in ticks
+                  if t.get("symbol", "").endswith("USDT") and "_" not in t["symbol"]]
+        rows_u.sort(key=lambda x: -x[1])
+        selected = [sym for sym, qv in rows_u if qv >= UNIVERSE_MIN_QVOL][:UNIVERSE_MAX]
+        if not selected:
+            raise ValueError("empty universe")
+    except Exception:
+        selected = us.select_universe(client, end_ms=now_ms, months=1.0, timeframe="1h",
+                                      min_daily_quote_volume=UNIVERSE_MIN_QVOL,
+                                      max_symbols=UNIVERSE_MAX)["selected"]
+    ctx = build_context(client, selected, now_ms)
     if PROVEN_ONLY:
         # the bleed fix: no discretionary entries — only lab-proven survivors fire.
         decisions = _mechanical_decisions(ctx)
