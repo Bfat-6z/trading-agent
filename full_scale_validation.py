@@ -67,7 +67,12 @@ def main() -> None:
             bars = of.fetch_klines_with_flow(sym, "15m", months=MONTHS,
                                              end_ms=int(time.time() * 1000),
                                              client=client, sleep_between=0.02)
-            rows = ml.feature_frame(bars)
+            try:
+                fund = of.fetch_funding_series(sym, months=MONTHS,
+                                               end_ms=int(time.time() * 1000), client=client)
+            except Exception:
+                fund = None
+            rows = ml.feature_frame(bars, funding=fund)
             if len(rows) < MIN_BARS:
                 skipped += 1
                 continue

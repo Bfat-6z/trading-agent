@@ -48,7 +48,8 @@ def lab_universe(client) -> list[str]:
 FEATS = {"rsi14", "px_vs_ema20", "px_vs_ema50", "px_vs_ema200", "ema_stack",
          "vol_ratio", "ret5", "ret20", "close", "ema4h_state", "ema4h_cross",
          "hour_utc", "range20_pct", "brk20_pct", "brkdn20_pct",
-         "streak_down", "streak_up", "dd96_pct", "rally96_pct", "atr_pct", "dow"}
+         "streak_down", "streak_up", "dd96_pct", "rally96_pct", "atr_pct", "dow",
+         "streak", "bar_z", "close_pos", "funding_rate_bps", "funding_z", "dd_from_high96_pct"}
 OPS = {"<", "<=", ">", ">=", "=="}
 
 
@@ -168,7 +169,11 @@ def run_once(client: Any, propose: bool = True) -> dict[str, Any]:
     for c in lab_universe(client):
         try:
             bars = of.fetch_klines_with_flow(c, "15m", months=LAB_MONTHS, end_ms=now, client=client, sleep_between=0.02)
-            rows = ml.feature_frame(bars)
+            try:
+                fund = of.fetch_funding_series(c, months=LAB_MONTHS, end_ms=now, client=client)
+            except Exception:
+                fund = None
+            rows = ml.feature_frame(bars, funding=fund)
             if len(rows) >= 260:
                 frames[c] = rows
         except Exception:

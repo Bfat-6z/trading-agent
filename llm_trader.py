@@ -309,6 +309,7 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
                 # last ~220 closed bars for chart rendering (underscore -> never
                 # sent as text; used only to draw the candlestick+EMA+vol image).
                 "_bars": fb[-220:],
+                "_funding": fund[-120:] if fund else None,   # for funding-based proven methods
                 "_ts": int(enr["ts_ms"].iloc[i]),
             })
         except Exception:
@@ -478,7 +479,7 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
         if not bars or len(bars) < 220:
             continue
         try:
-            row = ml.feature_frame(bars)[-1]
+            row = ml.feature_frame(bars, funding=c.get("_funding"))[-1]
         except Exception:
             continue
         for m in methods:

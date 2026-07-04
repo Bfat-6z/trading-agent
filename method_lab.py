@@ -61,11 +61,29 @@ def _rsi(c: np.ndarray, p: int = 14) -> np.ndarray:
     return out
 
 
-def feature_frame(bars: list[dict[str, Any]]) -> list[dict[str, float]]:
+def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> list[dict[str, float]]:
     """One feature row per bar (the columns methods reference). Values known AT
-    THAT BAR's close — no lookahead."""
+    THAT BAR's close — no lookahead. `funding` (optional): raw Binance funding
+    prints; forward-filled per bar, z-scored over the trailing 90 prints (~30d),
+    using only prints at/before the bar (no lookahead)."""
     if len(bars) < 60:
         return []
+    fts: list[int] = []
+    frs: list[float] = []
+    if funding:
+        pairs = []
+        for f in funding:
+            try:
+                if isinstance(f, dict):
+                    pairs.append((int(f["fundingTime"]), float(f["fundingRate"])))
+                else:
+                    pairs.append((int(f[0]), float(f[1])))
+            except Exception:
+                pass
+        pairs.sort()
+        fts = [t for t, _ in pairs]
+        frs = [r for _, r in pairs]
+    fidx = -1
     c = np.array([float(b["close"]) for b in bars])
     h = np.array([float(b["high"]) for b in bars])
     lo = np.array([float(b["low"]) for b in bars])
@@ -128,7 +146,32 @@ def feature_frame(bars: list[dict[str, Any]]) -> list[dict[str, float]]:
             dow = int(((int(bars[i].get("ts_ms") or 0) // 86400000) + 4) % 7)   # epoch day 0 = Thu
         except Exception:
             dow = -1
+        # signed streak (+up/-down), single-bar return in ATR units, close position
+        streak = su if su > 0 else -sd
+        ret1 = (c[i] / c[i - 1] - 1) * 100 if i >= 1 and c[i - 1] else 0.0
+        bar_z = round(float(ret1 / atrp), 3) if atrp > 0.05 else 0.0
+        rng_hl = h[i] - lo[i]
+        close_pos = round(min(1.0, max(0.0, float((c[i] - lo[i]) / rng_hl))), 3) if rng_hl > 0 else 0.5
+        # funding: forward-fill latest print at/before this bar; z over prior 90 prints
+        f_bps = 0.0
+        f_z = 0.0
+        if fts:
+            bts = int(bars[i].get("ts_ms") or 0)
+            while fidx + 1 < len(fts) and fts[fidx + 1] <= bts:
+                fidx += 1
+            if fidx >= 0:
+                f_bps = frs[fidx] * 10000.0
+                w = frs[max(0, fidx - 89):fidx + 1]
+                if len(w) >= 10:
+                    mu = sum(w) / len(w)
+                    var = sum((x - mu) ** 2 for x in w) / len(w)
+                    sd_ = var ** 0.5
+                    if sd_ > 1e-12:
+                        f_z = (frs[fidx] - mu) / sd_
         rows.append({
+            "streak": streak, "bar_z": bar_z, "close_pos": close_pos,
+            "funding_rate_bps": round(float(f_bps), 3), "funding_z": round(float(f_z), 3),
+            "dd_from_high96_pct": round(max(0.0, float(-dd96)), 3),   # positive % below the 24h high
             "streak_down": sd, "streak_up": su, "dd96_pct": round(float(dd96), 3),
             "rally96_pct": round(float(ral96), 3), "atr_pct": round(float(atrp), 3), "dow": dow,
             "hour_utc": hour_utc, "range20_pct": round(float(rng20), 3),
