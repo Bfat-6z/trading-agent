@@ -24,9 +24,25 @@ ROOT = Path(__file__).resolve().parent
 POOL = ml.LAB_DIR / "methods_pool.jsonl"
 HEARTBEAT = ROOT / "state" / "method_lab_heartbeat.json"
 
-COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT",
-         "LINKUSDT", "DOGEUSDT", "LTCUSDT", "ATOMUSDT", "APTUSDT", "ARBUSDT", "INJUSDT",
-         "NEARUSDT", "OPUSDT", "SUIUSDT", "TIAUSDT"]
+# owner (2026-07-05): scope must be BROAD — universe is now DYNAMIC: top-N USDT
+# perps by 24h quote volume (fallback to a fixed core list if the ticker fails).
+UNIVERSE_TOP_N = int(os.environ.get("LAB_UNIVERSE_TOP_N", "100"))
+LAB_MONTHS = float(os.environ.get("LAB_MONTHS", "2.0"))
+_FALLBACK_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT",
+                   "LINKUSDT", "DOGEUSDT", "LTCUSDT", "ATOMUSDT", "APTUSDT", "ARBUSDT", "INJUSDT",
+                   "NEARUSDT", "OPUSDT", "SUIUSDT", "TIAUSDT"]
+
+
+def lab_universe(client) -> list[str]:
+    try:
+        ticks = client.futures_ticker()
+        rows = [(t["symbol"], float(t.get("quoteVolume", 0) or 0)) for t in ticks
+                if t.get("symbol", "").endswith("USDT") and "_" not in t["symbol"]]
+        rows.sort(key=lambda x: -x[1])
+        uni = [s for s, v in rows[:UNIVERSE_TOP_N] if v >= 5_000_000]
+        return uni or _FALLBACK_COINS
+    except Exception:
+        return _FALLBACK_COINS
 
 # whitelist for validating proposed methods (must match feature_frame keys)
 FEATS = {"rsi14", "px_vs_ema20", "px_vs_ema50", "px_vs_ema200", "ema_stack",
@@ -148,9 +164,9 @@ def run_once(client: Any, propose: bool = True) -> dict[str, Any]:
     now = int(time.time() * 1000)
     frames = {}
     import orderflow_data as of
-    for c in COINS:
+    for c in lab_universe(client):
         try:
-            bars = of.fetch_klines_with_flow(c, "15m", months=1.0, end_ms=now, client=client, sleep_between=0.02)
+            bars = of.fetch_klines_with_flow(c, "15m", months=LAB_MONTHS, end_ms=now, client=client, sleep_between=0.02)
             rows = ml.feature_frame(bars)
             if len(rows) >= 260:
                 frames[c] = rows
