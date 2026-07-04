@@ -102,7 +102,35 @@ def feature_frame(bars: list[dict[str, Any]]) -> list[dict[str, float]]:
             brkdn20 = (c[i] / lo20 - 1) * 100 if lo20 else 0.0
         else:
             rng20, brk20, brkdn20 = 99.0, 0.0, 0.0
+        # Quant-harvest features (2026-07-05): capitulation-family expansion.
+        # streaks: consecutive red/green CLOSES ending at bar i (incl. i).
+        sd = su = 0
+        j = i
+        while j > 0 and c[j] < c[j - 1]:
+            sd += 1; j -= 1
+        j = i
+        while j > 0 and c[j] > c[j - 1]:
+            su += 1; j -= 1
+        # drawdown vs the 96-bar (24h) rolling high / rally vs rolling low.
+        if i >= 96:
+            hi96 = float(h[i - 96:i + 1].max()); lo96 = float(lo[i - 96:i + 1].min())
+            dd96 = (c[i] / hi96 - 1) * 100 if hi96 else 0.0
+            ral96 = (c[i] / lo96 - 1) * 100 if lo96 else 0.0
+        else:
+            dd96, ral96 = 0.0, 0.0
+        # ATR14 % of price (true-range EMA), day-of-week (0=Mon..6=Sun UTC).
+        if i >= 15:
+            trs = [max(h[k] - lo[k], abs(h[k] - c[k - 1]), abs(lo[k] - c[k - 1])) for k in range(i - 13, i + 1)]
+            atrp = (sum(trs) / 14.0) / c[i] * 100 if c[i] else 0.0
+        else:
+            atrp = 0.0
+        try:
+            dow = int(((int(bars[i].get("ts_ms") or 0) // 86400000) + 4) % 7)   # epoch day 0 = Thu
+        except Exception:
+            dow = -1
         rows.append({
+            "streak_down": sd, "streak_up": su, "dd96_pct": round(float(dd96), 3),
+            "rally96_pct": round(float(ral96), 3), "atr_pct": round(float(atrp), 3), "dow": dow,
             "hour_utc": hour_utc, "range20_pct": round(float(rng20), 3),
             "brk20_pct": round(float(brk20), 3), "brkdn20_pct": round(float(brkdn20), 3),
             "ema4h_state": state4, "ema4h_cross": cross4,
