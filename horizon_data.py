@@ -379,6 +379,9 @@ def build() -> dict:
                                  key=lambda x: (x.get("win_rate") or 0), reverse=True)
         sigf["by_channel"] = sorted([{"k": k, **v} for k, v in (bd.get("by_channel") or {}).items()],
                                     key=lambda x: (x.get("win_rate") or 0), reverse=True)
+        vd = json.loads((sfdir / "channel_verdicts.json").read_text(encoding="utf-8"))
+        sigf["excluded"] = list((vd.get("excluded") or {}).values())   # owner notification: which channel was cut + why
+        sigf["kept"] = list((vd.get("judged") or {}).values())
     except Exception:
         pass
 

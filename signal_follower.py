@@ -27,7 +27,17 @@ OPEN = SF_DIR / "open.jsonl"
 CLOSED = SF_DIR / "closed.jsonl"
 SEEN = SF_DIR / "seen_ids.json"
 BOARD = SF_DIR / "scoreboard.json"
+VERDICTS = SF_DIR / "channel_verdicts.json"      # owner rule: cut losers at 100 trades
+NOTIFY = SF_DIR / "notifications.jsonl"          # every cut is announced, with the why
 HEARTBEAT = ROOT / "state" / "signal_follower_heartbeat.json"
+
+# owner rule (2026-07-04): once a channel has 100 followed trades, if its win rate
+# is low it gets FILTERED OUT of ingestion — and the owner must be told which
+# channel and why. Kept if net% is positive despite win<50% (asymmetric TP2.5/SL1.5
+# makes ~38% the breakeven win rate — cutting a profitable channel on raw winrate
+# alone would be dumb; the notification spells this out).
+VERDICT_MIN_N = int(__import__("os").environ.get("SF_VERDICT_MIN_N", "100"))
+VERDICT_MIN_WR = 0.50
 
 # channel -> how to read its alerts. Each entry: (kind, parser)
 SIGNAL_CHANNELS = ("WhaleSniper", "cointrendz_pumpdetector", "cointrendz_whalehunter")
@@ -122,10 +132,61 @@ def _mark_price(client, symbol: str) -> float | None:
     return None
 
 
+def _excluded_channels() -> set[str]:
+    try:
+        v = json.loads(VERDICTS.read_text(encoding="utf-8"))
+        return set((v.get("excluded") or {}).keys())
+    except Exception:
+        return set()
+
+
+def judge_channels() -> dict[str, Any]:
+    """Owner rule: at >=100 followed trades, a low-winrate channel is cut from
+    ingestion, and the cut is ANNOUNCED (which channel + why). A channel with
+    win<50% but positive net keeps its seat (asymmetric TP makes that profitable)
+    — the verdict says so explicitly."""
+    closed = _load(CLOSED)
+    by: dict[str, dict[str, float]] = {}
+    for c in closed:
+        b = by.setdefault(c.get("channel") or "?", {"n": 0, "wins": 0, "net": 0.0})
+        b["n"] += 1
+        b["wins"] += 1 if c.get("hit") else 0
+        b["net"] += float(c.get("net_pct", 0) or 0)
+    try:
+        verd = json.loads(VERDICTS.read_text(encoding="utf-8"))
+    except Exception:
+        verd = {"excluded": {}, "judged": {}}
+    excluded = verd.setdefault("excluded", {})
+    judged = verd.setdefault("judged", {})
+    for ch, b in by.items():
+        if ch in excluded or b["n"] < VERDICT_MIN_N:
+            continue
+        wr = b["wins"] / b["n"]
+        net = round(b["net"], 2)
+        if wr < VERDICT_MIN_WR and net <= 0:
+            reason = (f"LOẠI sau {int(b['n'])} lệnh follow: win rate {wr*100:.1f}% (<50%) và "
+                      f"net {net:+.2f}% (âm) — kênh này làm mất tiền, ngừng theo.")
+            row = {"channel": ch, "verdict": "EXCLUDED", "n": int(b["n"]),
+                   "win_rate": round(wr, 3), "net_pct": net, "reason": reason, "ts": _now_ms()}
+            excluded[ch] = row
+            _append(NOTIFY, row)
+        else:
+            why = ("net dương dù win<50% (TP2.5/SL1.5 lệch — hòa vốn ~38% win)"
+                   if wr < VERDICT_MIN_WR else "win rate đạt chuẩn")
+            judged[ch] = {"channel": ch, "verdict": "KEEP", "n": int(b["n"]),
+                          "win_rate": round(wr, 3), "net_pct": net, "reason": why, "ts": _now_ms()}
+    SF_DIR.mkdir(parents=True, exist_ok=True)
+    VERDICTS.write_text(json.dumps(verd, ensure_ascii=False, indent=1), encoding="utf-8")
+    return verd
+
+
 def ingest(client) -> int:
     seen = _seen()
     opened = 0
+    banned = _excluded_channels()
     for ch in SIGNAL_CHANNELS:
+        if ch in banned:
+            continue                     # owner rule: low-winrate channel cut at 100 trades
         try:
             html = wfo.fetch_channel(ch) if hasattr(wfo, "fetch_channel") else \
                 __import__("requests").get(wfo.BASE_URL.format(channel=ch), timeout=15,
@@ -236,7 +297,8 @@ def scoreboard() -> dict[str, Any]:
 def run_once(client) -> dict[str, Any]:
     now = _now_ms()
     resolved = resolve(client, now)
-    opened = ingest(client)
+    verd = judge_channels()              # owner rule: cut low-winrate channels at 100 trades
+    opened = ingest(client)              # ingest AFTER judging so a fresh cut applies now
     board = scoreboard()
     HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
     from datetime import datetime, timezone
