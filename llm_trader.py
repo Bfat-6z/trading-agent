@@ -503,10 +503,12 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
     faithful to what was backtested: the method's own sl/tp %, x10 (owner wants
     size at max conviction), no structure override, no trailing, 16-bar timeout."""
     import method_lab as ml
+    import mech_sizing as msz
     methods = _survivor_methods()
     if not methods:
         return []
-    out = []
+    # PASS 1: find every (coin, method) that FIRES this bar (one method per coin).
+    fires, ctxs = [], {}
     for c in context:
         bars = c.get("_bars")
         if not bars or len(bars) < 220:
@@ -516,23 +518,42 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
         except Exception:
             continue
         for m in methods:
-            if not ml.method_fires(row, m):
-                continue
-            chart = None
-            try:
-                chart = ltc.render_chart(c["symbol"], bars, tf=TF, title_suffix=" · PROVEN " + m["id"])
-            except Exception:
-                pass
-            _slp, _tpp = float(m.get("sl_pct", 2.5)), float(m.get("tp_pct", 4.0))
-            _sz = _kelly_size_pct(float(m.get("oos_win_rate") or 0.5), _tpp / _slp, _slp, 10)
-            out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
-                        "size_pct": _sz, "sl_pct": _slp, "tp_pct": _tpp, "entry_px": None,
-                        "_mech": True, "_chart_b64": chart,
-                        "rationale": f"PROVEN {m['id']} (win {m.get('oos_win_rate')}, Kelly-sized {_sz}% margin): {m.get('desc','')[:70]}"})
-            _append(LT_DIR / "governance.jsonl",
-                    {"event": "proven_fire", "symbol": c["symbol"], "method": m["id"],
-                     "rsi": row.get("rsi14"), "vol": row.get("vol_ratio")})
-            break                                   # one method per coin per cycle
+            if ml.method_fires(row, m):
+                fires.append((c["symbol"], m["id"]))
+                ctxs[c["symbol"]] = (c, m, row)
+                break
+    if not fires:
+        return []
+    # PASS 2: BATCH size the whole firing cluster together — correlation is a
+    # property of the cluster, not a single fire (risk review). mech_sizing does
+    # empirical Kelly + LCB shrinkage + correlation divisor + drawdown governor +
+    # aggregate exposure cap; margins here are FINAL (open_positions uses them raw).
+    try:
+        dists = json.loads((LT_DIR.parent / "method_lab" / "survivor_distributions.json").read_text(encoding="utf-8"))
+    except Exception:
+        dists = {}
+    sized = {(o["coin"], o["method"]): o for o in msz.size_fires(fires, dists, lev=10)}
+    out = []
+    for (sym, mid) in fires:
+        o = sized.get((sym, mid))
+        if not o:                                    # sizer skipped it (edge shrank away / capped out)
+            _append(LT_DIR / "governance.jsonl", {"event": "proven_fire_unsized", "symbol": sym, "method": mid})
+            continue
+        c, m, row = ctxs[sym]
+        chart = None
+        try:
+            chart = ltc.render_chart(sym, c["_bars"], tf=TF, title_suffix=" · PROVEN " + mid)
+        except Exception:
+            pass
+        _slp, _tpp = float(m.get("sl_pct", 2.5)), float(m.get("tp_pct", 4.0))
+        out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
+                    "size_pct": o["margin_pct"], "sl_pct": _slp, "tp_pct": _tpp, "entry_px": None,
+                    "_mech": True, "_chart_b64": chart,
+                    "rationale": f"PROVEN {mid} (win {m.get('oos_win_rate')}, sized {o['margin_pct']}% margin, "
+                                 f"cluster={len(fires)}): {m.get('desc','')[:60]}"})
+        _append(LT_DIR / "governance.jsonl",
+                {"event": "proven_fire", "symbol": sym, "method": mid, "margin_pct": o["margin_pct"],
+                 "cluster_size": len(fires), "rsi": row.get("rsi14"), "vol": row.get("vol_ratio")})
     return out
 
 

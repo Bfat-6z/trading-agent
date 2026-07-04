@@ -120,6 +120,19 @@ def main() -> None:
                                         and (r["oos_mean_r"] or 0) > 0
                                         and (r["oos_net_pct"] or 0) > 0)
 
+    # persist survivor per-trade OOS net distributions -> mech_sizing inputs
+    try:
+        dist = {}
+        for r in results:
+            if r.get("survived_full_scale"):
+                arr = [round(t["net"], 6) for t in agg[r["id"]] if t["oos"]]
+                dist[r["id"]] = {"net": arr, "n": len(arr), "pvalue": r["pvalue"],
+                                 "win": r["oos_win"], "mean": (sum(arr) / len(arr)) if arr else 0}
+        (ROOT / "state" / "method_lab" / "survivor_distributions.json").write_text(
+            json.dumps(dist), encoding="utf-8")
+    except Exception:
+        pass
+
     results.sort(key=lambda r: (not r["survived_full_scale"], -(r["oos_mean_r"] or -9)))
     OUT.write_text(json.dumps({
         "universe_total": len(uni), "coins_tested": done_coins, "coins_skipped": skipped,
