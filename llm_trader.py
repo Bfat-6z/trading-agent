@@ -81,7 +81,16 @@ PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "1") == "1"
 # x5/x10 law. Caps (95% total margin) + daily breaker still govern.
 MISSION_START = float(os.environ.get("LLM_TRADER_MISSION_START", "100"))
 MISSION_TARGET = float(os.environ.get("LLM_TRADER_MISSION_TARGET", "1000"))
-MECH_SIZE_PCT = float(os.environ.get("LLM_TRADER_MECH_SIZE_PCT", "30"))   # owner: max speed -> aggregate-Kelly (7.5% risk/fire, 3 concurrent slots)
+# Size is NOT hardcoded (owner: 'let the agent REASON from the data, don't pick a
+# number'). Each fire is sized by fractional-Kelly computed from THAT method's OWN
+# measured win-rate + payoff (full-scale OOS stats in survivors.json). Strong edge
+# -> bigger bet, weak edge -> smaller, all derived, all auto-updating as the lab
+# re-measures. KELLY_FRACTION 0.25 (quarter-Kelly) is the estimation-error-robust
+# standard for a finite sample with correlated concurrent fires. Per-trade margin
+# is clamped so one bet can't dominate; the 95% total-margin cap governs slot count
+# emergently (no fixed slot number).
+KELLY_FRACTION = float(os.environ.get("LLM_TRADER_KELLY_FRACTION", "0.25"))
+MECH_SIZE_MIN, MECH_SIZE_MAX = 5.0, 33.0   # margin % clamp per fire
 # SCOPE + FREQUENCY (owner: wider coin scan, higher frequency). Universe is
 # re-selected each cycle by quote-volume; more concurrent slots so a wider scan
 # actually turns into more live trades (the batched decision is still ONE LLM
@@ -440,6 +449,24 @@ def _reflection_block() -> str:
             + head + "\n".join(f"- {d}" for d in ds[:6]) + "\n=== END REFLECTION ===\n\n")
 
 
+def _kelly_size_pct(win: float, payoff: float, sl_pct: float, lev: int) -> float:
+    """Fractional-Kelly margin % derived from a method's measured edge.
+
+    Binary Kelly (fraction of equity to RISK) = p - (1-p)/b, b = payoff (tp/sl).
+    Take KELLY_FRACTION of it (quarter-Kelly), then convert risk -> margin:
+    on a stop we lose sl_pct*leverage of the margin, so margin% = risk% /
+    (sl_pct*lev). Clamped. Non-positive edge -> min size (shouldn't happen: only
+    survivors fire). Everything comes from the data, nothing is picked by hand."""
+    try:
+        b = max(0.2, float(payoff))
+        f_full = float(win) - (1.0 - float(win)) / b           # Kelly risk fraction
+        risk = max(0.0, f_full) * KELLY_FRACTION
+        size = risk / (max(0.003, float(sl_pct) / 100.0) * max(1, lev)) * 100.0
+        return round(max(MECH_SIZE_MIN, min(MECH_SIZE_MAX, size)), 2)
+    except Exception:
+        return MECH_SIZE_MIN
+
+
 def _survivor_methods() -> list[dict[str, Any]]:
     """Current lab survivors joined to their full method definitions (conditions
     live in seeds + the runner's growing pool; survivors.json only carries ids)."""
@@ -458,7 +485,13 @@ def _survivor_methods() -> list[dict[str, Any]]:
                     defs[m["id"]] = m
                 except Exception:
                     pass
-        return [defs[i] for i in ids if i in defs]
+        stats = {s["id"]: s for s in surv if s.get("survived")}
+        out = []
+        for i in ids:
+            if i in defs:
+                out.append({**defs[i], "oos_win_rate": stats.get(i, {}).get("oos_win_rate"),
+                            "oos_mean_r": stats.get(i, {}).get("oos_mean_r")})
+        return out
     except Exception:
         return []
 
@@ -490,11 +523,12 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                 chart = ltc.render_chart(c["symbol"], bars, tf=TF, title_suffix=" · PROVEN " + m["id"])
             except Exception:
                 pass
+            _slp, _tpp = float(m.get("sl_pct", 2.5)), float(m.get("tp_pct", 4.0))
+            _sz = _kelly_size_pct(float(m.get("oos_win_rate") or 0.5), _tpp / _slp, _slp, 10)
             out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
-                        "size_pct": MECH_SIZE_PCT, "sl_pct": float(m.get("sl_pct", 2.5)),
-                        "tp_pct": float(m.get("tp_pct", 4.0)), "entry_px": None,
+                        "size_pct": _sz, "sl_pct": _slp, "tp_pct": _tpp, "entry_px": None,
                         "_mech": True, "_chart_b64": chart,
-                        "rationale": f"PROVEN {m['id']}: {m.get('desc','')} (OOS-verified survivor)"})
+                        "rationale": f"PROVEN {m['id']} (win {m.get('oos_win_rate')}, Kelly-sized {_sz}% margin): {m.get('desc','')[:70]}"})
             _append(LT_DIR / "governance.jsonl",
                     {"event": "proven_fire", "symbol": c["symbol"], "method": m["id"],
                      "rsi": row.get("rsi14"), "vol": row.get("vol_ratio")})
