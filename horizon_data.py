@@ -385,8 +385,16 @@ def build() -> dict:
     except Exception:
         pass
 
+    mission = {"start": 100.0, "target": 1000.0,
+               "equity": lt.get("equity"), "pct": None}
+    try:
+        mission["pct"] = round((float(lt.get("equity") or 100) - 100.0) / 900.0 * 100, 2)
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
+        "mission": mission,
         "mode": "PAPER-ONLY · LIVE LOCKED",
         "llm_trader": lt,
         "manual": manual,

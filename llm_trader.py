@@ -73,6 +73,15 @@ MIN_ENTRY_VOL = float(os.environ.get("LLM_TRADER_MIN_ENTRY_VOL", "1.5"))
 # method_lab code that backtested it (zero mapping drift). The lab keeps testing
 # new methods 24/7; new survivors auto-arm, dropped survivors auto-disarm.
 PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "1") == "1"
+# MISSION (boss's boss, 2026-07-05): grow \$100 -> \$1000, sizing at the bot's
+# discretion. Sizing chosen by HALF-KELLY math on capitulation_long's FULL-SCALE
+# stats (win 54.7%, ~1.6R payoff => full Kelly ~26% risk/fire is suicide-variance;
+# half-ish = 5% equity risk/fire): margin 20% x10 with the method's 2.5% stop.
+# Expected +0.73%/fire, ~316 fires to 10x. Leverage stays within the owner's
+# x5/x10 law. Caps (95% total margin) + daily breaker still govern.
+MISSION_START = float(os.environ.get("LLM_TRADER_MISSION_START", "100"))
+MISSION_TARGET = float(os.environ.get("LLM_TRADER_MISSION_TARGET", "1000"))
+MECH_SIZE_PCT = float(os.environ.get("LLM_TRADER_MECH_SIZE_PCT", "20"))
 # SCOPE + FREQUENCY (owner: wider coin scan, higher frequency). Universe is
 # re-selected each cycle by quote-volume; more concurrent slots so a wider scan
 # actually turns into more live trades (the batched decision is still ONE LLM
@@ -481,7 +490,7 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
             except Exception:
                 pass
             out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
-                        "size_pct": SIZE_PCT_MAX, "sl_pct": float(m.get("sl_pct", 2.5)),
+                        "size_pct": MECH_SIZE_PCT, "sl_pct": float(m.get("sl_pct", 2.5)),
                         "tp_pct": float(m.get("tp_pct", 4.0)), "entry_px": None,
                         "_mech": True, "_chart_b64": chart,
                         "rationale": f"PROVEN {m['id']}: {m.get('desc','')} (OOS-verified survivor)"})
