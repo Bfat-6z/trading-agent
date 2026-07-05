@@ -72,6 +72,27 @@ def watch_ids() -> list[str]:
         return DEFAULT_IDS
 
 
+def watch_params() -> dict[str, dict]:
+    """Per-candidate deep-optimal exit params {id: {sl_pct, tp_pct, timeout}} so the
+    forward test replicates the DEEP-VALIDATED version, not the pool default."""
+    out = {}
+    try:
+        w = json.loads(WATCH.read_text(encoding="utf-8"))
+        for c in w.get("candidates", []):
+            p = {}
+            if c.get("sl_pct") is not None:
+                p["sl_pct"] = float(c["sl_pct"])
+            if c.get("tp_pct") is not None:
+                p["tp_pct"] = float(c["tp_pct"])
+            if c.get("timeout") is not None:
+                p["timeout"] = int(c["timeout"])
+            if p:
+                out[c["id"]] = p
+    except Exception:
+        pass
+    return out
+
+
 def load_methods(ids: list[str]) -> list[dict]:
     defs = {m["id"]: m for m in SEED_METHODS}
     pool = ROOT / "state" / "method_lab" / "methods_pool.jsonl"
@@ -111,8 +132,9 @@ def resolve_open(client, now_ms: int) -> int:
             bars = _closed_bars(client, p["symbol"], now_ms)
             after = [b for b in bars if int(b["ts_ms"]) > int(p["entry_ts_ms"])]
             side, entry, sl, tp = p["side"], p["entry"], p["sl"], p["tp"]
+            timeout = int(p.get("timeout", TIMEOUT_BARS))     # per-method (deep-optimal) hold cap
             exit_px, reason, used = None, None, 0
-            for k, b in enumerate(after[:TIMEOUT_BARS]):
+            for k, b in enumerate(after[:timeout]):
                 used = k + 1
                 hi, low = float(b["high"]), float(b["low"])
                 if side == "LONG":
@@ -125,8 +147,8 @@ def resolve_open(client, now_ms: int) -> int:
                         exit_px, reason = sl, "sl"; break
                     if low <= tp:
                         exit_px, reason = tp, "tp"; break
-            if exit_px is None and len(after) >= TIMEOUT_BARS:
-                exit_px, reason, used = float(after[TIMEOUT_BARS - 1]["close"]), "timeout", TIMEOUT_BARS
+            if exit_px is None and len(after) >= timeout:
+                exit_px, reason, used = float(after[timeout - 1]["close"]), "timeout", timeout
             if exit_px is None:            # not enough bars elapsed yet -> keep open
                 still.append(p); continue
             gross = (exit_px / entry - 1) if side == "LONG" else (entry - exit_px) / entry
@@ -142,7 +164,7 @@ def resolve_open(client, now_ms: int) -> int:
     return closed_n
 
 
-def scan_open(client, methods: list[dict], now_ms: int) -> int:
+def scan_open(client, methods: list[dict], params: dict[str, dict], now_ms: int) -> int:
     open_syms = {p["symbol"] for p in _load(POSN)}
     opened = 0
     for sym in universe(client):
@@ -160,11 +182,14 @@ def scan_open(client, methods: list[dict], now_ms: int) -> int:
                 if ml.method_fires(row, m):
                     side = m.get("side", "LONG")
                     entry = float(last["close"])
-                    slp, tpp = float(m["sl_pct"]) / 100.0, float(m["tp_pct"]) / 100.0
+                    pp = params.get(m["id"], {})   # deep-optimal exits override the pool default
+                    slp = float(pp.get("sl_pct", m["sl_pct"])) / 100.0
+                    tpp = float(pp.get("tp_pct", m["tp_pct"])) / 100.0
+                    to = int(pp.get("timeout", TIMEOUT_BARS))
                     sl = entry * (1 - slp) if side == "LONG" else entry * (1 + slp)
                     tp = entry * (1 + tpp) if side == "LONG" else entry * (1 - tpp)
                     _append(POSN, {"symbol": sym, "method": m["id"], "side": side,
-                                   "entry": entry, "sl": sl, "tp": tp,
+                                   "entry": entry, "sl": sl, "tp": tp, "timeout": to,
                                    "entry_ts_ms": int(last["ts_ms"]), "opened_ts_ms": now_ms})
                     opened += 1
                     break
@@ -213,8 +238,9 @@ def run_once(client) -> dict:
     from timebase import utc_now
     now_ms = int(time.time() * 1000)
     methods = load_methods(watch_ids())
+    params = watch_params()
     closed_n = resolve_open(client, now_ms)
-    opened = scan_open(client, methods, now_ms)
+    opened = scan_open(client, methods, params, now_ms)
     stats = write_stats(methods)
     HB.write_text(json.dumps({"agent": "forward_test", "pid": os.getpid(), "ts": utc_now(),
                               "updated_at": utc_now(), "status": "running",
