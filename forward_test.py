@@ -266,12 +266,13 @@ def run_once(client) -> dict:
     now_ms = int(time.time() * 1000)
     methods = load_methods(watch_ids())
     params = watch_params()
-    # AS-TRADED novelty hashes: the shadow trades run with deep-optimal sl/tp
-    # overrides, so hash the effective method (identity = what actually traded).
+    # AS-TRADED novelty hashes: the shadow trades run with deep-optimal sl/tp AND
+    # timeout overrides — canonical v2 includes timeout, so it must be merged too
+    # (Codex file-review: sl/tp-only merge silently hashed TO48 trades as TO16).
     try:
         from method_canonical import method_hash
         hashes = {m["id"]: method_hash({**m, **{k: v for k, v in (params.get(m["id"]) or {}).items()
-                                                if k in ("sl_pct", "tp_pct")}}) for m in methods}
+                                                if k in ("sl_pct", "tp_pct", "timeout")}}) for m in methods}
     except Exception:
         hashes = {}
     closed_n = resolve_open(client, now_ms, hashes)

@@ -42,7 +42,8 @@ _SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS trials (
   trial_id      TEXT PRIMARY KEY,
-  novelty_hash  TEXT,                 -- NULL only for backfilled label-only rows (DSL lost to pool eviction)
+  novelty_hash  TEXT,                 -- RAW-def identity (gate key — matches what a proposer can emit). NULL only for label-only backfill rows.
+  as_traded_hash TEXT,                -- identity WITH the grid-optimal sl/tp/timeout actually tested (joins shadow autopsy; Codex file-review #2)
   bucket_hash   TEXT,
   method_id     TEXT,
   dsl_canonical TEXT,
@@ -171,12 +172,17 @@ class _chain_lock:
         self.fh = open(_LOCK, "a+b")
         try:
             import msvcrt
+            acquired = False
             for _ in range(200):                       # ~10s worst-case wait
                 try:
                     msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
                     break
                 except OSError:
                     time.sleep(0.05)
+            if not acquired:                           # Codex file-review #1: proceeding
+                self.fh.close()                        # unlocked would fork the chain —
+                raise TimeoutError("brain events.lock not acquired in 10s")  # fail CLOSED
         except ImportError:
             pass                                        # non-Windows: single-writer assumption
         return self
@@ -268,9 +274,21 @@ def record_trials(rows: list[dict[str, Any]], defs: dict[str, dict[str, Any]],
                 d = defs.get(r.get("id"))
                 nh = method_hash(d) if d else None
                 bh = bucketed_hash(d) if d else None
+                # as-traded identity: what the grid ACTUALLY tested (opt sl/tp/timeout
+                # override the def) — distinct from the raw-def gate key (Codex #2).
+                ath = None
+                if d:
+                    eff = {**d}
+                    if r.get("opt_sl") is not None:
+                        eff["sl_pct"] = r["opt_sl"]
+                    if r.get("opt_tp") is not None:
+                        eff["tp_pct"] = r["opt_tp"]
+                    if r.get("opt_timeout") is not None:
+                        eff["timeout"] = r["opt_timeout"]
+                    ath = method_hash(eff)
                 verdict, fmode = verdict_for(r)
                 rec = {
-                    "trial_id": _ulid(), "novelty_hash": nh, "bucket_hash": bh,
+                    "trial_id": _ulid(), "novelty_hash": nh, "as_traded_hash": ath, "bucket_hash": bh,
                     "method_id": r.get("id"),
                     "dsl_canonical": canonical_json(d) if d else None,
                     "side": r.get("side") or (d or {}).get("side"),

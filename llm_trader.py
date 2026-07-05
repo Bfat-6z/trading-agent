@@ -495,8 +495,14 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                                  "avg_r": les.get("avg_r"), "label": les.get("label")})
                         if les["status"] == "active":
                             blocked = True
-                except Exception:
+                except Exception as _lge:
+                    # fail-OPEN by design (a gate bug must not kill the bot) but never
+                    # SILENTLY (Codex file-review #3): an active veto that stops
+                    # applying is a risk change the owner must be able to see.
                     blocked = False
+                    _append(LT_DIR / "governance.jsonl",
+                            {"event": "lesson_gate_error", "symbol": c["symbol"],
+                             "method": m["id"], "error": repr(_lge)[:160]})
                 if blocked:
                     continue
                 fires.append((c["symbol"], m["id"]))
@@ -1266,8 +1272,12 @@ def resolve(client: Any, now_ms: int) -> int:
             import brain
             brain.record_mission_close({**rec, "entry_ts_ms": int(p.get("entry_ts") or 0),
                                         "closed_ts_ms": now_ms})
-        except Exception:
-            pass
+        except Exception as _bre:
+            # never silent (Codex file-review #4): a lost autopsy row is lost
+            # lesson evidence — surface it in governance so gaps are visible.
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "second_brain_error", "where": "record_mission_close",
+                     "symbol": rec.get("symbol"), "error": repr(_bre)[:160]})
         closed_n += 1
     save_account(acct)
     _rewrite(POSITIONS, still)
