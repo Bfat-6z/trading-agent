@@ -63,12 +63,25 @@ def _conds(method: dict[str, Any], bucket: bool) -> list[list[Any]]:
 
 def canonical_method(method: dict[str, Any], bucket: bool = False) -> dict[str, Any]:
     """Semantic payload only — everything that changes backtest outcome, nothing
-    that doesn't. sl/tp included (same entry + different risk = distinct trial)."""
+    that doesn't. v2 (Codex review): sl/tp AND timeout included — deep_validation
+    optimizes the hold cap, so two trials differing only by timeout are distinct;
+    omitting it merged them and made the as-traded hash non-replayable. In the
+    bucketed (advisory) layer, sl/tp are bucketed too — they are optimized params
+    like any threshold."""
+    sl = float(method.get("sl_pct", 1.5))
+    tp = float(method.get("tp_pct", 2.5))
+    to = int(method.get("timeout") or 16)          # DSL default hold cap = 16 bars
+    if bucket:
+        sl = round(round(sl / 0.5) * 0.5, 2)
+        tp = round(round(tp / 0.5) * 0.5, 2)
+        to = int(round(to / 16.0) * 16) or 16
     return {
         "side": str(method.get("side", "LONG")),
         "when": _conds(method, bucket),
-        "sl": round(float(method.get("sl_pct", 1.5)), 2),
-        "tp": round(float(method.get("tp_pct", 2.5)), 2),
+        "sl": round(sl, 2),
+        "tp": round(tp, 2),
+        "to": to,
+        "v": 2,
     }
 
 

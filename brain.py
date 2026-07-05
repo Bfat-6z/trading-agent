@@ -120,14 +120,57 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
 
 # ---------------------------------------------------------------------------
 # Layer 0: hash-chained event log (source of truth)
+#
+# Codex review fix: read-head-then-append was racy across the three writer
+# processes (forward_test 5-min loop, lab 3h loop, manual deep runs) — two
+# writers could share `prev` and fork the chain, making normal operation
+# indistinguishable from tampering. Serialized with an exclusive sidecar file
+# lock (msvcrt on Windows) around read-head -> append -> write-head; the O(1)
+# head file replaces the fixed-4096-byte tail scan (which broke on long lines).
 # ---------------------------------------------------------------------------
+_LOCK = MEM_DIR / "events.lock"
+_HEAD = MEM_DIR / "chain_head.txt"
+
+
+class _chain_lock:
+    def __enter__(self):
+        MEM_DIR.mkdir(parents=True, exist_ok=True)
+        self.fh = open(_LOCK, "a+b")
+        try:
+            import msvcrt
+            for _ in range(200):                       # ~10s worst-case wait
+                try:
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        except ImportError:
+            pass                                        # non-Windows: single-writer assumption
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            import msvcrt
+            self.fh.seek(0)
+            msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+        self.fh.close()
+        return False
+
+
 def _last_event_hash() -> str:
+    try:
+        h = _HEAD.read_text(encoding="utf-8").strip()
+        if h:
+            return h
+    except Exception:
+        pass
     if not EVENTS.exists():
         return "genesis"
-    try:
-        with EVENTS.open("rb") as fh:
-            tail = fh.read()[-4096:].splitlines()
-        for line in reversed(tail):
+    try:                                                # fallback: full last line
+        lines = EVENTS.read_text(encoding="utf-8").splitlines()
+        for line in reversed(lines):
             if line.strip():
                 return json.loads(line).get("h", "genesis")
     except Exception:
@@ -136,31 +179,44 @@ def _last_event_hash() -> str:
 
 
 def _append_event(kind: str, payload: dict[str, Any]) -> str:
-    MEM_DIR.mkdir(parents=True, exist_ok=True)
-    prev = _last_event_hash()
-    body = {"ts": _now_iso(), "kind": kind, "payload": payload}
-    h = hashlib.sha256((prev + canonical_json(body)).encode()).hexdigest()[:32]
-    with EVENTS.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({**body, "prev": prev, "h": h}, ensure_ascii=False) + "\n")
+    with _chain_lock():
+        prev = _last_event_hash()
+        body = {"ts": _now_iso(), "kind": kind, "payload": payload}
+        h = hashlib.sha256((prev + canonical_json(body)).encode()).hexdigest()[:32]
+        with EVENTS.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({**body, "prev": prev, "h": h}, ensure_ascii=False) + "\n")
+        _HEAD.write_text(h, encoding="utf-8")
     return h
 
 
 # ---------------------------------------------------------------------------
 # deterministic verdict mapping (documented, no judgment calls at write time)
 # ---------------------------------------------------------------------------
+def _fin(x: Any) -> float | None:
+    """Finite float or None — NaN/inf in a metric must never drive a verdict
+    (Codex review: NaN comparisons are silently False and misclassify)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
 def verdict_for(row: dict[str, Any]) -> tuple[str, str | None]:
-    pv = row.get("pvalue")
+    pv = _fin(row.get("pvalue"))
     if pv is None:
-        return "PENDING", "low_n"
-    if row.get("lockbox_held"):
+        # distinguish "never produced stats" from "tested but thin sample"
+        return "PENDING", ("low_n" if row.get("oos_n") else "unknown_stats")
+    # LOCKBOX_PASS needs the flag AND sane supporting stats (defense in depth —
+    # a truthy flag on a malformed/legacy row must not mint a winner)
+    if (row.get("lockbox_held") and (row.get("lockbox_n") or 0) >= 30
+            and (_fin(row.get("lockbox_mean_r")) or 0) > 0):
         return "LOCKBOX_PASS", None
-    if (row.get("oos_mean_r") or 0) <= 0 or (row.get("oos_net_pct") or 0) <= 0:
+    if (_fin(row.get("oos_mean_r")) or 0) <= 0 or (_fin(row.get("oos_net_pct")) or 0) <= 0:
         return "DEAD", "died_oos"
-    if (row.get("lockbox_n") or 0) >= 30 and not row.get("lockbox_held"):
+    if (row.get("lockbox_n") or 0) >= 30:
         return "DEAD", "died_lockbox"
-    if (row.get("lockbox_n") or 0) < 30:
-        return "PENDING", "low_n"
-    return "DEAD", "no_signal"
+    return "PENDING", "low_n"
 
 
 # ---------------------------------------------------------------------------
@@ -371,17 +427,27 @@ def rebuild_from_events() -> dict[str, int]:
 # the novelty gate (deterministic, pre-compute)
 # ---------------------------------------------------------------------------
 def novelty_gate(method: dict[str, Any], extra_hashes: set[str] | None = None) -> tuple[str, list[dict[str, Any]]]:
-    """Returns (gate_result, verbatim_dead_rows).
-    REJECT_EXACT  — this exact idea was already tested (any verdict) or is
-                    already in seeds/pool (extra_hashes). Re-testing burns
-                    compute and quietly multiplies the trial count.
-    FLAG_NEAR     — advisory: bucketed twin of a known trial (logged; caller
-                    may still accept — deliberate threshold A/B is legitimate).
-    PASS          — genuinely new idea.
+    """Returns (gate_result, verbatim_rows).
+    REJECT_EXACT        — this exact idea already has a trial (or sits in
+                          seeds/pool via extra_hashes) and is not a winner.
+    REJECT_KNOWN_WINNER — exact match whose latest trial is LOCKBOX_PASS: no
+                          re-test needed, but callers must surface it (a winner
+                          that fell out of the pool should be RESURRECTED, not
+                          silently skipped — Codex review).
+    FLAG_NEAR           — bucketed twin of a known trial. The LLM proposer must
+                          treat this as a REJECT (threshold-nudging a dead idea
+                          is the main laundering escape route); the hand-curated
+                          ingest path may accept a deliberate A/B.
+    PASS                — genuinely new idea.
     """
     nh = method_hash(method)
     known = known_hashes()
-    if nh in known or (extra_hashes and nh in extra_hashes):
+    if nh in known:
+        rows = rows_for_hash(nh)
+        if rows and rows[0].get("verdict") == "LOCKBOX_PASS":
+            return "REJECT_KNOWN_WINNER", rows
+        return "REJECT_EXACT", rows
+    if extra_hashes and nh in extra_hashes:
         return "REJECT_EXACT", rows_for_hash(nh)
     bh = bucketed_hash(method)
     if DB.exists():

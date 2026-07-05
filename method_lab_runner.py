@@ -111,10 +111,10 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
 
     Second brain (P2): every candidate passes the deterministic NOVELTY GATE
     before it can cost any compute. The LLM can rephrase prose; it cannot
-    rephrase a canonical hash — REJECT_EXACT (same side+conditions+sl/tp as any
-    prior trial / seed / pool entry) is dropped; FLAG_NEAR (bucketed threshold
-    twin) is accepted but logged. Every verdict lands verbatim in the
-    quarantined `proposals` table (audit trail; feeds no gate)."""
+    rephrase a canonical hash — on this path anything except PASS is dropped
+    (exact dupes, known winners, and bucketed near-twins alike; threshold
+    nudges of dead ideas are the main laundering escape route). Every verdict
+    lands verbatim in the quarantined `proposals` table (audit; feeds no gate)."""
     try:
         import llm_trader as lt
         base, key = lt._env_llm()
@@ -154,8 +154,14 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
                 try:
                     gate, _rows = brain.novelty_gate(v, extra_hashes=existing_hashes)
                     brain.record_proposal(v, gate)
-                    if gate == "REJECT_EXACT":
-                        continue                      # already tried — never re-spend compute
+                    if gate != "PASS":
+                        # LLM path is strict (Codex review): EXACT dupes, known
+                        # winners (surface for resurrection via proposals log,
+                        # don't re-test) AND bucketed near-twins are all rejected —
+                        # threshold-nudging a dead idea is the main laundering
+                        # escape route. Deliberate A/B stays possible through the
+                        # hand-curated ingest_candidates path.
+                        continue
                 except Exception:
                     pass                              # gate failure must not kill proposals
             out.append(v)
