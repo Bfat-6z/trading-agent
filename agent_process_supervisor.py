@@ -112,7 +112,10 @@ def specs() -> list[AgentSpec]:
         AgentSpec("host_runtime_monitor", "host_runtime_monitor.py", ("--interval-seconds", "300"), STATE_DIR / "host_runtime_monitor.pid", STATE_DIR / "host_runtime_monitor_heartbeat.json", 900),
         AgentSpec("market_observer", "market_observer.py", tuple(), STATE_DIR / "market_observer.pid", STATE_DIR / "market_observer_heartbeat.json", 420),
         AgentSpec("news_observer", "news_observer.py", tuple(), STATE_DIR / "news_observer.pid", STATE_DIR / "news_observer_heartbeat.json", 900),
-        AgentSpec("dream_cycle", "dream_cycle.py", tuple(), STATE_DIR / "dream_cycle.pid", STATE_DIR / "dream_cycle_heartbeat.json", 2400),
+        # CUT (gpt-5.5 architecture review 2026-07-05): alpha theater — the mission bot,
+        # method lab, deep_validation and forward_test have ZERO dependency on it. Kept
+        # the file; just no longer supervised. Re-add this line to revive.
+        # AgentSpec("dream_cycle", "dream_cycle.py", tuple(), STATE_DIR / "dream_cycle.pid", STATE_DIR / "dream_cycle_heartbeat.json", 2400),
         AgentSpec("reflection_agent", "reflection_agent.py", ("--interval-hours", "0.5"), STATE_DIR / "reflection_agent.pid", STATE_DIR / "reflection_agent_heartbeat.json", 2400),
         AgentSpec("cognitive_supervisor", "cognitive_supervisor.py", ("--interval-minutes", "20"), STATE_DIR / "cognitive_supervisor.pid", STATE_DIR / "cognitive_supervisor_heartbeat.json", 1500),
         AgentSpec("llm_reasoning_agent", "llm_reasoning_agent.py", ("--interval-minutes", "60"), STATE_DIR / "llm_reasoning_agent.pid", STATE_DIR / "llm_reasoning_agent_heartbeat.json", 900),
@@ -138,9 +141,12 @@ def specs() -> list[AgentSpec]:
         AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),
         AgentSpec("shadow_trade_evaluator_loop", "shadow_trade_evaluator_loop.py", ("--interval-seconds", "600", "--max-age-hours", "24", "--max-trades", "100"), STATE_DIR / "shadow_trade_evaluator_loop.pid", STATE_DIR / "shadow_trade_evaluator_loop_heartbeat.json", 1800),
         AgentSpec("promotion_evaluator_loop", "promotion_evaluator_loop.py", ("--interval-seconds", "300"), STATE_DIR / "promotion_evaluator_loop.pid", STATE_DIR / "promotion_evaluator_loop_heartbeat.json", 600),
-        AgentSpec("self_model", "self_model.py", ("--interval-minutes", "10"), STATE_DIR / "self_model.pid", STATE_DIR / "self_model_heartbeat.json", 900),
+        # CUT (gpt-5.5 review 2026-07-05): no direct alpha value, 0 mission deps. Re-add to revive.
+        # AgentSpec("self_model", "self_model.py", ("--interval-minutes", "10"), STATE_DIR / "self_model.pid", STATE_DIR / "self_model_heartbeat.json", 900),
         AgentSpec("memory_consolidation_agent", "memory_consolidation_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "memory_consolidation_agent.pid", STATE_DIR / "memory_consolidation_agent_heartbeat.json", 2700),
-        AgentSpec("skill_forge_agent", "skill_forge_agent.py", ("--interval-seconds", "1800", "--apply"), STATE_DIR / "skill_forge_agent.pid", STATE_DIR / "skill_forge_agent_heartbeat.json", 2700),
+        # CUT (gpt-5.5 review 2026-07-05): 'complexity factory' + ran with --apply (autonomous
+        # self-modification) for no measured edge; 0 mission deps. Re-add to revive.
+        # AgentSpec("skill_forge_agent", "skill_forge_agent.py", ("--interval-seconds", "1800", "--apply"), STATE_DIR / "skill_forge_agent.pid", STATE_DIR / "skill_forge_agent_heartbeat.json", 2700),
         AgentSpec("self_improvement_agent", "self_improvement_agent.py", ("--interval-hours", "6"), STATE_DIR / "self_improvement_agent.pid", STATE_DIR / "self_improvement_agent_heartbeat.json", 28800),
         AgentSpec("daily_exam_agent", "daily_exam_agent.py", ("--check-seconds", "300"), STATE_DIR / "daily_exam_agent.pid", STATE_DIR / "daily_exam_agent_heartbeat.json", 900),
     ]
