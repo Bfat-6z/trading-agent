@@ -40,6 +40,13 @@ PER_POS_CAP = float(os.environ.get("MECH_PER_POS_CAP", "0.25"))   # max margin f
 GROSS_EXP_CAP = float(os.environ.get("MECH_GROSS_EXP_CAP", "3.0"))  # max sum(notional/equity); a ~12% synced gap costs <=~36% equity
 MIN_MARGIN = 0.01      # below this -> skip (NO hard minimum-size floor)
 MIN_TRADES = 30        # untrusted sample -> don't fire
+# Codex adversarial review (2026-07-05): survivor_distributions come from the SAME OOS
+# slice that SELECTED the method, so its mean is winner-biased — sizing empirical Kelly
+# on it over-bets a method that merely won the selection lottery (worse now that C_DD
+# and caps are raised). Fix: haircut exposure HARD until the method is confirmed on
+# truly out-of-sample LIVE forward-test data (which carries no selection/grid/regime
+# bias). d["forward_confirmed"]=True (set by the caller from the shadow ledger) lifts it.
+SELECTION_HAIRCUT = float(os.environ.get("MECH_SELECTION_HAIRCUT", "0.5"))  # unconfirmed edge -> half size
 
 
 def kelly_exposure(r: np.ndarray) -> float:
@@ -112,7 +119,10 @@ def size_fires(firing: list[tuple[str, str]], dists: dict[str, dict[str, Any]],
         e_full = kelly_exposure(r_shift)
         if e_full <= 0:
             e_full = m_lcb / (s * s + m_lcb * m_lcb)     # mean/var fallback
-        e = C_DD * e_full / corr_div                     # drawdown governor + correlation
+        # selection-bias haircut: full size only once the edge is confirmed on live
+        # forward-test data (no selection/grid/regime bias); else half (Codex review).
+        hair = 1.0 if d.get("forward_confirmed") else SELECTION_HAIRCUT
+        e = C_DD * e_full * hair / corr_div              # drawdown governor + correlation + selection haircut
         margin = min(e / lev, PER_POS_CAP)
         if margin < MIN_MARGIN:
             continue

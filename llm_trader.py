@@ -569,6 +569,18 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
         dists = json.loads((LT_DIR.parent / "method_lab" / "survivor_distributions.json").read_text(encoding="utf-8"))
     except Exception:
         dists = {}
+    # Selection-bias guard (Codex review): a method's distribution is winner-biased
+    # until it is confirmed on truly out-of-sample LIVE forward-test data. Mark
+    # forward_confirmed only when the shadow ledger shows >=30 fresh trades that are
+    # net-positive; mech_sizing then lifts the half-size haircut for that method.
+    try:
+        fstats = json.loads((ROOT / "state" / "forward_test" / "shadow_stats.json").read_text(encoding="utf-8")).get("methods", {})
+        for mid, d in dists.items():
+            fs = fstats.get(mid) or {}
+            d["forward_confirmed"] = bool((fs.get("n") or 0) >= 30 and (fs.get("net_pct") or 0) > 0
+                                          and (fs.get("mean_r") or 0) > 0)
+    except Exception:
+        pass
     sized = {(o["coin"], o["method"]): o for o in msz.size_fires(fires, dists, lev=10)}
     out = []
     for (sym, mid) in fires:
