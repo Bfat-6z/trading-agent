@@ -478,19 +478,26 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
             continue
         for m in methods:
             if ml.method_fires(row, m):
-                # LESSON GATE (second brain P4): active lessons are hard vetoes
-                # mined mechanically from our OWN closed trades (n>=5, negative,
-                # pre-registered templates only). The veto row is logged verbatim.
+                # LESSON GATE (second brain P4, Codex ship-gate): tiered.
+                # 'active' (eff_n>=12 clusters + mission cohort negative) = HARD
+                # veto; 'advisory' (pooled-negative only) = logged, NOT blocked —
+                # so evidence keeps accumulating and a noise-mined rule can't
+                # starve the already-rare fires. Rows logged verbatim.
+                blocked = False
                 try:
                     import brain
-                    veto = brain.lesson_veto(row, m.get("side", "LONG"))
+                    for les in brain.lesson_hits(row, m.get("side", "LONG"), m["id"]):
+                        _append(LT_DIR / "governance.jsonl",
+                                {"event": "lesson_block" if les["status"] == "active" else "lesson_advisory",
+                                 "symbol": c["symbol"], "method": m["id"],
+                                 "lesson": les.get("lesson_id"), "n": les.get("n"),
+                                 "eff_n": les.get("eff_n"), "mission_n": les.get("mission_n"),
+                                 "avg_r": les.get("avg_r"), "label": les.get("label")})
+                        if les["status"] == "active":
+                            blocked = True
                 except Exception:
-                    veto = None
-                if veto:
-                    _append(LT_DIR / "governance.jsonl",
-                            {"event": "lesson_block", "symbol": c["symbol"], "method": m["id"],
-                             "lesson": veto.get("lesson_id"), "n": veto.get("n"),
-                             "avg_r": veto.get("avg_r"), "label": veto.get("label")})
+                    blocked = False
+                if blocked:
                     continue
                 fires.append((c["symbol"], m["id"]))
                 ctxs[c["symbol"]] = (c, m, row)

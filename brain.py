@@ -98,10 +98,14 @@ CREATE TABLE IF NOT EXISTS trade_autopsy (
 CREATE TABLE IF NOT EXISTS lessons (
   lesson_id TEXT PRIMARY KEY,     -- stable template key (pre-registered)
   block_side TEXT,                -- 'LONG' | 'SHORT' | 'ANY'
+  method_scope TEXT,              -- substring the method_id must contain ('' = all methods)
   conds TEXT NOT NULL,            -- JSON [{feat,op,val},...] evaluated on the fire row
   label TEXT,
   n INTEGER, wins INTEGER, avg_r REAL, avg_net REAL, worst_r REAL,
-  status TEXT CHECK(status IN ('candidate','active')),
+  eff_n INTEGER,                  -- distinct (symbol, UTC-day) clusters — dedups one market move
+  mission_n INTEGER, mission_avg_r REAL,
+  shadow_n INTEGER, shadow_avg_r REAL,
+  status TEXT CHECK(status IN ('candidate','advisory','active')),
   updated_at TEXT
 );
 
@@ -132,6 +136,15 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
         con.executescript(_SCHEMA)
         try:                                       # migration: pre-lessons DBs lack this column
             con.execute("ALTER TABLE trade_autopsy ADD COLUMN entry_feats TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # migration: lessons schema v2 (3-tier status + cohort columns). The table is
+        # a DERIVED projection (recomputed by mine_lessons) so drop-and-recreate is lossless.
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(lessons)")}
+            if cols and "mission_n" not in cols:
+                con.execute("DROP TABLE lessons")
+                con.executescript(_SCHEMA)
         except sqlite3.OperationalError:
             pass
     con.row_factory = sqlite3.Row
@@ -326,38 +339,70 @@ def record_mission_close(rec: dict[str, Any], novelty_hash: str | None = None) -
 
 
 # ---------------------------------------------------------------------------
-# LESSONS: pre-registered templates -> mechanical mining -> hard gates.
+# LESSONS: pre-registered templates -> mechanical mining -> tiered gates.
 #
-# The templates are FIXED AND PRE-DECLARED (6 hypotheses, no data dredging: the
-# multiple-testing surface is bounded and known). Each encodes a failure mode
-# the owner/audits already paid to learn. Mining just fills in the measured
-# numbers; promotion to 'active' (= hard entry veto) is purely mechanical:
-#   n >= LESSON_MIN_N  AND  avg_r < 0  AND  win_rate <= LESSON_MAX_WIN.
-# A lesson auto-DEMOTES the same way when the numbers stop supporting it.
+# Templates are FIXED AND PRE-DECLARED (bounded multiple-testing surface). The
+# Codex round-2 review set the ship gate for a HARD veto, implemented here:
+#   candidate -> stats only.
+#   advisory  -> pooled evidence is negative (n>=ADVISORY_MIN_N, avg_r<0,
+#                win<=MAX_WIN) but NOT strong enough to block: logged only.
+#   active    -> HARD veto. Requires ALL of:
+#                  eff_n >= ACTIVE_MIN_EFF_N   (distinct (symbol, UTC-day)
+#                    clusters — one market-wide move can't fake a sample),
+#                  pooled avg_r < 0 and win <= MAX_WIN,
+#                  mission_n >= ACTIVE_MIN_MISSION_N with mission_avg_r < 0
+#                    (shadow-only evidence may never hard-veto the mission —
+#                    different costs/universe/selection),
+#                computed over a rolling LESSON_WINDOW_DAYS window (regimes
+#                change; all rows kept for audit, only recent ones govern).
+#
+# Anti-lock (Codex critical #1): forward_test deliberately does NOT apply the
+# lesson gate — the shadow ledger keeps trading through vetoed conditions and
+# is the counterfactual probe stream. Demotion runs on POOLED rolling stats, so
+# shadow evidence alone can demote an active lesson even while mission entries
+# are being vetoed. Promotion needs mission evidence; demotion doesn't.
 # ---------------------------------------------------------------------------
-LESSON_MIN_N = 5
+ADVISORY_MIN_N = 5
+ACTIVE_MIN_EFF_N = 12
+ACTIVE_MIN_MISSION_N = 3
 LESSON_MAX_WIN = 0.45
-LESSON_FEATS = ("rsi14", "ret20", "ret5", "vol_ratio", "funding_z", "dd96_pct",
-                "px_vs_ema200", "atr_pct", "close_pos", "ema_stack")
+LESSON_WINDOW_DAYS = 90
+LESSON_FEATS = ("rsi14", "ret20", "ret5", "vol_ratio", "funding_z", "funding_rate_bps",
+                "dd96_pct", "px_vs_ema200", "atr_pct", "close_pos", "ema_stack")
 
 LESSON_TEMPLATES: list[dict[str, Any]] = [
-    {"lesson_id": "chase_pump_long", "block_side": "LONG", "label": "LONG after a vertical run (chasing the pump)",
+    {"lesson_id": "chase_pump_long", "block_side": "LONG", "method_scope": "",
+     "label": "LONG after a vertical run (chasing the pump)",
      "conds": [{"feat": "ret20", "op": ">", "val": 8.0}]},
-    {"lesson_id": "chase_dump_short", "block_side": "SHORT", "label": "SHORT after a waterfall (chasing the dump)",
+    {"lesson_id": "chase_dump_short", "block_side": "SHORT", "method_scope": "",
+     "label": "SHORT after a waterfall (chasing the dump)",
      "conds": [{"feat": "ret20", "op": "<", "val": -8.0}]},
-    {"lesson_id": "crowded_long", "block_side": "LONG", "label": "LONG into crowded positive funding",
-     "conds": [{"feat": "funding_z", "op": ">", "val": 1.5}]},
-    {"lesson_id": "crowded_short", "block_side": "SHORT", "label": "SHORT into crowded negative funding",
-     "conds": [{"feat": "funding_z", "op": "<", "val": -1.5}]},
-    {"lesson_id": "dead_tape", "block_side": "ANY", "label": "entries on dead volume",
+    # funding: z-score alone is noisy when base funding is tiny (Codex) — require magnitude too
+    {"lesson_id": "crowded_long", "block_side": "LONG", "method_scope": "",
+     "label": "LONG into crowded positive funding",
+     "conds": [{"feat": "funding_z", "op": ">", "val": 1.5},
+               {"feat": "funding_rate_bps", "op": ">", "val": 1.0}]},
+    {"lesson_id": "crowded_short", "block_side": "SHORT", "method_scope": "",
+     "label": "SHORT into crowded negative funding",
+     "conds": [{"feat": "funding_z", "op": "<", "val": -1.5},
+               {"feat": "funding_rate_bps", "op": "<", "val": -1.0}]},
+    {"lesson_id": "dead_tape", "block_side": "ANY", "method_scope": "",
+     "label": "entries on dead volume (may also be pre-breakout compression — watch stats)",
      "conds": [{"feat": "vol_ratio", "op": "<", "val": 0.7}]},
-    {"lesson_id": "fake_dip_long", "block_side": "LONG", "label": "capitulation LONG without a real drawdown",
+    # renamed from fake_dip_long (Codex: dd96<2 means NEAR THE HIGH, not a dip) and
+    # scoped to capitulation-style methods only — a breakout method WANTS this state.
+    {"lesson_id": "near_high_long", "block_side": "LONG", "method_scope": "cap",
+     "label": "dip-buy method LONG while price is near the 96-bar high (no real drawdown)",
      "conds": [{"feat": "dd96_pct", "op": "<", "val": 2.0}]},
 ]
 
 
-def _lesson_matches(feats: dict[str, Any], side: str, tpl: dict[str, Any]) -> bool:
-    if tpl["block_side"] not in ("ANY", side):
+def _lesson_matches(feats: dict[str, Any], side: str, tpl: dict[str, Any],
+                    method_id: str | None = None) -> bool:
+    if tpl.get("block_side") not in ("ANY", side):
+        return False
+    scope = tpl.get("method_scope") or ""
+    if scope and (method_id is None or scope not in str(method_id)):
         return False
     try:
         import method_lab as ml
@@ -367,42 +412,66 @@ def _lesson_matches(feats: dict[str, Any], side: str, tpl: dict[str, Any]) -> bo
 
 
 def mine_lessons() -> dict[str, Any]:
-    """Recompute every template's stats over ALL autopsy rows that carry an
-    entry-feature snapshot; promote/demote mechanically. Deterministic — safe
-    to run every cycle. Returns {lesson_id: status} for logging."""
+    """Recompute every template's tiered status over the rolling window of
+    autopsy rows that carry an entry-feature snapshot. Deterministic; safe to
+    run every cycle. Returns {lesson_id: {status, ...}} for logging."""
     if not DB.exists():
         return {}
     con = connect()
     out: dict[str, Any] = {}
     try:
+        cutoff_ms = int((time.time() - LESSON_WINDOW_DAYS * 86400) * 1000)
         rows = [dict(r) for r in con.execute(
-            "SELECT side, net, r, entry_feats FROM trade_autopsy WHERE entry_feats IS NOT NULL")]
+            "SELECT src, symbol, side, method_id, net, r, entry_feats, closed_ts_ms "
+            "FROM trade_autopsy WHERE entry_feats IS NOT NULL")]
         for t in rows:
             try:
                 t["feats"] = json.loads(t["entry_feats"])
             except Exception:
                 t["feats"] = None
-        rows = [t for t in rows if isinstance(t.get("feats"), dict)]
+        rows = [t for t in rows if isinstance(t.get("feats"), dict)
+                and int(t.get("closed_ts_ms") or 0) >= cutoff_ms]
         now = _now_iso()
         with con:
             for tpl in LESSON_TEMPLATES:
-                hit = [t for t in rows if _lesson_matches(t["feats"], t.get("side") or "", tpl)]
+                hit = [t for t in rows
+                       if _lesson_matches(t["feats"], t.get("side") or "", tpl, t.get("method_id"))]
                 n = len(hit)
                 wins = sum(1 for t in hit if (t.get("net") or 0) > 0)
                 avg_r = (sum(float(t.get("r") or 0) for t in hit) / n) if n else None
                 avg_net = (sum(float(t.get("net") or 0) for t in hit) / n) if n else None
                 worst = min((float(t.get("r") or 0) for t in hit), default=None)
-                active = bool(n >= LESSON_MIN_N and (avg_r or 0) < 0
-                              and (wins / n if n else 1.0) <= LESSON_MAX_WIN)
-                status = "active" if active else "candidate"
+                # effective sample: distinct (symbol, UTC-day) — a single synchronized
+                # market move that stops 7 clustered trades is ONE observation, not 7
+                eff = len({(t.get("symbol"), int(t.get("closed_ts_ms") or 0) // 86400000) for t in hit})
+                mis = [t for t in hit if t.get("src") == "mission"]
+                sha = [t for t in hit if t.get("src") == "shadow"]
+                m_n, s_n = len(mis), len(sha)
+                m_avg = (sum(float(t.get("r") or 0) for t in mis) / m_n) if m_n else None
+                s_avg = (sum(float(t.get("r") or 0) for t in sha) / s_n) if s_n else None
+                neg = bool(n and (avg_r or 0) < 0 and (wins / n) <= LESSON_MAX_WIN)
+                if (neg and eff >= ACTIVE_MIN_EFF_N
+                        and m_n >= ACTIVE_MIN_MISSION_N and (m_avg or 0) < 0):
+                    status = "active"
+                elif neg and n >= ADVISORY_MIN_N:
+                    status = "advisory"
+                else:
+                    status = "candidate"
                 con.execute(
-                    "INSERT INTO lessons (lesson_id, block_side, conds, label, n, wins, avg_r, avg_net, worst_r, status, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(lesson_id) DO UPDATE SET "
+                    "INSERT INTO lessons (lesson_id, block_side, method_scope, conds, label, n, wins, "
+                    "avg_r, avg_net, worst_r, eff_n, mission_n, mission_avg_r, shadow_n, shadow_avg_r, "
+                    "status, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(lesson_id) DO UPDATE SET block_side=excluded.block_side, "
+                    "method_scope=excluded.method_scope, conds=excluded.conds, label=excluded.label, "
                     "n=excluded.n, wins=excluded.wins, avg_r=excluded.avg_r, avg_net=excluded.avg_net, "
-                    "worst_r=excluded.worst_r, status=excluded.status, updated_at=excluded.updated_at",
-                    (tpl["lesson_id"], tpl["block_side"], canonical_json(tpl["conds"]), tpl["label"],
-                     n, wins, avg_r, avg_net, worst, status, now))
-                out[tpl["lesson_id"]] = {"n": n, "status": status, "avg_r": avg_r}
+                    "worst_r=excluded.worst_r, eff_n=excluded.eff_n, mission_n=excluded.mission_n, "
+                    "mission_avg_r=excluded.mission_avg_r, shadow_n=excluded.shadow_n, "
+                    "shadow_avg_r=excluded.shadow_avg_r, status=excluded.status, updated_at=excluded.updated_at",
+                    (tpl["lesson_id"], tpl["block_side"], tpl.get("method_scope") or "",
+                     canonical_json(tpl["conds"]), tpl["label"], n, wins, avg_r, avg_net, worst,
+                     eff, m_n, m_avg, s_n, s_avg, status, now))
+                out[tpl["lesson_id"]] = {"n": n, "eff_n": eff, "mission_n": m_n,
+                                         "status": status, "avg_r": avg_r}
     finally:
         con.close()
     try:
@@ -412,14 +481,14 @@ def mine_lessons() -> dict[str, Any]:
     return out
 
 
-def active_lessons() -> list[dict[str, Any]]:
-    """The hard-gate set: evaluated on the fire-bar feature row before sizing."""
+def _lessons_by_status(statuses: tuple[str, ...]) -> list[dict[str, Any]]:
     if not DB.exists():
         return []
     con = connect(readonly=True)
     try:
         out = []
-        for r in con.execute("SELECT * FROM lessons WHERE status='active'"):
+        q = f"SELECT * FROM lessons WHERE status IN ({','.join('?' * len(statuses))})"
+        for r in con.execute(q, statuses):
             d = dict(r)
             try:
                 d["conds"] = json.loads(d["conds"])
@@ -431,13 +500,16 @@ def active_lessons() -> list[dict[str, Any]]:
         con.close()
 
 
-def lesson_veto(feats: dict[str, Any], side: str) -> dict[str, Any] | None:
-    """Return the first active lesson that vetoes this (feature-row, side), else
-    None. Pure read; caller logs the verbatim lesson row (never paraphrased)."""
-    for les in active_lessons():
-        if _lesson_matches(feats, side, {"block_side": les["block_side"], "conds": les["conds"]}):
-            return les
-    return None
+def lesson_hits(feats: dict[str, Any], side: str, method_id: str | None = None) -> list[dict[str, Any]]:
+    """All advisory+active lessons matching this (fire-row, side, method).
+    'active' = hard veto; 'advisory' = log-only. Rows returned verbatim."""
+    hits = []
+    for les in _lessons_by_status(("active", "advisory")):
+        tpl = {"block_side": les["block_side"], "conds": les["conds"],
+               "method_scope": les.get("method_scope") or ""}
+        if _lesson_matches(feats, side, tpl, method_id):
+            hits.append(les)
+    return hits
 
 
 def record_proposal(method: dict[str, Any], gate_result: str) -> None:
