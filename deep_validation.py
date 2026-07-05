@@ -245,16 +245,28 @@ def main() -> None:
                                 and (r["oos_mean_r"] or 0) > 0 and (r["oos_net_pct"] or 0) > 0
                                 and (r["oos_n"] or 0) >= 120)
 
+    # ROBUST = LOCKBOX-PRIMARY. The untouched holdout is the trustworthy judge; the
+    # 25% OOS-select window is small + noisy so its p is unreliable (good methods score
+    # weak there by chance). So require: lockbox significant (p<0.05, n>=100) + positive,
+    # and merely DIRECTIONALLY positive on OOS-select. This is the only armable tier —
+    # S_QUIET_BEAR_COIL passed BH on OOS-select but FAILED the lockbox (overfit).
+    for r in results:
+        r["robust"] = bool(r.get("lockbox_held")
+                           and (r.get("lockbox_pvalue") is not None and r["lockbox_pvalue"] < 0.05)
+                           and (r.get("lockbox_n") or 0) >= 100
+                           and (r.get("lockbox_mean_r") or 0) > 0
+                           and (r["oos_mean_r"] or 0) > 0)
+
     dist = {}
     for r in results:
-        if r["survived"] or r["strong_solo"]:
+        if r["robust"] or r["survived"] or r["strong_solo"]:
             arr = [round(t["net"], 6) for t in oos_agg[r["id"]]]
             dist[r["id"]] = {"net": arr, "n": len(arr), "pvalue": r["pvalue"], "win": r["oos_win"],
-                             "mean": (sum(arr) / len(arr)) if arr else 0,
+                             "mean": (sum(arr) / len(arr)) if arr else 0, "lockbox_held": r.get("lockbox_held"),
                              "opt": {"sl": r["opt_sl"], "tp": r["opt_tp"], "timeout": r["opt_timeout"]}}
     DIST.write_text(json.dumps(dist), encoding="utf-8")
 
-    results.sort(key=lambda r: (not (r["survived"] or r["strong_solo"]), -(r["oos_mean_r"] or -9)))
+    results.sort(key=lambda r: (not r["robust"], not (r["survived"] or r["strong_solo"]), -(r["oos_mean_r"] or -9)))
     OUT.write_text(json.dumps({"universe_total": len(uni), "coins_tested": done_coins,
         "coins_skipped": skipped, "min_qvol_usd": MIN_QVOL, "grid_combos": len(COMBOS),
         "sl_grid": SL_GRID, "tp_grid": TP_GRID, "timeout_grid": TIMEOUT_GRID,
@@ -262,6 +274,7 @@ def main() -> None:
         "minutes": round((time.time() - t0) / 60, 1), "results": results}, indent=1), encoding="utf-8")
     DONE.write_text("done", encoding="utf-8")
     print(json.dumps({"coins_tested": done_coins, "grid": len(COMBOS),
+        "ROBUST_lockbox": [r["id"] for r in results if r["robust"]],
         "survived_bh": [r["id"] for r in results if r["survived"]],
         "strong_solo": [r["id"] for r in results if r["strong_solo"] and not r["survived"]]}))
 
