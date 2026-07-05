@@ -141,6 +141,10 @@ def main() -> None:
 
     # per method: accumulate OOS trades under the TRAIN-selected combo, across coins
     oos_agg: dict[str, list[dict]] = {m["id"]: [] for m in methods}
+    # #2 LOCKBOX (gpt-5.5 review): the most-recent slice is NEVER used to select params
+    # or admit a method — a final untouched holdout that catches regime fragility
+    # ("worked once, dead now") and selection/OOS contamination. per-coin, same TF.
+    lockbox_agg: dict[str, list[dict]] = {m["id"]: [] for m in methods}
     # track chosen combo per method per coin (report the modal choice)
     combo_votes: dict[str, dict[tuple, int]] = {m["id"]: {} for m in methods}
     done_coins, skipped = 0, 0
@@ -159,7 +163,10 @@ def main() -> None:
             if len(rows) < MIN_BARS:
                 skipped += 1
                 continue
-            cut = int(len(rows) * (1 - OOS_FRAC))
+            n = len(rows)
+            train_end = int(n * 0.55)          # params chosen here
+            oos_end = int(n * 0.80)            # OOS-select scored here (train_end..oos_end)
+            # lockbox = [oos_end:n] — never touched by selection
             for m in methods:
                 side = m.get("side", "LONG")
                 fires = fire_bars(rows, m)
@@ -168,7 +175,7 @@ def main() -> None:
                 # Fix 1+2: pick (sl,tp,timeout) on TRAIN only
                 best, best_mr = None, None
                 for (sl, tp, to) in COMBOS:
-                    tr = trades_for_combo(rows, fires, side, sl, tp, to, 200, cut)
+                    tr = trades_for_combo(rows, fires, side, sl, tp, to, 200, train_end)
                     if len(tr) < MIN_TRAIN_TRADES:
                         continue
                     mr = sum(t["r"] for t in tr) / len(tr)
@@ -177,9 +184,11 @@ def main() -> None:
                 if best is None:            # too few train trades to choose honestly
                     continue
                 combo_votes[m["id"]][best] = combo_votes[m["id"]].get(best, 0) + 1
-                # score the CHOSEN combo on untouched OOS
-                oos = trades_for_combo(rows, fires, side, best[0], best[1], best[2], cut, len(rows))
-                oos_agg[m["id"]].extend(oos)
+                # score the CHOSEN combo on the OOS-select slice AND the untouched lockbox
+                oos_agg[m["id"]].extend(
+                    trades_for_combo(rows, fires, side, best[0], best[1], best[2], train_end, oos_end))
+                lockbox_agg[m["id"]].extend(
+                    trades_for_combo(rows, fires, side, best[0], best[1], best[2], oos_end, n))
             done_coins += 1
         except Exception:
             skipped += 1
@@ -205,6 +214,20 @@ def main() -> None:
                         "pvalue": card.get("pvalue")})
         else:
             row.update({"oos_mean_r": None, "oos_win": None, "oos_net_pct": None, "pvalue": None})
+        # #2 LOCKBOX: never used to select — the honest final holdout
+        lb = lockbox_agg[m["id"]]
+        row["lockbox_n"] = len(lb)
+        if len(lb) >= 30:
+            lc = ls.scorecard(lb)
+            row["lockbox_mean_r"] = lc.get("metrics", {}).get("mean_r")
+            row["lockbox_net_pct"] = round(sum(t["net"] for t in lb) * 100, 2)
+            row["lockbox_pvalue"] = lc.get("pvalue")
+        else:
+            row["lockbox_mean_r"] = row["lockbox_net_pct"] = row["lockbox_pvalue"] = None
+        # a method is lockbox_held only if it stays net-positive with positive mean on
+        # data that never influenced its selection (regime-robustness, not luck)
+        row["lockbox_held"] = bool((row["lockbox_mean_r"] or 0) > 0 and (row["lockbox_net_pct"] or 0) > 0
+                                   and (row["lockbox_n"] or 0) >= 30)
         results.append(row)
 
     cand = sorted([r for r in results if r["pvalue"] is not None
