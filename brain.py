@@ -656,6 +656,11 @@ def render_views() -> None:
         (MEM_DIR / "BRAIN_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     finally:
         con.close()
+    try:                                   # Obsidian vault live-numbers layer (owner request)
+        import brain_vault
+        brain_vault.render_auto()
+    except Exception:
+        pass
 
 
 def rebuild_from_events() -> dict[str, int]:
