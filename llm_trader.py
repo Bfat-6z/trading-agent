@@ -115,6 +115,13 @@ UNIVERSE_CACHE = LT_DIR / "universe_cache.json"
 # day; does not close positions).
 MAX_CONCURRENT = int(os.environ.get("LLM_TRADER_MAX_CONCURRENT", "50"))
 MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "95"))
+# Owner (2026-07-05): "bo cai phanh ngay do di" — DISABLE the daily-loss breaker.
+# Owner accepts the risk (paper account). Set to "1" to re-arm. NOTE: with this OFF
+# there is NO daily circuit-breaker; a run of losing capitulation fires on a hard
+# down-day can compound past -15% with nothing halting new entries. The per-position
+# sizing (mech_sizing), $50M liquidity floor and 95% total-margin cap are the only
+# remaining guards. Live orders stay LOCKED regardless.
+DAILY_BREAKER_ON = os.environ.get("LLM_TRADER_DAILY_BREAKER", "0") != "0"
 # DATA-ACCUMULATION mode (owner): trade B+ setups to build a measured track record
 # fast, instead of sitting idle waiting for the rare A+. Lower confluence gate +
 # an explicit "act, don't over-skip" directive. Honest tradeoff: more trades on a
@@ -986,7 +993,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
     now_ms = int(now_ms if now_ms is not None else _t.time() * 1000)
     acct = load_account()
     day_start = _day_anchor(acct, now_ms, equity)
-    blocked, why = lr.daily_breaker(_load(CLOSED), day_start, now_ms)
+    blocked, why = lr.daily_breaker(_load(CLOSED), day_start, now_ms) if DAILY_BREAKER_ON else (False, "")
     if blocked:
         _append(LT_DIR / "governance.jsonl",
                 {"ts_ms": now_ms, "event": "daily_breaker_block", "why": why,
@@ -1365,7 +1372,8 @@ def run_once() -> dict[str, Any]:
     _maybe_reflect(now_ms)   # meta-cognition: bot reasons about its own results ~every 30 min
     open_now = _load(POSITIONS)
     margin_used = sum(float(x.get("margin") or 0) for x in open_now)
-    blocked, why = lr.daily_breaker(_load(CLOSED), _day_anchor(acct, now_ms, equity), now_ms)
+    blocked, why = (lr.daily_breaker(_load(CLOSED), _day_anchor(acct, now_ms, equity), now_ms)
+                    if DAILY_BREAKER_ON else (False, "off"))
     status = {
         "scorecard": {"n": card["metrics"]["n"], "win_rate": card["metrics"]["win_rate"],
                       "mean_r": card["metrics"]["mean_r"], "liq_count": card["metrics"]["liq_count"],
