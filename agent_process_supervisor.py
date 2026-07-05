@@ -116,7 +116,10 @@ def specs() -> list[AgentSpec]:
         # method lab, deep_validation and forward_test have ZERO dependency on it. Kept
         # the file; just no longer supervised. Re-add this line to revive.
         # AgentSpec("dream_cycle", "dream_cycle.py", tuple(), STATE_DIR / "dream_cycle.pid", STATE_DIR / "dream_cycle_heartbeat.json", 2400),
-        AgentSpec("reflection_agent", "reflection_agent.py", ("--interval-hours", "0.5"), STATE_DIR / "reflection_agent.pid", STATE_DIR / "reflection_agent_heartbeat.json", 2400),
+        # CUT (second-brain P4, gpt-5.5 triage): template-string "lessons"/dreams with
+        # near-zero signal, off every decision path; lesson mining is now deterministic
+        # in brain.mine_lessons() from real trade autopsies. Re-add to revive.
+        # AgentSpec("reflection_agent", "reflection_agent.py", ("--interval-hours", "0.5"), STATE_DIR / "reflection_agent.pid", STATE_DIR / "reflection_agent_heartbeat.json", 2400),
         AgentSpec("cognitive_supervisor", "cognitive_supervisor.py", ("--interval-minutes", "20"), STATE_DIR / "cognitive_supervisor.pid", STATE_DIR / "cognitive_supervisor_heartbeat.json", 1500),
         AgentSpec("llm_reasoning_agent", "llm_reasoning_agent.py", ("--interval-minutes", "60"), STATE_DIR / "llm_reasoning_agent.pid", STATE_DIR / "llm_reasoning_agent_heartbeat.json", 900),
         AgentSpec("paper_candidate_feeder", "paper_candidate_feeder.py", ("--interval-seconds", "60"), STATE_DIR / "paper_candidate_feeder.pid", STATE_DIR / "paper_candidate_feeder_heartbeat.json", 180),
@@ -143,7 +146,11 @@ def specs() -> list[AgentSpec]:
         AgentSpec("promotion_evaluator_loop", "promotion_evaluator_loop.py", ("--interval-seconds", "300"), STATE_DIR / "promotion_evaluator_loop.pid", STATE_DIR / "promotion_evaluator_loop_heartbeat.json", 600),
         # CUT (gpt-5.5 review 2026-07-05): no direct alpha value, 0 mission deps. Re-add to revive.
         # AgentSpec("self_model", "self_model.py", ("--interval-minutes", "10"), STATE_DIR / "self_model.pid", STATE_DIR / "self_model_heartbeat.json", 900),
-        AgentSpec("memory_consolidation_agent", "memory_consolidation_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "memory_consolidation_agent.pid", STATE_DIR / "memory_consolidation_agent_heartbeat.json", 2700),
+        # CUT (second-brain P4): its durable-memory write role is superseded by the
+        # deterministic brain.db registry + mechanical lessons; its evidence sources
+        # were largely the already-cut theater agents. The data_trust gating CODE
+        # stays in the repo for reuse. Re-add to revive.
+        # AgentSpec("memory_consolidation_agent", "memory_consolidation_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "memory_consolidation_agent.pid", STATE_DIR / "memory_consolidation_agent_heartbeat.json", 2700),
         # CUT (gpt-5.5 review 2026-07-05): 'complexity factory' + ran with --apply (autonomous
         # self-modification) for no measured edge; 0 mission deps. Re-add to revive.
         # AgentSpec("skill_forge_agent", "skill_forge_agent.py", ("--interval-seconds", "1800", "--apply"), STATE_DIR / "skill_forge_agent.pid", STATE_DIR / "skill_forge_agent_heartbeat.json", 2700),

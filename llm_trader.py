@@ -478,6 +478,20 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
             continue
         for m in methods:
             if ml.method_fires(row, m):
+                # LESSON GATE (second brain P4): active lessons are hard vetoes
+                # mined mechanically from our OWN closed trades (n>=5, negative,
+                # pre-registered templates only). The veto row is logged verbatim.
+                try:
+                    import brain
+                    veto = brain.lesson_veto(row, m.get("side", "LONG"))
+                except Exception:
+                    veto = None
+                if veto:
+                    _append(LT_DIR / "governance.jsonl",
+                            {"event": "lesson_block", "symbol": c["symbol"], "method": m["id"],
+                             "lesson": veto.get("lesson_id"), "n": veto.get("n"),
+                             "avg_r": veto.get("avg_r"), "label": veto.get("label")})
+                    continue
                 fires.append((c["symbol"], m["id"]))
                 ctxs[c["symbol"]] = (c, m, row)
                 break
@@ -520,9 +534,15 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
         except Exception:
             pass
         _slp, _tpp = float(m.get("sl_pct", 2.5)), float(m.get("tp_pct", 4.0))
+        try:
+            from brain import LESSON_FEATS
+            _feats = {k: row.get(k) for k in LESSON_FEATS if row.get(k) is not None}
+        except Exception:
+            _feats = None
         out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
                     "size_pct": o["margin_pct"], "sl_pct": _slp, "tp_pct": _tpp, "entry_px": None,
                     "_mech": True, "_max_hold": int(m.get("timeout") or 16), "_chart_b64": chart,
+                    "_mech_method": m["id"], "_entry_feats": _feats,
                     "rationale": f"PROVEN {mid} (win {m.get('oos_win_rate')}, sized {o['margin_pct']}% margin, "
                                  f"cluster={len(fires)}): {m.get('desc','')[:60]}"})
         _append(LT_DIR / "governance.jsonl",
@@ -1027,6 +1047,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
                          "fill_bar_ts": d.get("_fill_bar_ts"),
                          "mech": bool(d.get("_mech")), "max_hold": (int(d.get("_max_hold") or 16) if d.get("_mech") else None),
+                         "mech_method": d.get("_mech_method"), "entry_feats": d.get("_entry_feats"),
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
@@ -1230,9 +1251,16 @@ def resolve(client: Any, now_ms: int) -> int:
                "entry": entry, "exit": exit_px, "reason": reason, "net": round(net, 4), "r": round(r, 3),
                "fee": round(fee, 4), "funding": round(funding, 4), "liq_px": round(liq_px, 6), "tier": tier,
                "leverage": lev, "margin": round(margin, 4), "vol": p.get("vol"),
+               "mech_method": p.get("mech_method"), "entry_feats": p.get("entry_feats"),
                "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         _append(CLOSED, rec)
         _append(MEMORY, rec)   # self-learning: outcome tagged by context
+        try:                    # second brain: mission closes feed lesson mining too
+            import brain
+            brain.record_mission_close({**rec, "entry_ts_ms": int(p.get("entry_ts") or 0),
+                                        "closed_ts_ms": now_ms})
+        except Exception:
+            pass
         closed_n += 1
     save_account(acct)
     _rewrite(POSITIONS, still)

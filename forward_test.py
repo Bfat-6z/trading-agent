@@ -208,8 +208,15 @@ def scan_open(client, methods: list[dict], params: dict[str, dict], now_ms: int)
                     to = int(pp.get("timeout", TIMEOUT_BARS))
                     sl = entry * (1 - slp) if side == "LONG" else entry * (1 + slp)
                     tp = entry * (1 + tpp) if side == "LONG" else entry * (1 - tpp)
+                    # fire-bar feature snapshot -> trade_autopsy -> lesson mining
+                    try:
+                        from brain import LESSON_FEATS
+                        feats = {k: row.get(k) for k in LESSON_FEATS if row.get(k) is not None}
+                    except Exception:
+                        feats = None
                     _append(POSN, {"symbol": sym, "method": m["id"], "side": side,
                                    "entry": entry, "sl": sl, "tp": tp, "timeout": to,
+                                   "entry_feats": feats,
                                    "entry_ts_ms": int(last["ts_ms"]), "opened_ts_ms": now_ms})
                     opened += 1
                     break
@@ -269,6 +276,12 @@ def run_once(client) -> dict:
         hashes = {}
     closed_n = resolve_open(client, now_ms, hashes)
     opened = scan_open(client, methods, params, now_ms)
+    if closed_n:
+        try:                             # deterministic lesson recompute on new evidence
+            import brain
+            brain.mine_lessons()
+        except Exception:
+            pass
     stats = write_stats(methods)
     HB.write_text(json.dumps({"agent": "forward_test", "pid": os.getpid(), "ts": utc_now(),
                               "updated_at": utc_now(), "status": "running",

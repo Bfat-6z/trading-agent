@@ -86,7 +86,23 @@ CREATE TABLE IF NOT EXISTS trade_autopsy (
   net REAL, r REAL,
   mae_pct REAL, mfe_pct REAL,
   bars_held INTEGER, exit_reason TEXT,
+  entry_feats TEXT,         -- JSON snapshot of the fire-bar feature row (lesson mining input)
   created_at TEXT
+);
+
+-- LESSONS: deterministic aggregates over trade_autopsy, recomputed (never
+-- hand-written, never LLM-written). A lesson is an EXECUTABLE predicate in the
+-- method-DSL condition form; 'active' rows become HARD entry vetoes. Promotion
+-- is mechanical (n >= 5, consistently negative) — Reflexion-style causal
+-- confabulation from a single trade can never mint a rule.
+CREATE TABLE IF NOT EXISTS lessons (
+  lesson_id TEXT PRIMARY KEY,     -- stable template key (pre-registered)
+  block_side TEXT,                -- 'LONG' | 'SHORT' | 'ANY'
+  conds TEXT NOT NULL,            -- JSON [{feat,op,val},...] evaluated on the fire row
+  label TEXT,
+  n INTEGER, wins INTEGER, avg_r REAL, avg_net REAL, worst_r REAL,
+  status TEXT CHECK(status IN ('candidate','active')),
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS proposals (   -- LLM quarantine: zero evidential weight
@@ -114,6 +130,10 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
     else:
         con = sqlite3.connect(DB, timeout=10)
         con.executescript(_SCHEMA)
+        try:                                       # migration: pre-lessons DBs lack this column
+            con.execute("ALTER TABLE trade_autopsy ADD COLUMN entry_feats TEXT")
+        except sqlite3.OperationalError:
+            pass
     con.row_factory = sqlite3.Row
     return con
 
@@ -263,10 +283,10 @@ def record_trials(rows: list[dict[str, Any]], defs: dict[str, dict[str, Any]],
     return n
 
 
-def record_shadow_close(rec: dict[str, Any], novelty_hash: str | None) -> None:
-    """One trade_autopsy row per forward-test shadow close (numbers only)."""
-    row = {
-        "trade_id": _ulid(), "src": "shadow",
+def _autopsy_row(rec: dict[str, Any], src: str, novelty_hash: str | None) -> dict[str, Any]:
+    feats = rec.get("entry_feats")
+    return {
+        "trade_id": _ulid(), "src": src,
         "method_id": rec.get("method"), "novelty_hash": novelty_hash,
         "symbol": rec.get("symbol"), "side": rec.get("side"),
         "entry": rec.get("entry"), "exit_px": rec.get("exit"),
@@ -274,9 +294,13 @@ def record_shadow_close(rec: dict[str, Any], novelty_hash: str | None) -> None:
         "net": rec.get("net"), "r": rec.get("r"),
         "mae_pct": rec.get("mae_pct"), "mfe_pct": rec.get("mfe_pct"),
         "bars_held": rec.get("bars_held"), "exit_reason": rec.get("reason"),
+        "entry_feats": canonical_json(feats) if isinstance(feats, dict) else None,
         "created_at": _now_iso(),
     }
-    _append_event("shadow_close", row)
+
+
+def _insert_autopsy(row: dict[str, Any], kind: str) -> None:
+    _append_event(kind, row)
     con = connect()
     try:
         with con:
@@ -285,6 +309,135 @@ def record_shadow_close(rec: dict[str, Any], novelty_hash: str | None) -> None:
                 list(row.values()))
     finally:
         con.close()
+
+
+def record_shadow_close(rec: dict[str, Any], novelty_hash: str | None) -> None:
+    """One trade_autopsy row per forward-test shadow close (numbers only)."""
+    _insert_autopsy(_autopsy_row(rec, "shadow", novelty_hash), "shadow_close")
+
+
+def record_mission_close(rec: dict[str, Any], novelty_hash: str | None = None) -> None:
+    """One trade_autopsy row per MISSION close — the bot's own losses are the
+    highest-value lesson-mining input (numbers only, no rationale text)."""
+    r2 = {**rec, "method": rec.get("method") or rec.get("mech_method"),
+          "entry_ts_ms": rec.get("entry_ts_ms") or rec.get("entry_ts"),
+          "closed_ts_ms": rec.get("closed_ts_ms") or rec.get("closed_ts")}
+    _insert_autopsy(_autopsy_row(r2, "mission", novelty_hash), "mission_close")
+
+
+# ---------------------------------------------------------------------------
+# LESSONS: pre-registered templates -> mechanical mining -> hard gates.
+#
+# The templates are FIXED AND PRE-DECLARED (6 hypotheses, no data dredging: the
+# multiple-testing surface is bounded and known). Each encodes a failure mode
+# the owner/audits already paid to learn. Mining just fills in the measured
+# numbers; promotion to 'active' (= hard entry veto) is purely mechanical:
+#   n >= LESSON_MIN_N  AND  avg_r < 0  AND  win_rate <= LESSON_MAX_WIN.
+# A lesson auto-DEMOTES the same way when the numbers stop supporting it.
+# ---------------------------------------------------------------------------
+LESSON_MIN_N = 5
+LESSON_MAX_WIN = 0.45
+LESSON_FEATS = ("rsi14", "ret20", "ret5", "vol_ratio", "funding_z", "dd96_pct",
+                "px_vs_ema200", "atr_pct", "close_pos", "ema_stack")
+
+LESSON_TEMPLATES: list[dict[str, Any]] = [
+    {"lesson_id": "chase_pump_long", "block_side": "LONG", "label": "LONG after a vertical run (chasing the pump)",
+     "conds": [{"feat": "ret20", "op": ">", "val": 8.0}]},
+    {"lesson_id": "chase_dump_short", "block_side": "SHORT", "label": "SHORT after a waterfall (chasing the dump)",
+     "conds": [{"feat": "ret20", "op": "<", "val": -8.0}]},
+    {"lesson_id": "crowded_long", "block_side": "LONG", "label": "LONG into crowded positive funding",
+     "conds": [{"feat": "funding_z", "op": ">", "val": 1.5}]},
+    {"lesson_id": "crowded_short", "block_side": "SHORT", "label": "SHORT into crowded negative funding",
+     "conds": [{"feat": "funding_z", "op": "<", "val": -1.5}]},
+    {"lesson_id": "dead_tape", "block_side": "ANY", "label": "entries on dead volume",
+     "conds": [{"feat": "vol_ratio", "op": "<", "val": 0.7}]},
+    {"lesson_id": "fake_dip_long", "block_side": "LONG", "label": "capitulation LONG without a real drawdown",
+     "conds": [{"feat": "dd96_pct", "op": "<", "val": 2.0}]},
+]
+
+
+def _lesson_matches(feats: dict[str, Any], side: str, tpl: dict[str, Any]) -> bool:
+    if tpl["block_side"] not in ("ANY", side):
+        return False
+    try:
+        import method_lab as ml
+        return ml.method_fires(feats, {"when": tpl["conds"]})
+    except Exception:
+        return False
+
+
+def mine_lessons() -> dict[str, Any]:
+    """Recompute every template's stats over ALL autopsy rows that carry an
+    entry-feature snapshot; promote/demote mechanically. Deterministic — safe
+    to run every cycle. Returns {lesson_id: status} for logging."""
+    if not DB.exists():
+        return {}
+    con = connect()
+    out: dict[str, Any] = {}
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT side, net, r, entry_feats FROM trade_autopsy WHERE entry_feats IS NOT NULL")]
+        for t in rows:
+            try:
+                t["feats"] = json.loads(t["entry_feats"])
+            except Exception:
+                t["feats"] = None
+        rows = [t for t in rows if isinstance(t.get("feats"), dict)]
+        now = _now_iso()
+        with con:
+            for tpl in LESSON_TEMPLATES:
+                hit = [t for t in rows if _lesson_matches(t["feats"], t.get("side") or "", tpl)]
+                n = len(hit)
+                wins = sum(1 for t in hit if (t.get("net") or 0) > 0)
+                avg_r = (sum(float(t.get("r") or 0) for t in hit) / n) if n else None
+                avg_net = (sum(float(t.get("net") or 0) for t in hit) / n) if n else None
+                worst = min((float(t.get("r") or 0) for t in hit), default=None)
+                active = bool(n >= LESSON_MIN_N and (avg_r or 0) < 0
+                              and (wins / n if n else 1.0) <= LESSON_MAX_WIN)
+                status = "active" if active else "candidate"
+                con.execute(
+                    "INSERT INTO lessons (lesson_id, block_side, conds, label, n, wins, avg_r, avg_net, worst_r, status, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(lesson_id) DO UPDATE SET "
+                    "n=excluded.n, wins=excluded.wins, avg_r=excluded.avg_r, avg_net=excluded.avg_net, "
+                    "worst_r=excluded.worst_r, status=excluded.status, updated_at=excluded.updated_at",
+                    (tpl["lesson_id"], tpl["block_side"], canonical_json(tpl["conds"]), tpl["label"],
+                     n, wins, avg_r, avg_net, worst, status, now))
+                out[tpl["lesson_id"]] = {"n": n, "status": status, "avg_r": avg_r}
+    finally:
+        con.close()
+    try:
+        render_views()
+    except Exception:
+        pass
+    return out
+
+
+def active_lessons() -> list[dict[str, Any]]:
+    """The hard-gate set: evaluated on the fire-bar feature row before sizing."""
+    if not DB.exists():
+        return []
+    con = connect(readonly=True)
+    try:
+        out = []
+        for r in con.execute("SELECT * FROM lessons WHERE status='active'"):
+            d = dict(r)
+            try:
+                d["conds"] = json.loads(d["conds"])
+            except Exception:
+                continue
+            out.append(d)
+        return out
+    finally:
+        con.close()
+
+
+def lesson_veto(feats: dict[str, Any], side: str) -> dict[str, Any] | None:
+    """Return the first active lesson that vetoes this (feature-row, side), else
+    None. Pure read; caller logs the verbatim lesson row (never paraphrased)."""
+    for les in active_lessons():
+        if _lesson_matches(feats, side, {"block_side": les["block_side"], "conds": les["conds"]}):
+            return les
+    return None
 
 
 def record_proposal(method: dict[str, Any], gate_result: str) -> None:
@@ -384,6 +537,33 @@ def trial_counts() -> dict[str, int]:
         dm = con.execute(
             "SELECT COUNT(DISTINCT COALESCE(novelty_hash, method_id)) FROM trials").fetchone()[0]
         return {"total": int(tot), "distinct_methods": int(dm)}
+    finally:
+        con.close()
+
+
+def render_views() -> None:
+    """Deterministic markdown views regenerated FROM SQL (never hand-edited,
+    never LLM-written; if they drift, delete — they'll regrow identical)."""
+    if not DB.exists():
+        return
+    con = connect(readonly=True)
+    try:
+        c = trial_counts()
+        lines = [f"# BRAIN SUMMARY (auto-rendered {_now_iso()} — do not edit)",
+                 f"\ntrials={c['total']} distinct_methods={c['distinct_methods']}", ""]
+        lines.append("## Armed (current)")
+        for r in con.execute("SELECT method_id, state, valid_at FROM method_state WHERE invalid_at IS NULL"):
+            lines.append(f"- {r['method_id']}: {r['state']} since {r['valid_at']}")
+        lines.append("\n## Lessons")
+        for r in con.execute("SELECT lesson_id, status, n, wins, avg_r, label FROM lessons ORDER BY status"):
+            lines.append(f"- [{r['status']}] {r['lesson_id']}: n={r['n']} wins={r['wins']} "
+                         f"avg_r={r['avg_r']} — {r['label']}")
+        lines.append("\n## Graveyard (top 30 DEAD by sample size)")
+        for r in con.execute("SELECT method_id, failure_mode, oos_n, oos_mean_r, pvalue, source FROM trials "
+                             "WHERE verdict='DEAD' ORDER BY COALESCE(oos_n,0) DESC LIMIT 30"):
+            lines.append(f"- {r['method_id']} [{r['failure_mode']}] n={r['oos_n']} "
+                         f"meanR={r['oos_mean_r']} p={r['pvalue']} ({r['source']})")
+        (MEM_DIR / "BRAIN_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     finally:
         con.close()
 
