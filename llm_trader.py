@@ -97,6 +97,16 @@ MECH_SIZE_MIN, MECH_SIZE_MAX = 5.0, 33.0   # margin % clamp per fire
 # call regardless of coin count, so breadth is ~free on the model side).
 UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "220"))  # FULL validated universe (~205 coins @ $5M): signals change per 15m bar-close, so a 2-3min full sweep misses nothing
 UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "50000000"))  # LIQUID established coins only: capitulation on $5-20M micro-caps = falling-knife (they dump straight, do not mean-revert). The edge is real only where liquidity is.
+# Owner (2026-07-05): "danh may con vol 1h to thoi ... neu danh chart 1h thi quet
+# 1h, 15m thi quet 15m, 4h thi quet 4h". So the universe is ranked by RECENT money
+# flow on the timeframe we actually trade — not stale 24h volume (a coin can be big
+# on 24h yet dead right now). The $50M/24h floor stays as an anti-trash liquidity
+# base; among those, keep the hottest by recent SCAN_TF volume.
+SCAN_TF = os.environ.get("LLM_TRADER_SCAN_TF", "1h")               # timeframe whose recent volume ranks the universe
+SCAN_WINDOW_BARS = int(os.environ.get("LLM_TRADER_SCAN_WINDOW", "24"))   # sum this many recent SCAN_TF bars = "hot money flow now"
+UNIVERSE_HOT_TOP = int(os.environ.get("LLM_TRADER_HOT_TOP", "60"))       # keep top-N liquid coins by recent SCAN_TF volume
+UNIVERSE_REFRESH_SEC = float(os.environ.get("LLM_TRADER_UNIVERSE_REFRESH", "1800"))  # rebuild the hot list every ~30 min (bounds klines API calls)
+UNIVERSE_CACHE = LT_DIR / "universe_cache.json"
 # Owner: UNLIMITED number of positions — accepts correlation risk for bigger
 # upside. No trade-count cap (50 >> the 30-coin universe, 1-per-symbol, so it
 # never binds). MARGIN is the only physical limit: at 5-10%/trade on $100 you can
@@ -1298,6 +1308,47 @@ def refresh_scorecard(client: Any) -> dict[str, Any]:
     return card
 
 
+def _hot_universe(client: Any, now_ms: int) -> list[str]:
+    """Universe ranked by RECENT volume on the timeframe we trade (owner: 'danh may
+    con vol 1h to thoi'). Anti-trash 24h floor ($50M) is the liquidity base — a 1h
+    volume spike on a micro-cap is a pump-and-dump, exactly the falling knife we just
+    got burned by — so we rank WITHIN the liquid pool by recent SCAN_TF money flow and
+    keep the hottest N. Cached ~30 min to bound the per-coin klines calls. Paper only."""
+    import json as _j
+    try:
+        if UNIVERSE_CACHE.exists():
+            c = _j.loads(UNIVERSE_CACHE.read_text(encoding="utf-8"))
+            if (c.get("scan_tf") == SCAN_TF and c.get("selected")
+                    and (now_ms - int(c.get("ts_ms", 0))) < UNIVERSE_REFRESH_SEC * 1000):
+                return list(c["selected"])
+    except Exception:
+        pass
+    ticks = client.futures_ticker()
+    pool = sorted(
+        [(t["symbol"], float(t.get("quoteVolume", 0) or 0)) for t in ticks
+         if t.get("symbol", "").endswith("USDT") and "_" not in t["symbol"]
+         and float(t.get("quoteVolume", 0) or 0) >= UNIVERSE_MIN_QVOL],
+        key=lambda x: -x[1])[:max(UNIVERSE_MAX, 300)]
+    scored: list[tuple[str, float]] = []
+    for sym, _qv in pool:
+        try:
+            kl = client.futures_klines(symbol=sym, interval=SCAN_TF, limit=SCAN_WINDOW_BARS)
+            scored.append((sym, sum(float(k[7]) for k in kl)))   # k[7] = quote asset volume per bar
+        except Exception:
+            continue
+    scored.sort(key=lambda x: -x[1])
+    selected = [s for s, _v in scored[:UNIVERSE_HOT_TOP]]
+    if not selected:                                              # klines all failed -> fall back to 24h order
+        selected = [s for s, _ in pool[:UNIVERSE_HOT_TOP]]
+    try:
+        UNIVERSE_CACHE.write_text(_j.dumps({"scan_tf": SCAN_TF, "ts_ms": now_ms,
+            "window_bars": SCAN_WINDOW_BARS, "n_pool": len(pool),
+            "selected": selected}), encoding="utf-8")
+    except Exception:
+        pass
+    return selected
+
+
 def run_once() -> dict[str, Any]:
     import time as _t
     from timebase import utc_now
@@ -1324,15 +1375,11 @@ def run_once() -> dict[str, Any]:
                      "margin_cap_pct": MAX_TOTAL_MARGIN_PCT,
                      "daily_breaker": ("BLOCKED: " + why) if blocked else "ok"},
     }
-    # DYNAMIC universe straight from the 24h ticker (one call) — the old
-    # select_universe ranked within a hardcoded ~24-coin candidate list, silently
-    # capping the net at 23 no matter what max_symbols said.
+    # Universe = the hottest liquid coins by RECENT volume on the timeframe we trade
+    # (owner: "danh may con vol 1h to thoi"). $50M/24h floor keeps out micro-cap
+    # falling-knives; SCAN_TF volume ranks who is actually moving right now.
     try:
-        ticks = client.futures_ticker()
-        rows_u = [(t["symbol"], float(t.get("quoteVolume", 0) or 0)) for t in ticks
-                  if t.get("symbol", "").endswith("USDT") and "_" not in t["symbol"]]
-        rows_u.sort(key=lambda x: -x[1])
-        selected = [sym for sym, qv in rows_u if qv >= UNIVERSE_MIN_QVOL][:UNIVERSE_MAX]
+        selected = _hot_universe(client, now_ms)
         if not selected:
             raise ValueError("empty universe")
     except Exception:
