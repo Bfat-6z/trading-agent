@@ -58,6 +58,10 @@ def methods_all() -> list[dict]:
                 by_id[m["id"]] = m
             except Exception:
                 pass
+    only = os.environ.get("DEEP_ONLY_IDS", "").strip()
+    if only:                              # targeted re-check of specific methods
+        want = {s.strip() for s in only.split(",") if s.strip()}
+        return [m for m in by_id.values() if m["id"] in want]
     return list(by_id.values())
 
 

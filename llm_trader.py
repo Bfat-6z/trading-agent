@@ -484,14 +484,19 @@ def _kelly_size_pct(win: float, payoff: float, sl_pct: float, lev: int) -> float
         return MECH_SIZE_MIN
 
 
+_ARMED_METHODS = ROOT / "state" / "method_lab" / "armed_methods.json"
+
+
 def _survivor_methods() -> list[dict[str, Any]]:
-    """Current lab survivors joined to their full method definitions (conditions
-    live in seeds + the runner's growing pool; survivors.json only carries ids)."""
+    """Methods the mission bot is allowed to fire, joined to their DSL conditions.
+
+    Source of truth is armed_methods.json — a STABLE, hand-curated set validated on
+    the liquid universe with deep-optimal SL/TP/timeout. The 3-hourly method_lab
+    runner rewrites survivors.json on its own ($5M) universe; letting that govern real
+    money silently disarmed the liquid-validated set (owner saw 'only LONG' after it
+    dropped everything but capitulation). So live arming reads armed_methods.json and
+    falls back to survivors.json only if the curated file is absent."""
     try:
-        surv = json.loads(_LAB_SURVIVORS.read_text(encoding="utf-8"))
-        ids = [s["id"] for s in surv if s.get("survived")]
-        if not ids:
-            return []
         from method_seeds import SEED_METHODS
         defs = {m["id"]: m for m in SEED_METHODS}
         pool = ROOT / "state" / "method_lab" / "methods_pool.jsonl"
@@ -502,12 +507,27 @@ def _survivor_methods() -> list[dict[str, Any]]:
                     defs[m["id"]] = m
                 except Exception:
                     pass
-        stats = {s["id"]: s for s in surv if s.get("survived")}
+        src = None
+        if _ARMED_METHODS.exists():
+            src = json.loads(_ARMED_METHODS.read_text(encoding="utf-8"))
+        if not src:
+            surv = json.loads(_LAB_SURVIVORS.read_text(encoding="utf-8"))
+            src = [{"id": s["id"], "oos_win_rate": s.get("oos_win_rate"),
+                    "oos_mean_r": s.get("oos_mean_r")} for s in surv if s.get("survived")]
         out = []
-        for i in ids:
-            if i in defs:
-                out.append({**defs[i], "oos_win_rate": stats.get(i, {}).get("oos_win_rate"),
-                            "oos_mean_r": stats.get(i, {}).get("oos_mean_r")})
+        for s in src:
+            d = defs.get(s["id"])
+            if not d:
+                continue
+            m = {**d}
+            if s.get("sl_pct") is not None:      # deep-optimal exits override the pool default
+                m["sl_pct"] = s["sl_pct"]
+            if s.get("tp_pct") is not None:
+                m["tp_pct"] = s["tp_pct"]
+            m["timeout"] = s.get("timeout")
+            m["oos_win_rate"] = s.get("oos_win_rate")
+            m["oos_mean_r"] = s.get("oos_mean_r")
+            out.append(m)
         return out
     except Exception:
         return []
@@ -565,7 +585,7 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
         _slp, _tpp = float(m.get("sl_pct", 2.5)), float(m.get("tp_pct", 4.0))
         out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
                     "size_pct": o["margin_pct"], "sl_pct": _slp, "tp_pct": _tpp, "entry_px": None,
-                    "_mech": True, "_chart_b64": chart,
+                    "_mech": True, "_max_hold": int(m.get("timeout") or 16), "_chart_b64": chart,
                     "rationale": f"PROVEN {mid} (win {m.get('oos_win_rate')}, sized {o['margin_pct']}% margin, "
                                  f"cluster={len(fires)}): {m.get('desc','')[:60]}"})
         _append(LT_DIR / "governance.jsonl",
@@ -1069,7 +1089,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "liq_px": liq_px, "mmr": mmr, "quote_vol_24h": quote_vol, "tier": tier,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
                          "fill_bar_ts": d.get("_fill_bar_ts"),
-                         "mech": bool(d.get("_mech")), "max_hold": 16 if d.get("_mech") else None,
+                         "mech": bool(d.get("_mech")), "max_hold": (int(d.get("_max_hold") or 16) if d.get("_mech") else None),
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
