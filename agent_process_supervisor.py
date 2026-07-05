@@ -130,6 +130,9 @@ def specs() -> list[AgentSpec]:
         AgentSpec("method_lab_runner", "method_lab_runner.py", ("--interval", "10800"), STATE_DIR / "method_lab_runner.pid", STATE_DIR / "method_lab_heartbeat.json", 14400),
         # Signal follower (paper-trades Telegram alerts, measures per-channel win rate)
         AgentSpec("signal_follower", "signal_follower.py", ("--interval", "300"), STATE_DIR / "signal_follower.pid", STATE_DIR / "signal_follower_heartbeat.json", 1800),
+        # Forward test (paper shadow-ledger for below-bar candidate methods on fresh
+        # LIVE bars; owner 'cam forward-test um_reclaim_06'; promotes if edge persists)
+        AgentSpec("forward_test", "forward_test.py", ("--interval", "300"), STATE_DIR / "forward_test.pid", STATE_DIR / "forward_test_heartbeat.json", 1200),
         AgentSpec("counterfactual_replay_agent", "counterfactual_replay_agent.py", ("--interval-seconds", "300"), STATE_DIR / "counterfactual_replay_agent.pid", STATE_DIR / "counterfactual_replay_agent_heartbeat.json", 900),
         AgentSpec("learning_exam_benchmark", "learning_exam_benchmark.py", ("--interval-seconds", "3600"), STATE_DIR / "learning_exam_benchmark.pid", STATE_DIR / "learning_exam_benchmark_heartbeat.json", 4500),
         AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),
