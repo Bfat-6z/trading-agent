@@ -1271,6 +1271,12 @@ def resolve(client: Any, now_ms: int) -> int:
         closed_n += 1
     save_account(acct)
     _rewrite(POSITIONS, still)
+    if closed_n:
+        try:                     # lessons recompute on new MISSION evidence too —
+            import brain         # without this, mining only ran on shadow closes
+            brain.mine_lessons() # and mission-only days left lesson stats stale.
+        except Exception:
+            pass
     return closed_n
 
 

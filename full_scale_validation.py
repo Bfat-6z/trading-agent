@@ -141,6 +141,17 @@ def main() -> None:
         "minutes": round((time.time() - t0) / 60, 1),
         "results": results}, indent=1), encoding="utf-8")
     DONE.write_text("done", encoding="utf-8")
+    # Second brain: register this sweep's trials (an unrecorded validation silently
+    # un-deflates every later Sharpe/p-value in the DSR ledger).
+    try:
+        import brain
+        defs = {m["id"]: m for m in methods}
+        n_rec = brain.record_trials(results, defs, source="full_scale",
+                                    universe=f"usdtperp>={MIN_QVOL / 1e6:.0f}M",
+                                    timeframe="15m", months=MONTHS)
+        print(json.dumps({"brain_trials_recorded": n_rec}))
+    except Exception as e:
+        print(json.dumps({"brain_record_error": repr(e)[:160]}))
     print(json.dumps({"coins_tested": done_coins, "survivors_full_scale":
                       [r["id"] for r in results if r["survived_full_scale"]]}))
 

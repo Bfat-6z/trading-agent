@@ -154,6 +154,17 @@ def main() -> None:
         "minutes": round((time.time() - t0) / 60, 1), "results": results}, indent=1),
         encoding="utf-8")
     done_f.write_text("done", encoding="utf-8")
+    # Second brain: every future TF run must register its trials too (an unrecorded
+    # validation silently un-deflates every later Sharpe/p-value).
+    try:
+        import brain
+        defs = {m["id"]: m for m in methods}
+        n_rec = brain.record_trials(results, defs, source=f"tf_validation_{tf}",
+                                    universe=f"usdtperp>={MIN_QVOL / 1e6:.0f}M",
+                                    timeframe=tf, months=months)
+        print(json.dumps({"brain_trials_recorded": n_rec}))
+    except Exception as e:
+        print(json.dumps({"brain_record_error": repr(e)[:160]}))
     print(json.dumps({"tf": tf, "coins_tested": done_coins,
         "survived_bh": [r["id"] for r in results if r["survived"]],
         "strong_solo": [r["id"] for r in results if r["strong_solo"] and not r["survived"]]}))
