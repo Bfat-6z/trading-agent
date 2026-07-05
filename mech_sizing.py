@@ -22,19 +22,22 @@ except the justified safety coefficients. PAPER/OFFLINE: pure math, no orders.
 """
 from __future__ import annotations
 
+import os
 from math import isfinite, sqrt
 from typing import Any
 
 import numpy as np
 
-# Safety coefficients (justified in the risk review, not magic numbers):
-C_DD = 0.30              # drawdown governor -> P(ever halve) ~2%, ~51% of Kelly growth
+# Safety coefficients. Aggressiveness (owner 'danh be qua' — accepts more risk) is
+# env-tunable; the aggregate cap remains the ruin backstop no matter how high C_DD goes.
+#   C_DD 0.30 -> P(ever halve)~2%  |  0.50 (half-Kelly) ~12%  |  0.70 ~25%.
+C_DD = float(os.environ.get("MECH_C_DD", "0.50"))            # drawdown governor / Kelly fraction
 Z_LCB = 1.0             # lower-confidence-bound sigmas (bumped to 1.5 for thin methods)
 Z_LCB_THIN = 1.5
 THIN_N = 500            # oos_n below this (or p>0.01) -> extra shrinkage
 RHO_DEFAULT = 0.7      # assume high correlation when co-fire data is thin (safe side)
-PER_POS_CAP = 0.25     # max margin fraction per position
-GROSS_EXP_CAP = 2.0    # max sum(notional/equity): survives a ~12% synced gap <=25% equity
+PER_POS_CAP = float(os.environ.get("MECH_PER_POS_CAP", "0.25"))   # max margin fraction per position
+GROSS_EXP_CAP = float(os.environ.get("MECH_GROSS_EXP_CAP", "3.0"))  # max sum(notional/equity); a ~12% synced gap costs <=~36% equity
 MIN_MARGIN = 0.01      # below this -> skip (NO hard minimum-size floor)
 MIN_TRADES = 30        # untrusted sample -> don't fire
 
