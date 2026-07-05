@@ -1,0 +1,397 @@
+"""Second brain — deterministic trials/DSR registry (P2).
+
+Ground-truth memory for the research pipeline. Design (15-agent blueprint in
+plans/second_brain_design.md, adapted to repo conventions in
+plans/second_brain_readiness.md):
+
+  Layer 0  state/memory/events.jsonl — append-only, hash-chained event log.
+           Source of truth; every write is one event line.
+  Layer 1  state/memory/brain.db (SQLite WAL) — a PROJECTION of the log
+           (rebuildable via rebuild_from_events). Append-only triggers on the
+           trials table: a dead trial can never be edited away, because
+           deleting/updating it would silently un-deflate every future
+           Sharpe/p-value (the registry doubles as the Deflated-Sharpe trial
+           count — Bailey & López de Prado).
+
+  NO LLM anywhere in this module: writers are called only from deterministic
+  pipeline code (deep_validation, forward_test, method_lab_runner, backfill).
+  The LLM's only interface is READ (novelty gate feedback quotes rows
+  verbatim) plus the quarantined `proposals` table, which no gate consults.
+
+Paper/offline only. No exchange calls, no secrets.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any
+
+from atomic_state import canonical_json
+from method_canonical import method_hash, bucketed_hash
+
+ROOT = Path(__file__).resolve().parent
+MEM_DIR = ROOT / "state" / "memory"
+DB = MEM_DIR / "brain.db"
+EVENTS = MEM_DIR / "events.jsonl"
+
+_SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS trials (
+  trial_id      TEXT PRIMARY KEY,
+  novelty_hash  TEXT,                 -- NULL only for backfilled label-only rows (DSL lost to pool eviction)
+  bucket_hash   TEXT,
+  method_id     TEXT,
+  dsl_canonical TEXT,
+  side          TEXT,
+  universe      TEXT,
+  timeframe     TEXT,
+  months        REAL,
+  oos_n INTEGER, oos_mean_r REAL, oos_win REAL, oos_net_pct REAL,
+  pvalue REAL, pvalue_method TEXT,
+  lockbox_n INTEGER, lockbox_mean_r REAL, lockbox_net_pct REAL, lockbox_pvalue REAL,
+  lockbox_held INTEGER,
+  opt_sl REAL, opt_tp REAL, opt_timeout INTEGER,
+  verdict TEXT CHECK(verdict IN ('DEAD','LOCKBOX_PASS','PENDING')),
+  failure_mode TEXT,
+  source TEXT,
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS trials_hash ON trials(novelty_hash);
+CREATE INDEX IF NOT EXISTS trials_mid  ON trials(method_id);
+CREATE TRIGGER IF NOT EXISTS trials_no_upd BEFORE UPDATE ON trials
+  BEGIN SELECT RAISE(ABORT,'trials is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trials_no_del BEFORE DELETE ON trials
+  BEGIN SELECT RAISE(ABORT,'trials is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS method_state (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  novelty_hash TEXT, method_id TEXT,
+  state TEXT CHECK(state IN ('armed','disarmed','shadow','retired')),
+  reason TEXT,
+  valid_at TEXT NOT NULL,
+  invalid_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS trade_autopsy (
+  trade_id TEXT PRIMARY KEY,
+  src TEXT,                 -- 'shadow' | 'mission'
+  method_id TEXT, novelty_hash TEXT,
+  symbol TEXT, side TEXT,
+  entry REAL, exit_px REAL,
+  entry_ts_ms INTEGER, closed_ts_ms INTEGER,
+  net REAL, r REAL,
+  mae_pct REAL, mfe_pct REAL,
+  bars_held INTEGER, exit_reason TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS proposals (   -- LLM quarantine: zero evidential weight
+  id TEXT PRIMARY KEY,
+  method_id TEXT, dsl TEXT,
+  novelty_hash TEXT, bucket_hash TEXT,
+  gate_result TEXT,
+  created_at TEXT
+);
+"""
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def _ulid() -> str:
+    return f"{int(time.time() * 1000):x}-{os.urandom(4).hex()}"
+
+
+def connect(readonly: bool = False) -> sqlite3.Connection:
+    MEM_DIR.mkdir(parents=True, exist_ok=True)
+    if readonly and DB.exists():
+        con = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True, timeout=10)
+    else:
+        con = sqlite3.connect(DB, timeout=10)
+        con.executescript(_SCHEMA)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+# ---------------------------------------------------------------------------
+# Layer 0: hash-chained event log (source of truth)
+# ---------------------------------------------------------------------------
+def _last_event_hash() -> str:
+    if not EVENTS.exists():
+        return "genesis"
+    try:
+        with EVENTS.open("rb") as fh:
+            tail = fh.read()[-4096:].splitlines()
+        for line in reversed(tail):
+            if line.strip():
+                return json.loads(line).get("h", "genesis")
+    except Exception:
+        pass
+    return "genesis"
+
+
+def _append_event(kind: str, payload: dict[str, Any]) -> str:
+    MEM_DIR.mkdir(parents=True, exist_ok=True)
+    prev = _last_event_hash()
+    body = {"ts": _now_iso(), "kind": kind, "payload": payload}
+    h = hashlib.sha256((prev + canonical_json(body)).encode()).hexdigest()[:32]
+    with EVENTS.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({**body, "prev": prev, "h": h}, ensure_ascii=False) + "\n")
+    return h
+
+
+# ---------------------------------------------------------------------------
+# deterministic verdict mapping (documented, no judgment calls at write time)
+# ---------------------------------------------------------------------------
+def verdict_for(row: dict[str, Any]) -> tuple[str, str | None]:
+    pv = row.get("pvalue")
+    if pv is None:
+        return "PENDING", "low_n"
+    if row.get("lockbox_held"):
+        return "LOCKBOX_PASS", None
+    if (row.get("oos_mean_r") or 0) <= 0 or (row.get("oos_net_pct") or 0) <= 0:
+        return "DEAD", "died_oos"
+    if (row.get("lockbox_n") or 0) >= 30 and not row.get("lockbox_held"):
+        return "DEAD", "died_lockbox"
+    if (row.get("lockbox_n") or 0) < 30:
+        return "PENDING", "low_n"
+    return "DEAD", "no_signal"
+
+
+# ---------------------------------------------------------------------------
+# writers (deterministic pipeline code only)
+# ---------------------------------------------------------------------------
+def record_trials(rows: list[dict[str, Any]], defs: dict[str, dict[str, Any]],
+                  source: str, universe: str, timeframe: str, months: float) -> int:
+    """One trials row per validation result row. defs maps method_id -> DSL def
+    (for canonical hash); missing def -> label-only row (hash NULL, still counts
+    toward the DSR trial total)."""
+    con = connect()
+    n = 0
+    try:
+        with con:
+            for r in rows:
+                d = defs.get(r.get("id"))
+                nh = method_hash(d) if d else None
+                bh = bucketed_hash(d) if d else None
+                verdict, fmode = verdict_for(r)
+                rec = {
+                    "trial_id": _ulid(), "novelty_hash": nh, "bucket_hash": bh,
+                    "method_id": r.get("id"),
+                    "dsl_canonical": canonical_json(d) if d else None,
+                    "side": r.get("side") or (d or {}).get("side"),
+                    "universe": universe, "timeframe": timeframe, "months": months,
+                    "oos_n": r.get("oos_n"), "oos_mean_r": r.get("oos_mean_r"),
+                    "oos_win": r.get("oos_win"), "oos_net_pct": r.get("oos_net_pct"),
+                    "pvalue": r.get("pvalue"), "pvalue_method": "block_bootstrap",
+                    "lockbox_n": r.get("lockbox_n"), "lockbox_mean_r": r.get("lockbox_mean_r"),
+                    "lockbox_net_pct": r.get("lockbox_net_pct"), "lockbox_pvalue": r.get("lockbox_pvalue"),
+                    "lockbox_held": 1 if r.get("lockbox_held") else 0,
+                    "opt_sl": r.get("opt_sl"), "opt_tp": r.get("opt_tp"),
+                    "opt_timeout": r.get("opt_timeout"),
+                    "verdict": verdict, "failure_mode": fmode,
+                    "source": source, "created_at": _now_iso(),
+                }
+                _append_event("trial", rec)
+                con.execute(
+                    f"INSERT INTO trials ({','.join(rec)}) VALUES ({','.join('?' * len(rec))})",
+                    list(rec.values()))
+                n += 1
+    finally:
+        con.close()
+    return n
+
+
+def record_shadow_close(rec: dict[str, Any], novelty_hash: str | None) -> None:
+    """One trade_autopsy row per forward-test shadow close (numbers only)."""
+    row = {
+        "trade_id": _ulid(), "src": "shadow",
+        "method_id": rec.get("method"), "novelty_hash": novelty_hash,
+        "symbol": rec.get("symbol"), "side": rec.get("side"),
+        "entry": rec.get("entry"), "exit_px": rec.get("exit"),
+        "entry_ts_ms": rec.get("entry_ts_ms"), "closed_ts_ms": rec.get("closed_ts_ms"),
+        "net": rec.get("net"), "r": rec.get("r"),
+        "mae_pct": rec.get("mae_pct"), "mfe_pct": rec.get("mfe_pct"),
+        "bars_held": rec.get("bars_held"), "exit_reason": rec.get("reason"),
+        "created_at": _now_iso(),
+    }
+    _append_event("shadow_close", row)
+    con = connect()
+    try:
+        with con:
+            con.execute(
+                f"INSERT OR IGNORE INTO trade_autopsy ({','.join(row)}) VALUES ({','.join('?' * len(row))})",
+                list(row.values()))
+    finally:
+        con.close()
+
+
+def record_proposal(method: dict[str, Any], gate_result: str) -> None:
+    """LLM proposal + the gate's verdict — quarantine table, audit only."""
+    row = {"id": _ulid(), "method_id": method.get("id"),
+           "dsl": canonical_json(method),
+           "novelty_hash": method_hash(method), "bucket_hash": bucketed_hash(method),
+           "gate_result": gate_result, "created_at": _now_iso()}
+    _append_event("proposal", row)
+    con = connect()
+    try:
+        with con:
+            con.execute(
+                f"INSERT INTO proposals ({','.join(row)}) VALUES ({','.join('?' * len(row))})",
+                list(row.values()))
+    finally:
+        con.close()
+
+
+def sync_armed_state(defs: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    """Mirror state/method_lab/armed_methods.json into bi-temporal method_state.
+    Arming is manual curation (no code writer exists) — this records transitions
+    whenever the file's contents change. Returns transition descriptions."""
+    armed_path = ROOT / "state" / "method_lab" / "armed_methods.json"
+    try:
+        armed = json.loads(armed_path.read_text(encoding="utf-8"))
+    except Exception:
+        armed = []
+    now = _now_iso()
+    want = {}
+    for a in armed:
+        d = (defs or {}).get(a.get("id"))
+        want[a.get("id")] = method_hash(d) if d else None
+    changes: list[str] = []
+    con = connect()
+    try:
+        with con:
+            cur = {r["method_id"]: r for r in con.execute(
+                "SELECT * FROM method_state WHERE state='armed' AND invalid_at IS NULL")}
+            for mid, r in cur.items():
+                if mid not in want:
+                    con.execute("UPDATE method_state SET invalid_at=? WHERE id=?", (now, r["id"]))
+                    con.execute(
+                        "INSERT INTO method_state (novelty_hash, method_id, state, reason, valid_at) "
+                        "VALUES (?,?,?,?,?)", (r["novelty_hash"], mid, "disarmed", "removed from armed_methods.json", now))
+                    changes.append(f"disarmed:{mid}")
+                    _append_event("method_state", {"method_id": mid, "state": "disarmed", "at": now})
+            for mid, nh in want.items():
+                if mid not in cur:
+                    con.execute(
+                        "INSERT INTO method_state (novelty_hash, method_id, state, reason, valid_at) "
+                        "VALUES (?,?,?,?,?)", (nh, mid, "armed", "armed_methods.json", now))
+                    changes.append(f"armed:{mid}")
+                    _append_event("method_state", {"method_id": mid, "state": "armed", "at": now})
+    finally:
+        con.close()
+    return changes
+
+
+# ---------------------------------------------------------------------------
+# readers (novelty gate + DSR)
+# ---------------------------------------------------------------------------
+def known_hashes() -> set[str]:
+    if not DB.exists():
+        return set()
+    con = connect(readonly=True)
+    try:
+        return {r[0] for r in con.execute(
+            "SELECT DISTINCT novelty_hash FROM trials WHERE novelty_hash IS NOT NULL")}
+    finally:
+        con.close()
+
+
+def rows_for_hash(nh: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Verbatim rows for gate feedback — the raw record, never a paraphrase
+    (an LLM-rephrased rejection is itself a laundering channel)."""
+    if not DB.exists():
+        return []
+    con = connect(readonly=True)
+    try:
+        return [dict(r) for r in con.execute(
+            "SELECT method_id, verdict, failure_mode, oos_n, oos_mean_r, oos_net_pct, pvalue, "
+            "lockbox_net_pct, lockbox_pvalue, source, created_at FROM trials "
+            "WHERE novelty_hash=? ORDER BY created_at DESC LIMIT ?", (nh, limit))]
+    finally:
+        con.close()
+
+
+def trial_counts() -> dict[str, int]:
+    """DSR inputs: every validation event ever run (label-only rows included —
+    they were real trials and must deflate future Sharpe like any other)."""
+    if not DB.exists():
+        return {"total": 0, "distinct_methods": 0}
+    con = connect(readonly=True)
+    try:
+        tot = con.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
+        dm = con.execute(
+            "SELECT COUNT(DISTINCT COALESCE(novelty_hash, method_id)) FROM trials").fetchone()[0]
+        return {"total": int(tot), "distinct_methods": int(dm)}
+    finally:
+        con.close()
+
+
+def rebuild_from_events() -> dict[str, int]:
+    """Disaster recovery: brain.db is a projection — rebuild it from the log."""
+    if DB.exists():
+        DB.unlink()
+    con = connect()
+    counts = {"trial": 0, "shadow_close": 0, "proposal": 0, "method_state": 0}
+    try:
+        with con:
+            for line in (EVENTS.read_text(encoding="utf-8").splitlines() if EVENTS.exists() else []):
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                kind, p = ev.get("kind"), ev.get("payload") or {}
+                if kind == "trial":
+                    con.execute(f"INSERT OR IGNORE INTO trials ({','.join(p)}) VALUES ({','.join('?' * len(p))})",
+                                list(p.values()))
+                elif kind == "shadow_close":
+                    con.execute(f"INSERT OR IGNORE INTO trade_autopsy ({','.join(p)}) VALUES ({','.join('?' * len(p))})",
+                                list(p.values()))
+                elif kind == "proposal":
+                    con.execute(f"INSERT OR IGNORE INTO proposals ({','.join(p)}) VALUES ({','.join('?' * len(p))})",
+                                list(p.values()))
+                elif kind == "method_state":
+                    con.execute("INSERT INTO method_state (novelty_hash, method_id, state, reason, valid_at) "
+                                "VALUES (?,?,?,?,?)",
+                                (p.get("novelty_hash"), p.get("method_id"), p.get("state"),
+                                 "rebuilt", p.get("at") or _now_iso()))
+                if kind in counts:
+                    counts[kind] += 1
+    finally:
+        con.close()
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# the novelty gate (deterministic, pre-compute)
+# ---------------------------------------------------------------------------
+def novelty_gate(method: dict[str, Any], extra_hashes: set[str] | None = None) -> tuple[str, list[dict[str, Any]]]:
+    """Returns (gate_result, verbatim_dead_rows).
+    REJECT_EXACT  — this exact idea was already tested (any verdict) or is
+                    already in seeds/pool (extra_hashes). Re-testing burns
+                    compute and quietly multiplies the trial count.
+    FLAG_NEAR     — advisory: bucketed twin of a known trial (logged; caller
+                    may still accept — deliberate threshold A/B is legitimate).
+    PASS          — genuinely new idea.
+    """
+    nh = method_hash(method)
+    known = known_hashes()
+    if nh in known or (extra_hashes and nh in extra_hashes):
+        return "REJECT_EXACT", rows_for_hash(nh)
+    bh = bucketed_hash(method)
+    if DB.exists():
+        con = connect(readonly=True)
+        try:
+            near = [dict(r) for r in con.execute(
+                "SELECT method_id, verdict, failure_mode, oos_mean_r, pvalue FROM trials "
+                "WHERE bucket_hash=? ORDER BY created_at DESC LIMIT 3", (bh,))]
+        finally:
+            con.close()
+        if near:
+            return "FLAG_NEAR", near
+    return "PASS", []

@@ -103,10 +103,18 @@ def _save_pool(methods: list[dict[str, Any]]) -> None:
             fh.write(json.dumps(m) + "\n")
 
 
-def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6) -> list[dict[str, Any]]:
+def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
+                    existing_hashes: set[str] | None = None) -> list[dict[str, Any]]:
     """Ask the LLM for k NEW candidate methods encoding real trading approaches, as
     DSL JSON. Best-effort: returns [] on any failure (the loop still re-tests the
-    pool). This is the 'learn from how others trade' channel — data still decides."""
+    pool). This is the 'learn from how others trade' channel — data still decides.
+
+    Second brain (P2): every candidate passes the deterministic NOVELTY GATE
+    before it can cost any compute. The LLM can rephrase prose; it cannot
+    rephrase a canonical hash — REJECT_EXACT (same side+conditions+sl/tp as any
+    prior trial / seed / pool entry) is dropped; FLAG_NEAR (bucketed threshold
+    twin) is accepted but logged. Every verdict lands verbatim in the
+    quarantined `proposals` table (audit trail; feeds no gate)."""
     try:
         import llm_trader as lt
         base, key = lt._env_llm()
@@ -134,10 +142,23 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6)
         s, e = txt.find("["), txt.rfind("]")
         raw = json.loads(txt[s:e + 1]) if s >= 0 and e > s else []
         out = []
+        try:
+            import brain
+        except Exception:
+            brain = None
         for m in raw:
             v = validate_method(m)
-            if v and v["id"] not in existing_ids:
-                out.append(v)
+            if not v or v["id"] in existing_ids:
+                continue
+            if brain is not None:
+                try:
+                    gate, _rows = brain.novelty_gate(v, extra_hashes=existing_hashes)
+                    brain.record_proposal(v, gate)
+                    if gate == "REJECT_EXACT":
+                        continue                      # already tried — never re-spend compute
+                except Exception:
+                    pass                              # gate failure must not kill proposals
+            out.append(v)
         return out
     except Exception:
         return []
@@ -155,7 +176,13 @@ def run_once(client: Any, propose: bool = True) -> dict[str, Any]:
     except Exception:
         pass
     if propose:
-        new = propose_methods(set(by_id), [d for d in killed_descs if d], k=6)
+        try:
+            from method_canonical import method_hash
+            existing_hashes = {method_hash(m) for m in by_id.values()}
+        except Exception:
+            existing_hashes = None
+        new = propose_methods(set(by_id), [d for d in killed_descs if d], k=6,
+                              existing_hashes=existing_hashes)
         for m in new:
             by_id[m["id"]] = m
         # persist the growing pool (everything beyond the built-in seeds)
@@ -179,6 +206,29 @@ def run_once(client: Any, propose: bool = True) -> dict[str, Any]:
         except Exception:
             continue
     out = ml.run_lab(methods, frames)
+    # Second brain (P2): register FIRST-EVER evaluations as trials (the DSR trial
+    # count must include every idea ever tested). Re-evaluations of registered
+    # methods are 3-hourly screening repeats on overlapping data — recording each
+    # would spam the registry; deep_validation runs are the authoritative re-trials.
+    try:
+        import brain
+        from method_canonical import method_hash
+        known = brain.known_hashes()
+        fresh_rows, fresh_defs = [], {}
+        for r in out.get("results", []):
+            d = by_id.get(r.get("id"))
+            if not d or method_hash(d) in known:
+                continue
+            fresh_rows.append({**r, "oos_win": r.get("oos_win_rate"),
+                               "oos_net_pct": r.get("oos_total_net_pct"),
+                               "opt_sl": d.get("sl_pct"), "opt_tp": d.get("tp_pct")})
+            fresh_defs[r["id"]] = d
+        if fresh_rows:
+            brain.record_trials(fresh_rows, fresh_defs, source="lab_round",
+                                universe=f"lab_top{UNIVERSE_TOP_N}", timeframe="15m",
+                                months=LAB_MONTHS)
+    except Exception:
+        pass
     HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
     from datetime import datetime, timezone
     HEARTBEAT.write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),

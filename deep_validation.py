@@ -273,6 +273,20 @@ def main() -> None:
         "methods": len(methods), "bh_threshold": thr,
         "minutes": round((time.time() - t0) / 60, 1), "results": results}, indent=1), encoding="utf-8")
     DONE.write_text("done", encoding="utf-8")
+    # Second brain (P2): every deep-validation row is a TRIAL — the registry is
+    # the Deflated-Sharpe trial ledger, so this write is what keeps every future
+    # p-value honest. Deterministic; best-effort so a brain failure never kills
+    # the validation output itself.
+    try:
+        import brain
+        defs = {m["id"]: m for m in methods}
+        n_rec = brain.record_trials(results, defs, source="deep_validation",
+                                    universe=f"usdtperp>={MIN_QVOL / 1e6:.0f}M",
+                                    timeframe="15m", months=MONTHS)
+        brain.sync_armed_state(defs)
+        print(json.dumps({"brain_trials_recorded": n_rec, **brain.trial_counts()}))
+    except Exception as e:
+        print(json.dumps({"brain_record_error": repr(e)[:160]}))
     print(json.dumps({"coins_tested": done_coins, "grid": len(COMBOS),
         "ROBUST_lockbox": [r["id"] for r in results if r["robust"]],
         "survived_bh": [r["id"] for r in results if r["survived"]],

@@ -318,6 +318,23 @@ def run_lab(methods: list[dict[str, Any]], frames: dict[str, list[dict[str, floa
     flipped on pool growth alone. Hysteresis: a previous survivor keeps its seat
     while it stays individually significant (p<=0.05, positive OOS), so one round
     of pool churn can't evict a working method."""
+    # Second brain (P2): never spend a backtest on a canonical duplicate. The pool
+    # dedups by id STRING only, so two ids with identical side+conditions+sl/tp
+    # both reach here (and would double-count as independent trials). Keep the
+    # first occurrence (seed order wins).
+    try:
+        from method_canonical import method_hash as _mh
+        _seen: set[str] = set()
+        _uniq = []
+        for _m in methods:
+            _h = _mh(_m)
+            if _h in _seen:
+                continue
+            _seen.add(_h)
+            _uniq.append(_m)
+        methods = _uniq
+    except Exception:
+        pass
     n = len(methods)
     results = [evaluate_method(mth, frames, n_methods=1) for mth in methods]   # raw p
     try:

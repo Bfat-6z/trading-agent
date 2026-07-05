@@ -124,7 +124,7 @@ def _closed_bars(client, sym: str, now_ms: int) -> list[dict]:
     return [b for b in bars if b.get("is_final", True)]
 
 
-def resolve_open(client, now_ms: int) -> int:
+def resolve_open(client, now_ms: int, hashes: dict[str, str] | None = None) -> int:
     open_pos = _load(POSN)
     still, closed_n = [], 0
     for p in open_pos:
@@ -134,9 +134,12 @@ def resolve_open(client, now_ms: int) -> int:
             side, entry, sl, tp = p["side"], p["entry"], p["sl"], p["tp"]
             timeout = int(p.get("timeout", TIMEOUT_BARS))     # per-method (deep-optimal) hold cap
             exit_px, reason, used = None, None, 0
+            lo_min = hi_max = None                            # MAE/MFE excursion track
             for k, b in enumerate(after[:timeout]):
                 used = k + 1
                 hi, low = float(b["high"]), float(b["low"])
+                lo_min = low if lo_min is None else min(lo_min, low)
+                hi_max = hi if hi_max is None else max(hi_max, hi)
                 if side == "LONG":
                     if low <= sl:
                         exit_px, reason = sl, "sl"; break
@@ -154,9 +157,26 @@ def resolve_open(client, now_ms: int) -> int:
             gross = (exit_px / entry - 1) if side == "LONG" else (entry - exit_px) / entry
             net = gross - FEE_RT
             slp = abs(entry - sl) / entry
-            _append(CLOSED, {**p, "exit": exit_px, "reason": reason, "net": round(net, 6),
-                             "r": round(net / slp, 4) if slp else 0.0,
-                             "bars_held": used, "closed_ts_ms": now_ms})
+            # MAE/MFE as % of entry (positive magnitudes), up to & incl. the exit bar —
+            # the raw numbers later lesson-mining needs (stop-too-tight? tp-too-far?).
+            lo_ref = entry if lo_min is None else lo_min
+            hi_ref = entry if hi_max is None else hi_max
+            if side == "LONG":
+                mae_pct = round(max(0.0, (entry - lo_ref) / entry * 100), 4)
+                mfe_pct = round(max(0.0, (hi_ref - entry) / entry * 100), 4)
+            else:
+                mae_pct = round(max(0.0, (hi_ref - entry) / entry * 100), 4)
+                mfe_pct = round(max(0.0, (entry - lo_ref) / entry * 100), 4)
+            rec = {**p, "exit": exit_px, "reason": reason, "net": round(net, 6),
+                   "r": round(net / slp, 4) if slp else 0.0,
+                   "mae_pct": mae_pct, "mfe_pct": mfe_pct,
+                   "bars_held": used, "closed_ts_ms": now_ms}
+            _append(CLOSED, rec)
+            try:                            # second brain: numbers-only autopsy row
+                import brain
+                brain.record_shadow_close(rec, (hashes or {}).get(p.get("method")))
+            except Exception:
+                pass
             closed_n += 1
         except Exception:
             still.append(p)               # transient error -> retry next cycle
@@ -239,7 +259,15 @@ def run_once(client) -> dict:
     now_ms = int(time.time() * 1000)
     methods = load_methods(watch_ids())
     params = watch_params()
-    closed_n = resolve_open(client, now_ms)
+    # AS-TRADED novelty hashes: the shadow trades run with deep-optimal sl/tp
+    # overrides, so hash the effective method (identity = what actually traded).
+    try:
+        from method_canonical import method_hash
+        hashes = {m["id"]: method_hash({**m, **{k: v for k, v in (params.get(m["id"]) or {}).items()
+                                                if k in ("sl_pct", "tp_pct")}}) for m in methods}
+    except Exception:
+        hashes = {}
+    closed_n = resolve_open(client, now_ms, hashes)
     opened = scan_open(client, methods, params, now_ms)
     stats = write_stats(methods)
     HB.write_text(json.dumps({"agent": "forward_test", "pid": os.getpid(), "ts": utc_now(),

@@ -33,7 +33,12 @@ def unescape(m):
     return m
 
 
-# existing pool: ids + condition-signatures for dedupe
+# existing pool + seeds + BRAIN registry: ids + canonical hashes for dedupe.
+# (Second brain P2: the shared method_hash replaces the local sig() — one identity
+# function everywhere, and the registry remembers ideas the 150-cap pool evicted.)
+from method_canonical import method_hash
+from method_seeds import SEED_METHODS
+
 existing = []
 if POOL.exists():
     for line in POOL.read_text(encoding="utf-8").splitlines():
@@ -43,14 +48,13 @@ if POOL.exists():
             except Exception:
                 pass
 seen_ids = {m.get("id") for m in existing}
-
-
-def sig(m):
-    return (m.get("side"), tuple(sorted((c["feat"], c["op"], round(float(c["val"]), 4))
-                                        for c in m.get("when", []))))
-
-
-seen_sigs = {sig(m) for m in existing if m.get("when")}
+seen_h = {method_hash(m) for m in existing if m.get("when")}
+seen_h |= {method_hash(m) for m in SEED_METHODS}
+try:
+    import brain
+    seen_h |= brain.known_hashes()
+except Exception:
+    pass
 
 added, rejected, dup = [], 0, 0
 for m in methods:
@@ -59,10 +63,11 @@ for m in methods:
     if not v:
         rejected += 1
         continue
-    if v["id"] in seen_ids or sig(v) in seen_sigs:
+    h = method_hash(v)
+    if v["id"] in seen_ids or h in seen_h:
         dup += 1
         continue
-    seen_ids.add(v["id"]); seen_sigs.add(sig(v))
+    seen_ids.add(v["id"]); seen_h.add(h)
     added.append(v)
 
 with POOL.open("a", encoding="utf-8") as fh:

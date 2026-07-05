@@ -53,7 +53,6 @@ BASE_URL = os.environ.get("LLM_TRADER_BASE", "http://localhost:20128/v1")
 # and large max_tokens, so let it THINK as long as it needs. These are ceilings,
 # not forced usage; a slow deep cycle just runs less often (loop is sequential).
 MAX_DECISION_TOKENS = int(os.environ.get("LLM_TRADER_MAX_TOKENS", "16000"))
-MAX_REFLECT_TOKENS = int(os.environ.get("LLM_TRADER_REFLECT_TOKENS", "6000"))
 REASONING_EFFORT = os.environ.get("LLM_TRADER_REASONING_EFFORT", "high")
 LLM_TIMEOUT = float(os.environ.get("LLM_TRADER_LLM_TIMEOUT", "300"))
 TF = "15m"
@@ -380,90 +379,13 @@ def _proven_methods_block() -> str:
             "prioritize them) ===\n" + "\n".join(lines) + "\n=== END PROVEN METHODS ===\n\n")
 
 
-_REFLECT_PATH = LT_DIR / "self_reflection.json"
-
-
-def _reflect() -> dict[str, Any]:
-    """Meta-cognition: the bot REASONS about its own results and self-directs. It
-    reads its P&L, measured mistakes, proven methods, and recent rationale-vs-
-    outcome, thinks about what is actually working vs its habits, and emits
-    directives that get injected into future decisions. Best-effort."""
-    try:
-        closed = _dedupe_closed(_load(CLOSED))
-        booked = [c for c in closed if c.get("net") is not None]
-        if len(booked) < 8:
-            return {}
-        acct = load_account()
-        try:
-            surv = json.loads(_LAB_SURVIVORS.read_text(encoding="utf-8"))
-        except Exception:
-            surv = []
-        recent = [{"sym": c.get("symbol"), "side": c.get("side"), "net": round(float(c.get("net", 0)), 3),
-                   "reason": c.get("reason"), "i_said": (c.get("rationale") or "")[:110]} for c in booked[-12:]]
-        state = {"equity": acct.get("equity"), "realized": acct.get("realized"),
-                 "n_trades": len(booked), "win_rate": round(sum(1 for c in booked if c["net"] > 0) / len(booked), 3),
-                 "measured_mistakes": ltm.mistake_lessons(closed),
-                 "proven_methods": [s.get("desc") for s in surv if s.get("survived")],
-                 "recent_rationale_vs_outcome": recent}
-        mode = ("You are in DATA-ACCUMULATION mode: the goal is to build a measured track record, so your directives "
-                "must IMPROVE trade SELECTION (avoid the specific traps that lose), NOT stop trading altogether. "
-                "Do NOT say 'default SKIP' or 'max 1 trade' — instead say which setups to PREFER vs AVOID. "
-                if EXPLORE_MODE else "")
-        sysp = ("You are the trading agent reflecting on your OWN performance (meta-cognition). Think HARD and be "
-                "brutally honest: you are losing money, so vague optimism is useless. Reason about WHY you lose, "
-                "whether your stated rationales actually matched outcomes (did 'bull stack' setups get stopped?), "
-                "what is genuinely working (proven_methods) versus your reflexive habits, and what you must change. "
-                + mode +
-                "Reply ONLY a JSON object: {\"reflection\":\"3-4 sentences of honest self-analysis\","
-                "\"directives\":[\"3-5 concrete changes to apply to your next decisions\"]}")
-        raw = _llm(sysp, json.dumps(state, default=str), max_tokens=MAX_REFLECT_TOKENS)
-        obj = None
-        if raw:                          # parse the OBJECT (not _extract_json, which
-            a, b = raw.find("{"), raw.rfind("}")   # would grab the inner directives array)
-            if a >= 0 and b > a:
-                try:
-                    obj = json.loads(raw[a:b + 1])
-                except Exception:
-                    obj = None
-        if isinstance(obj, dict) and obj.get("directives"):
-            # strip markup — this text reaches a publicly tunneled page via innerHTML
-            _cln = lambda x: str(x).replace("<", "").replace(">", "")
-            obj["reflection"] = _cln(obj.get("reflection", ""))
-            obj["directives"] = [_cln(d) for d in obj.get("directives", [])][:6]
-            import time as _t
-            obj["ts"] = int(_t.time() * 1000)
-            LT_DIR.mkdir(parents=True, exist_ok=True)
-            _REFLECT_PATH.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
-            return obj
-    except Exception:
-        pass
-    return {}
-
-
-def _maybe_reflect(now_ms: int, min_gap_ms: int = 1_800_000) -> None:
-    """Run meta-cognition at most every ~30 min (it's an extra LLM call)."""
-    try:
-        last = 0
-        if _REFLECT_PATH.exists():
-            last = int(json.loads(_REFLECT_PATH.read_text(encoding="utf-8")).get("ts", 0))
-        if now_ms - last >= min_gap_ms:
-            _reflect()
-    except Exception:
-        pass
-
-
-def _reflection_block() -> str:
-    """Inject the bot's own self-reflection directives into the decision prompt."""
-    try:
-        obj = json.loads(_REFLECT_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    ds = obj.get("directives") or []
-    if not ds:
-        return ""
-    head = (obj.get("reflection", "").strip() + "\n") if obj.get("reflection") else ""
-    return ("=== YOUR SELF-REFLECTION (you reasoned about your own results — follow your own conclusions) ===\n"
-            + head + "\n".join(f"- {d}" for d in ds[:6]) + "\n=== END REFLECTION ===\n\n")
+# REMOVED (second-brain P1, 2026-07-06): the _reflect()/_reflection_block() loop let
+# the LLM free-write "directives" to self_reflection.json with NO evidence gate and
+# then re-read them as authority ("follow your own conclusions") — a textbook
+# memory-laundering loop (MemoryGraft arxiv.org/abs/2512.16962; the codebase's own
+# data_trust.py classifies llm_generated text as non-promotable, and this loop
+# bypassed it). The deterministic replacement already exists: _mistakes_block()
+# (P&L-derived failure modes) + _proven_methods_block() (walk-forward evidence).
 
 
 def _kelly_size_pct(win: float, payoff: float, sl_pct: float, lev: int) -> float:
@@ -864,7 +786,7 @@ def _decide_numeric(context: list[dict[str, Any]], equity: float,
     payload = [{"symbol": c["symbol"], **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                for c in context]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money reading numeric context per coin. "
-           + _reflection_block() + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     usr = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                       "memory": memory_context(), "coins": payload}, default=str)
     return _validate_decisions(_split_thinking(_llm(sys, usr)), by_sym)
@@ -936,7 +858,7 @@ def decide(context: list[dict[str, Any]], equity: float,
            "confluence hint ONLY — whale pressure agreeing with your chart setup adds a little confidence; a big "
            "opposite-side liquidation can mark a flush/reversal; NEVER trade on whale flow alone or chase it.\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
-           + _reflection_block() + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": mem, "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
@@ -1404,7 +1326,6 @@ def run_once() -> dict[str, Any]:
     if pend_filled:
         acct = load_account(); equity = float(acct["equity"])
     card = refresh_scorecard(client)
-    _maybe_reflect(now_ms)   # meta-cognition: bot reasons about its own results ~every 30 min
     open_now = _load(POSITIONS)
     margin_used = sum(float(x.get("margin") or 0) for x in open_now)
     blocked, why = (lr.daily_breaker(_load(CLOSED), _day_anchor(acct, now_ms, equity), now_ms)

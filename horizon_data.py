@@ -354,16 +354,13 @@ def build() -> dict:
     except Exception:
         pass
 
-    # Mind: the bot's step-by-step thinking + self-reflection (meta-cognition).
+    # Mind: the bot's step-by-step thinking. (self_reflection.json REMOVED — it was
+    # an ungated LLM-writes-own-authority laundering loop; the deterministic
+    # measured-mistakes lessons replaced it in the prompt.)
     mind = {"thinking": None, "thinking_ts": None, "reflection": None, "directives": []}
     try:
         th = json.loads((st / "llm_trader" / "thinking_latest.json").read_text(encoding="utf-8"))
         mind["thinking"] = th.get("thinking"); mind["thinking_ts"] = th.get("ts")
-    except Exception:
-        pass
-    try:
-        rf = json.loads((st / "llm_trader" / "self_reflection.json").read_text(encoding="utf-8"))
-        mind["reflection"] = rf.get("reflection"); mind["directives"] = (rf.get("directives") or [])[:6]
     except Exception:
         pass
 
