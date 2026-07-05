@@ -27,7 +27,7 @@ OUT = ROOT / "state" / "method_lab" / "full_scale_validation.json"
 PROG = ROOT / "state" / "method_lab" / "full_scale_progress.json"
 DONE = ROOT / "state" / "method_lab" / "full_scale.done"
 
-MIN_QVOL = 5_000_000.0
+MIN_QVOL = 50_000_000.0
 MONTHS = 5.0
 MIN_BARS = 2000
 OOS_FRAC = 0.3

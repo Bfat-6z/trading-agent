@@ -96,7 +96,7 @@ MECH_SIZE_MIN, MECH_SIZE_MAX = 5.0, 33.0   # margin % clamp per fire
 # actually turns into more live trades (the batched decision is still ONE LLM
 # call regardless of coin count, so breadth is ~free on the model side).
 UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "220"))  # FULL validated universe (~205 coins @ $5M): signals change per 15m bar-close, so a 2-3min full sweep misses nothing
-UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "5000000"))   # match the $5M validation universe (more proven-fire coverage)
+UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "50000000"))  # LIQUID established coins only: capitulation on $5-20M micro-caps = falling-knife (they dump straight, do not mean-revert). The edge is real only where liquidity is.
 # Owner: UNLIMITED number of positions — accepts correlation risk for bigger
 # upside. No trade-count cap (50 >> the 30-coin universe, 1-per-symbol, so it
 # never binds). MARGIN is the only physical limit: at 5-10%/trade on $100 you can
