@@ -36,6 +36,12 @@ Z_LCB = 1.0             # lower-confidence-bound sigmas (bumped to 1.5 for thin 
 Z_LCB_THIN = 1.5
 THIN_N = 500            # oos_n below this (or p>0.01) -> extra shrinkage
 RHO_DEFAULT = 0.7      # assume high correlation when co-fire data is thin (safe side)
+# Side-aware CRISIS correlation (Codex/gpt-5.5 review): correlations spike toward 1 in
+# a crash, so a same-direction cluster must be sized for crisis co-movement, not the
+# calm-market average. Opposite-side fires (a LONG + a SHORT) HEDGE, so they should
+# NOT inflate the divisor. rho: same side -> RHO_CRISIS, opposite -> RHO_OPP.
+RHO_CRISIS = float(os.environ.get("MECH_RHO_CRISIS", "0.85"))   # same-direction co-fire in a stress move
+RHO_OPP = float(os.environ.get("MECH_RHO_OPP", "0.0"))          # long vs short = hedged, not additive
 PER_POS_CAP = float(os.environ.get("MECH_PER_POS_CAP", "0.25"))   # max margin fraction per position
 GROSS_EXP_CAP = float(os.environ.get("MECH_GROSS_EXP_CAP", "3.0"))  # max sum(notional/equity); a ~12% synced gap costs <=~36% equity
 MIN_MARGIN = 0.01      # below this -> skip (NO hard minimum-size floor)
@@ -85,14 +91,19 @@ def size_fires(firing: list[tuple[str, str]], dists: dict[str, dict[str, Any]],
     if not firing:
         return []
     k = len(firing)
-    # cluster correlation (equicorrelation model). Real co-fire matrix not stored ->
-    # RHO_DEFAULT (safe: these longs move together in a dump).
+    # cluster correlation (equicorrelation model), SIDE-AWARE + crisis-level: same-side
+    # pairs co-move toward RHO_CRISIS in a stress bar; opposite-side pairs hedge (RHO_OPP).
+    # side comes from dists[mid]["side"] (set by the caller); unknown -> RHO_DEFAULT.
     if k > 1:
         prs = []
         for i, a in enumerate(firing):
             for b in firing[i + 1:]:
-                rp = _pair_rho(dists, a[1], b[1])
-                prs.append(RHO_DEFAULT if rp is None else rp)
+                sa = (dists.get(a[1]) or {}).get("side")
+                sb = (dists.get(b[1]) or {}).get("side")
+                if sa and sb:
+                    prs.append(RHO_CRISIS if sa == sb else RHO_OPP)
+                else:
+                    prs.append(RHO_DEFAULT)
         rho_bar = float(np.clip(np.mean(prs), 0.0, 0.99)) if prs else RHO_DEFAULT
     else:
         rho_bar = 0.0

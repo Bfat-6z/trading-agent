@@ -573,6 +573,9 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
     # until it is confirmed on truly out-of-sample LIVE forward-test data. Mark
     # forward_confirmed only when the shadow ledger shows >=30 fresh trades that are
     # net-positive; mech_sizing then lifts the half-size haircut for that method.
+    side_by_id = {m["id"]: m.get("side") for m in methods}
+    for mid, d in dists.items():
+        d["side"] = side_by_id.get(mid)          # side-aware crisis correlation in mech_sizing
     try:
         fstats = json.loads((ROOT / "state" / "forward_test" / "shadow_stats.json").read_text(encoding="utf-8")).get("methods", {})
         for mid, d in dists.items():

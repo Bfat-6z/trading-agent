@@ -174,27 +174,42 @@ def basic_metrics(closed: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 # statistics (deterministic seed=7)
 # ---------------------------------------------------------------------------
+def _block_len(n: int) -> int:
+    """Moving-block length ~ n**(1/3) (Kunsch rule). Crypto trade sequences are
+    autocorrelated + regime-clustered (a trending/dumping stretch yields a RUN of
+    similar-signed R). Resampling/flipping in BLOCKS of consecutive trades preserves
+    that dependence; IID resampling destroys it and reports falsely-tight CIs and
+    falsely-small p-values (Codex/gpt-5.5 review). n<=3 -> block 1 = plain IID."""
+    if n <= 3:
+        return 1
+    return max(2, min(n, int(round(n ** (1.0 / 3.0)))))
+
+
 def bootstrap_ci(rs: list[float], iters: int = DEFAULT_ITERS,
                  alpha: float = DEFAULT_ALPHA, seed: int = DEFAULT_SEED) -> tuple[float, float]:
-    """Percentile-bootstrap CI for mean(rs).
+    """Circular MOVING-BLOCK percentile-bootstrap CI for mean(rs).
 
-    WHY bootstrap: trade R distributions are fat-tailed and small-N; a normal
-    approximation would produce false confidence exactly where it hurts most.
-    Deterministic via random.Random(seed) so the scorecard is reproducible.
-    Empty input returns (0.0, 0.0) — no data, no interval. Any non-finite
-    input (NaN/inf) also returns (0.0, 0.0): NaN makes the sorted percentile
-    positions implementation-order-dependent and the resulting "interval"
-    meaningless, so we fail closed instead of emitting garbage bounds.
+    WHY block: trade R is fat-tailed AND serially dependent; resampling blocks of
+    consecutive trades keeps the autocorrelation so the interval widens honestly.
+    Deterministic via random.Random(seed). Empty/non-finite -> (0.0, 0.0) (fail
+    closed: NaN makes percentile positions order-dependent and meaningless).
     """
     n = len(rs)
     if n == 0 or iters <= 0 or not _all_finite(rs):
         return (0.0, 0.0)
+    L = _block_len(n)
     rng = random.Random(seed)
     means = []
     for _ in range(iters):
         total = 0.0
-        for _ in range(n):
-            total += rs[rng.randrange(n)]
+        filled = 0
+        while filled < n:
+            start = rng.randrange(n)
+            for j in range(L):
+                if filled >= n:
+                    break
+                total += rs[(start + j) % n]
+                filled += 1
         means.append(total / n)
     means.sort()
     lo_idx = max(0, min(iters - 1, int((alpha / 2.0) * iters)))
@@ -204,27 +219,30 @@ def bootstrap_ci(rs: list[float], iters: int = DEFAULT_ITERS,
 
 def permutation_pvalue(rs: list[float], iters: int = DEFAULT_ITERS,
                        seed: int = DEFAULT_SEED) -> float:
-    """One-sided sign-flip permutation p-value: P(mean_flipped >= mean_obs).
+    """One-sided BLOCK sign-flip permutation p-value: P(mean_flipped >= mean_obs).
 
-    Null hypothesis: R outcomes are symmetric noise around 0 (no edge), so
-    each trade's sign is a coin flip. We flip signs at random and count how
-    often luck alone matches the observed mean. Add-one smoothing
-    ((count+1)/(iters+1)) keeps p > 0 — we can never claim impossibility from
-    a finite simulation. Empty input returns 1.0 (no evidence of anything).
-    Any non-finite input (NaN/inf) also returns 1.0 (fail closed): a NaN mean
-    makes `total/n >= mean_obs` False on every iteration, which would report
-    the MINIMUM possible p-value — maximal fake significance — for garbage.
+    Null: R is dependence-preserving noise around 0. A run of correlated trades
+    shares one 'luck' draw, so we flip the sign of whole BLOCKS of consecutive
+    trades (length ~n**(1/3)), not each trade independently — independent flips
+    average out the dependence and understate p (fake significance). Add-one
+    smoothing keeps p>0. Empty/non-finite -> 1.0 (fail closed).
     """
     n = len(rs)
     if n == 0 or iters <= 0 or not _all_finite(rs):
         return 1.0
     mean_obs = sum(rs) / n
+    L = _block_len(n)
     rng = random.Random(seed)
     count = 0
     for _ in range(iters):
         total = 0.0
-        for x in rs:
-            total += x if rng.random() < 0.5 else -x
+        i = 0
+        while i < n:
+            s = 1.0 if rng.random() < 0.5 else -1.0
+            end = min(i + L, n)
+            for k in range(i, end):
+                total += s * rs[k]
+            i = end
         if total / n >= mean_obs:
             count += 1
     return (count + 1) / (iters + 1)
