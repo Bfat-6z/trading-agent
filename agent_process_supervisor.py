@@ -139,6 +139,10 @@ def specs() -> list[AgentSpec]:
         # Forward test (paper shadow-ledger for below-bar candidate methods on fresh
         # LIVE bars; owner 'cam forward-test um_reclaim_06'; promotes if edge persists)
         AgentSpec("forward_test", "forward_test.py", ("--interval", "300"), STATE_DIR / "forward_test.pid", STATE_DIR / "forward_test_heartbeat.json", 1200),
+        # Lane farm (owner: '10 kênh trade, mỗi kênh 100u, rút tổng hợp bài học') —
+        # 10 parallel paper experiment lanes incl. a random-entry control; feeds
+        # trade_autopsy/lesson mining; paper-only, mission untouched.
+        AgentSpec("lane_farm", "lane_farm.py", ("--interval", "300"), STATE_DIR / "lane_farm.pid", STATE_DIR / "lane_farm_heartbeat.json", 1200),
         AgentSpec("counterfactual_replay_agent", "counterfactual_replay_agent.py", ("--interval-seconds", "300"), STATE_DIR / "counterfactual_replay_agent.pid", STATE_DIR / "counterfactual_replay_agent_heartbeat.json", 900),
         AgentSpec("learning_exam_benchmark", "learning_exam_benchmark.py", ("--interval-seconds", "3600"), STATE_DIR / "learning_exam_benchmark.pid", STATE_DIR / "learning_exam_benchmark_heartbeat.json", 4500),
         AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),
