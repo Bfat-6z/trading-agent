@@ -73,8 +73,14 @@ def validate_method(m: dict[str, Any]) -> dict[str, Any] | None:
             return None
         # strip markup chars — proposed text reaches the dashboard via innerHTML
         _cln = lambda x: str(x).replace("<", "").replace(">", "").replace("&", " ")
-        return {"id": _cln(mid), "name": _cln(m.get("name", mid))[:60], "desc": _cln(m.get("desc", ""))[:160],
-                "side": side, "when": clean, "sl_pct": round(sl, 2), "tp_pct": round(tp, 2)}
+        out = {"id": _cln(mid), "name": _cln(m.get("name", mid))[:60], "desc": _cln(m.get("desc", ""))[:160],
+               "side": side, "when": clean, "sl_pct": round(sl, 2), "tp_pct": round(tp, 2)}
+        # optional family label (metadata, NOT part of the novelty hash): conditions
+        # the exit grid in deep_validation (MR vs momentum exits behave oppositely).
+        fam = str(m.get("family") or "").strip().lower()
+        if fam in ("mr", "momentum", "squeeze", "breakout", "flow"):
+            out["family"] = fam
+        return out
     except Exception:
         return None
 
@@ -125,7 +131,7 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
             "(you are NOT trading). Encode real, commonly-shared trading ideas (trend-following, mean-reversion, "
             "breakout, pullback, divergence-proxy, volume-confirmation, regime filters) as a strict JSON DSL. "
             f"Return ONLY a JSON array of {k} method objects. Each: {{id, name, desc, side:'LONG'|'SHORT', "
-            "when:[{feat,op,val}...], sl_pct, tp_pct}}. Allowed feat: rsi14, px_vs_ema20, px_vs_ema50, "
+            "when:[{feat,op,val}...], sl_pct, tp_pct, family:'mr'|'momentum'|'squeeze'}}. Allowed feat: rsi14, px_vs_ema20, px_vs_ema50, "
             "px_vs_ema200 (percent above/below EMA), ema_stack (-1 bear / 0 / 1 bull), vol_ratio (x vs 20-bar avg), "
             "ret5, ret20 (percent). Allowed op: <,<=,>,>=,==. Use 1-4 conditions, sl_pct 0.5-4, tp_pct 1-8, and "
             "aim for tp_pct >= 1.5*sl_pct. Be creative and DIVERSE — combine features across families. Do NOT "

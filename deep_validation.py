@@ -65,18 +65,37 @@ def methods_all() -> list[dict]:
     return list(by_id.values())
 
 
-def _combos() -> list[tuple[float, float, int]]:
+def _combos(timeouts: list[int]) -> list[tuple[float, float, int]]:
     out = []
     for sl in SL_GRID:
         for tp in TP_GRID:
             if tp < 1.3 * sl:            # keep a sane reward:risk, skip degenerate combos
                 continue
-            for to in TIMEOUT_GRID:
+            for to in timeouts:
                 out.append((sl, tp, to))
     return out
 
 
-COMBOS = _combos()
+COMBOS = _combos(TIMEOUT_GRID)
+# Family-conditioned exit grids (harvest playbook #4, Kaminski & Lo: stops/exits
+# behave OPPOSITELY for mean-reversion vs momentum — an unconditioned grid averages
+# two opposing effects). Methods may carry an optional `family` label:
+#   mr        -> tight TIME exits (the reversion either happens fast or was wrong)
+#   momentum  -> longer holds (let the trend breathe)
+# unlabeled  -> default grid (no penalty for missing metadata).
+# NOTE (Run B falsification): capitulation_long under a tight-only MR grid {8,16}
+# collapsed on the lockbox (+0.61R/p=0.012 at TO48 -> +0.16R/p=0.135 at TO8) — this
+# 15m capitulation needs ~12h to mean-revert. So 'mr' CONDITIONS the grid by ADDING
+# tight exits to test, it never REMOVES the long ones (superset, data decides).
+FAMILY_TIMEOUTS = {"mr": [8, 16, 48], "momentum": [16, 48], "squeeze": [8, 16, 48]}
+_COMBO_CACHE: dict[str, list[tuple[float, float, int]]] = {}
+
+
+def combos_for(method: dict) -> list[tuple[float, float, int]]:
+    fam = str(method.get("family") or "")
+    if fam not in _COMBO_CACHE:
+        _COMBO_CACHE[fam] = _combos(FAMILY_TIMEOUTS.get(fam, TIMEOUT_GRID))
+    return _COMBO_CACHE[fam]
 
 
 def fire_bars(rows: list[dict], method: dict) -> list[int]:
@@ -90,13 +109,20 @@ def trades_for_combo(rows: list[dict], fires: list[int], side: str,
                      lo: int, hi: int) -> list[dict]:
     """Replay the SAME no-lookahead fill as method_lab.backtest_method (SL before TP,
     pessimistic, timeout-at-close, no overlapping positions) for one exit combo, over
-    fires whose entry bar is in [lo, hi)."""
+    fires whose entry bar is in [lo, hi).
+
+    PURGE/EMBARGO (harvest playbook #2, López-de-Prado purged-CV): a label window
+    spans up to `timeout` bars, so an entry near a split boundary would have its
+    OUTCOME computed from the NEXT segment's bars — train selection would peek into
+    OOS, and OOS-select would peek into the lockbox (the lockbox was not fully
+    untouched). Entries are eligible only if the whole window fits inside the
+    segment (i + timeout < hi). Block bootstrap cannot fix this class of leak."""
     slf, tpf = sl_pct / 100.0, tp_pct / 100.0
     n = len(rows)
     out = []
     last_exit = -1
     for i in fires:
-        if i < lo or i >= hi or i <= last_exit:
+        if i < lo or i + timeout >= hi or i <= last_exit:
             continue
         entry = rows[i]["close"]
         if side == "LONG":
@@ -172,9 +198,9 @@ def main() -> None:
                 fires = fire_bars(rows, m)
                 if not fires:
                     continue
-                # Fix 1+2: pick (sl,tp,timeout) on TRAIN only
+                # Fix 1+2: pick (sl,tp,timeout) on TRAIN only (grid family-conditioned)
                 best, best_mr = None, None
-                for (sl, tp, to) in COMBOS:
+                for (sl, tp, to) in combos_for(m):
                     tr = trades_for_combo(rows, fires, side, sl, tp, to, 200, train_end)
                     if len(tr) < MIN_TRAIN_TRADES:
                         continue
@@ -256,6 +282,35 @@ def main() -> None:
                            and (r.get("lockbox_n") or 0) >= 100
                            and (r.get("lockbox_mean_r") or 0) > 0
                            and (r["oos_mean_r"] or 0) > 0)
+
+    # Fix #3 (harvest playbook): deflate p-values against the CUMULATIVE registry
+    # trial count — BH-FDR corrects per-batch only; best-of-N over an ever-growing
+    # registry is spuriously significant as N grows. Šidák: p_defl = 1-(1-p)^N.
+    # Two honest denominators: N_reg = every trial ever (brutal upper bound) and
+    # N_lb = only trials that actually faced a lockbox (the arming decision's real
+    # multiplicity). INFORMATIONAL columns — surfaced, never auto-disarm.
+    try:
+        import brain as _brain
+        _c = _brain.connect(readonly=True)
+        n_reg = _c.execute("SELECT COUNT(*) FROM trials").fetchone()[0] + len(results)
+        n_lb = _c.execute("SELECT COUNT(*) FROM trials WHERE lockbox_n>=30").fetchone()[0] \
+            + sum(1 for r in results if (r.get("lockbox_n") or 0) >= 30)
+        _c.close()
+    except Exception:
+        n_reg, n_lb = len(results), sum(1 for r in results if (r.get("lockbox_n") or 0) >= 30)
+
+    def _sidak(p, n):
+        if p is None or n <= 0:
+            return None
+        try:
+            return round(min(1.0, 1.0 - (1.0 - float(p)) ** n), 6)
+        except Exception:
+            return None
+
+    for r in results:
+        r["pvalue_defl_reg"] = _sidak(r.get("pvalue"), n_reg)
+        r["lockbox_pvalue_defl"] = _sidak(r.get("lockbox_pvalue"), n_lb)
+    print(json.dumps({"dsr_denominators": {"n_registry": n_reg, "n_lockbox_exposed": n_lb}}))
 
     dist = {}
     for r in results:

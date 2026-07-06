@@ -58,7 +58,7 @@ SEED_METHODS = [
      "desc": "Long deep RSI<22 + high volume flush (mean-revert the panic)",
      "side": "LONG", "when": [{"feat": "rsi14", "op": "<", "val": 22},
                               {"feat": "vol_ratio", "op": ">", "val": 1.8}],
-     "sl_pct": 2.5, "tp_pct": 4.0},
+     "sl_pct": 2.5, "tp_pct": 4.0, "family": "mr"},
 
     # --- OWNER'S METHOD: 4h EMA cross -> "kieu gi cung dump" (short the cross) ---
     {"id": "owner_4h_death_cross_short", "name": "Owner 4h death-cross short",
