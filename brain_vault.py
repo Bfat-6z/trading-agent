@@ -8,6 +8,7 @@ lessons so Obsidian's graph shows the real relationships. Owner (2026-07-06):
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import brain
@@ -114,8 +115,7 @@ def render_auto() -> None:
                             "IS NOT NULL ORDER BY created_at DESC LIMIT 1", (mid,)).fetchone()
             dw = None
             try:
-                import json as _j
-                dd = _j.loads((ROOT / "state" / "method_lab" / "survivor_distributions.json")
+                dd = json.loads((ROOT / "state" / "method_lab" / "survivor_distributions.json")
                               .read_text(encoding="utf-8")).get(mid) or {}
                 dw = dd.get("win")
             except Exception:

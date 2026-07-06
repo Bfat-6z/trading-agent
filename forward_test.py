@@ -183,8 +183,10 @@ def resolve_open(client, now_ms: int, hashes: dict[str, str] | None = None) -> i
                     fn = f"{p['symbol']}_{ex_ts}.png"
                     (cdir / fn).write_bytes(_b64.b64decode(b64))
                     rec["chart"] = f"charts/{fn}"
-            except Exception:
-                pass
+                else:
+                    print(json.dumps({"chart_render_none": p.get("symbol")}))
+            except Exception as _ce:
+                print(json.dumps({"chart_error": repr(_ce)[:120]}))
             _append(CLOSED, rec)
             try:                            # second brain: numbers-only autopsy row
                 import brain
@@ -318,7 +320,17 @@ def _pid_alive(pid: int) -> bool:
         code = ctypes.c_ulong()
         ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
         ctypes.windll.kernel32.CloseHandle(h)
-        return bool(ok) and code.value == 259          # STILL_ACTIVE
+        alive = bool(ok) and code.value == 259         # STILL_ACTIVE
+        if not alive:
+            return False
+        # pid-reuse guard (Codex): a recycled pid on an UNRELATED process must not
+        # block startup forever — require the image to actually be python.
+        buf = ctypes.create_unicode_buffer(512)
+        ln = ctypes.c_ulong(512)
+        h2 = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        okn = ctypes.windll.kernel32.QueryFullProcessImageNameW(h2, 0, buf, ctypes.byref(ln))
+        ctypes.windll.kernel32.CloseHandle(h2)
+        return (not okn) or ("python" in buf.value.lower())
     except Exception:
         return False
 

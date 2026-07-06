@@ -1277,8 +1277,9 @@ def resolve(client: Any, now_ms: int) -> int:
                 fn = f"{p['symbol']}_{exit_ts}.png"
                 (cdir / fn).write_bytes(_b64.b64decode(b64))
                 rec["chart_exit"] = f"charts_closed/{fn}"
-        except Exception:
-            pass
+        except Exception as _ce:
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "chart_error", "symbol": p.get("symbol"), "error": repr(_ce)[:120]})
         _append(CLOSED, rec)
         _append(MEMORY, rec)   # self-learning: outcome tagged by context
         try:                    # second brain: mission closes feed lesson mining too
