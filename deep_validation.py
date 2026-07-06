@@ -46,6 +46,13 @@ SL_GRID = [1.0, 1.5, 2.5]
 TP_GRID = [2.5, 4.0, 6.0]
 TIMEOUT_GRID = [16, 48]                 # 4h, 12h — let slow/trend methods breathe
 MIN_TRAIN_TRADES = 20                   # need enough train fires to pick params honestly
+# FIXED-EXITS mode (refinement variants): selective children of a validated parent
+# fire too rarely per coin to re-select exits on train (grid skips them entirely).
+# The honest alternative: inherit the parent's ALREADY-VALIDATED exits verbatim —
+# zero exit-selection multiplicity, train window unused, OOS+lockbox still purged.
+# DEEP_FIXED_EXITS="sl,tp,to" applies to every method in the run.
+_FX = os.environ.get("DEEP_FIXED_EXITS", "").strip()
+FIXED_EXITS = tuple(float(x) if i < 2 else int(x) for i, x in enumerate(_FX.split(","))) if _FX else None
 
 
 def methods_all() -> list[dict]:
@@ -197,6 +204,14 @@ def main() -> None:
                 side = m.get("side", "LONG")
                 fires = fire_bars(rows, m)
                 if not fires:
+                    continue
+                if FIXED_EXITS:
+                    best = FIXED_EXITS               # inherited, pre-specified — no selection
+                    combo_votes[m["id"]][best] = combo_votes[m["id"]].get(best, 0) + 1
+                    oos_agg[m["id"]].extend(
+                        trades_for_combo(rows, fires, side, best[0], best[1], best[2], train_end, oos_end))
+                    lockbox_agg[m["id"]].extend(
+                        trades_for_combo(rows, fires, side, best[0], best[1], best[2], oos_end, n))
                     continue
                 # Fix 1+2: pick (sl,tp,timeout) on TRAIN only (grid family-conditioned)
                 best, best_mr = None, None

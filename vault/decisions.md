@@ -35,3 +35,6 @@ updated: 2026-07-06
 - um_pb_02: lockbox $15M giữ (p=0.007) nhưng $50M mẫu mỏng (n=60) → forward-test phán.
 - Baseline-relative lesson promotion (Codex đề xuất) — chờ mẫu lớn hơn.
 - Behavioral/correlation hash chống semantic-dup — blueprint item #6.
+
+## 2026-07-06 (vòng winrate)
+20. **ARM wr_flush_notknife (đứng trước capitulation).** Nguồn gốc: harvest 10-agent + mining 1.104 fires của chính mình. Cơ chế: đòi climax thật (bar_z≤−2) + chặn sập-giai-đoạn-cuối (dd96≤18%). Validation fixed-exit (kế thừa SL1/TP6/TO48 — zero exit-multiplicity, purged): lockbox +1.16R net+80% p=0.0002, cả 2 segment dương, sống Šidák toàn-lockbox-exposure. Win 45.8% vs cha 32.9%, mean 6×. Bài học đối chứng: folklore web (Connors-uptrend, nến búa) chết/mâu thuẫn — data mình + lockbox là trọng tài duy nhất. bear_noasia + deep15 → forward-watch.
