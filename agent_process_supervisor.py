@@ -154,7 +154,9 @@ def specs() -> list[AgentSpec]:
         # CUT (gpt-5.5 review 2026-07-05): 'complexity factory' + ran with --apply (autonomous
         # self-modification) for no measured edge; 0 mission deps. Re-add to revive.
         # AgentSpec("skill_forge_agent", "skill_forge_agent.py", ("--interval-seconds", "1800", "--apply"), STATE_DIR / "skill_forge_agent.pid", STATE_DIR / "skill_forge_agent_heartbeat.json", 2700),
-        AgentSpec("self_improvement_agent", "self_improvement_agent.py", ("--interval-hours", "6"), STATE_DIR / "self_improvement_agent.pid", STATE_DIR / "self_improvement_agent_heartbeat.json", 28800),
+        # CUT (post-ship sweep 2026-07-06): its food chain is gone — it consumed
+        # reflection_agent's profile.json (cut) and fed self_model (cut). Theater tier.
+        # AgentSpec("self_improvement_agent", "self_improvement_agent.py", ("--interval-hours", "6"), STATE_DIR / "self_improvement_agent.pid", STATE_DIR / "self_improvement_agent_heartbeat.json", 28800),
         AgentSpec("daily_exam_agent", "daily_exam_agent.py", ("--check-seconds", "300"), STATE_DIR / "daily_exam_agent.pid", STATE_DIR / "daily_exam_agent_heartbeat.json", 900),
     ]
 
