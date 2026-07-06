@@ -298,8 +298,23 @@ def main() -> None:
     ap.add_argument("--interval", type=float, default=300.0)
     a = ap.parse_args()
     from tradingagents.binance.client import spot_client
+    # SINGLE-INSTANCE guard (post-sweep fix): the supervisor once double-spawned
+    # this agent in the same second; two instances racing the shadow ledger would
+    # duplicate trades. If the pid file points at a LIVE other process, exit.
+    pid_f = ROOT / "state" / "forward_test.pid"
     try:
-        (ROOT / "state" / "forward_test.pid").write_text(str(os.getpid()), encoding="utf-8")
+        old = int(pid_f.read_text(encoding="utf-8").strip())
+        if old and old != os.getpid():
+            try:
+                os.kill(old, 0)                    # raises if dead
+                print(json.dumps({"exit": "another forward_test alive", "pid": old}))
+                return
+            except OSError:
+                pass                                # stale pid -> we take over
+    except Exception:
+        pass
+    try:
+        pid_f.write_text(str(os.getpid()), encoding="utf-8")
     except Exception:
         pass
     client = spot_client()
