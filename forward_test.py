@@ -306,6 +306,23 @@ def run_once(client) -> dict:
     return {"opened": opened, "closed": closed_n, "stats": stats}
 
 
+def _pid_alive(pid: int) -> bool:
+    """Windows-safe liveness probe. NEVER use os.kill(pid, 0) here: on Windows
+    that calls TerminateProcess (kills the peer!) — the original guard was
+    murdering the incumbent and the supervisor kept respawning doubles."""
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return bool(ok) and code.value == 259          # STILL_ACTIVE
+    except Exception:
+        return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Forward-test candidate methods (paper shadow ledger)")
     ap.add_argument("--once", action="store_true")
@@ -318,13 +335,9 @@ def main() -> None:
     pid_f = ROOT / "state" / "forward_test.pid"
     try:
         old = int(pid_f.read_text(encoding="utf-8").strip())
-        if old and old != os.getpid():
-            try:
-                os.kill(old, 0)                    # raises if dead
-                print(json.dumps({"exit": "another forward_test alive", "pid": old}))
-                return
-            except OSError:
-                pass                                # stale pid -> we take over
+        if old and old != os.getpid() and _pid_alive(old):
+            print(json.dumps({"exit": "another forward_test alive", "pid": old}))
+            return
     except Exception:
         pass
     try:
