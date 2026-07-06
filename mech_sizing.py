@@ -42,7 +42,13 @@ RHO_DEFAULT = 0.7      # assume high correlation when co-fire data is thin (safe
 # NOT inflate the divisor. rho: same side -> RHO_CRISIS, opposite -> RHO_OPP.
 RHO_CRISIS = float(os.environ.get("MECH_RHO_CRISIS", "0.85"))   # same-direction co-fire in a stress move
 RHO_OPP = float(os.environ.get("MECH_RHO_OPP", "0.0"))          # long vs short = hedged, not additive
-PER_POS_CAP = float(os.environ.get("MECH_PER_POS_CAP", "0.25"))   # max margin fraction per position
+# Single-position ruin backstop. Liquidation loses the WHOLE margin (the Kelly
+# distribution is computed on backtest net% that assume the SL fills at its nominal
+# %, so it never saw the gap-through-to-liq tail), therefore PER_POS_CAP *is* the
+# max fraction of the book one gapped trade can cost. 0.25 let a single HMSTR flush
+# gap -13.6% through a 1% stop to liquidation for -25% of equity in ONE trade
+# (2026-07-06). 0.10 bounds any single liquidation to a tenth of the book.
+PER_POS_CAP = float(os.environ.get("MECH_PER_POS_CAP", "0.10"))   # max margin fraction per position
 GROSS_EXP_CAP = float(os.environ.get("MECH_GROSS_EXP_CAP", "3.0"))  # max sum(notional/equity); a ~12% synced gap costs <=~36% equity
 MIN_MARGIN = 0.01      # below this -> skip (NO hard minimum-size floor)
 MIN_TRADES = 30        # untrusted sample -> don't fire

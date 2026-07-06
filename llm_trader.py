@@ -455,6 +455,17 @@ def _survivor_methods() -> list[dict[str, Any]]:
         return []
 
 
+# Reject a proven fire when liquidation is closer than this many ATRs (ruin control;
+# see the gate below). 3.0 -> at x10 (~10% to liq) any coin with atr_pct > ~3.3% is
+# refused, the volatility band where a single flush gaps the stop straight to liq.
+GAP_LIQ_ATR_MULT = float(os.environ.get("MECH_GAP_LIQ_ATR_MULT", "3.0"))
+# The mechanical path trades a single fixed leverage (owner: max conviction, x10).
+# Bind the gate's liquidation distance AND the sizer to the SAME value so they can
+# never drift apart — a hardcoded 10 in one place and a x5 sizer would wrong-sign
+# the gate (Codex review point a). ~100/lev % is the naive liq distance at `lev`.
+MECH_LEV = int(os.environ.get("MECH_LEV", "10"))
+
+
 def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """PROVEN-ONLY decide: fire a trade ONLY where a lab-survivor method's DSL
     condition holds on the coin's live CLOSED bars — evaluated with method_lab's
@@ -478,6 +489,21 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
             continue
         for m in methods:
             if ml.method_fires(row, m):
+                # GAP-RISK GATE (ruin control, 2026-07-06 HMSTR liquidation -$14.33 =
+                # the entire day's loss). Sizing's Kelly is fit on backtest net% that
+                # ASSUME the SL fills at its nominal % — it never saw the gap-through-
+                # to-liquidation tail. On a high-ATR coin, liquidation (~100/lev % away)
+                # is only a couple of noise-bars away and a single flush candle blows
+                # past the 1% stop straight to liq. Refuse the fire when liquidation is
+                # closer than GAP_LIQ_ATR_MULT ATRs. atr_pct is a feature_frame column.
+                _atr = float(row.get("atr_pct") or 0.0)
+                _liq_dist = 100.0 / MECH_LEV                  # x10 -> ~10% to liquidation
+                if _atr > 0 and _atr * GAP_LIQ_ATR_MULT > _liq_dist:
+                    _append(LT_DIR / "governance.jsonl",
+                            {"event": "gate_block_gap_risk", "symbol": c["symbol"],
+                             "method": m["id"], "atr_pct": _atr, "liq_dist_pct": _liq_dist,
+                             "mult": GAP_LIQ_ATR_MULT})
+                    continue
                 # LESSON GATE (second brain P4, Codex ship-gate): tiered.
                 # 'active' (eff_n>=12 clusters + mission cohort negative) = HARD
                 # veto; 'advisory' (pooled-negative only) = logged, NOT blocked —
@@ -533,7 +559,7 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                                           and (fs.get("mean_r") or 0) > 0)
     except Exception:
         pass
-    sized = {(o["coin"], o["method"]): o for o in msz.size_fires(fires, dists, lev=10)}
+    sized = {(o["coin"], o["method"]): o for o in msz.size_fires(fires, dists, lev=MECH_LEV)}
     out = []
     for (sym, mid) in fires:
         o = sized.get((sym, mid))
@@ -552,7 +578,7 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
             _feats = {k: row.get(k) for k in LESSON_FEATS if row.get(k) is not None}
         except Exception:
             _feats = None
-        out.append({**c, "action": m.get("side", "LONG"), "leverage": 10,
+        out.append({**c, "action": m.get("side", "LONG"), "leverage": MECH_LEV,
                     "size_pct": o["margin_pct"], "sl_pct": _slp, "tp_pct": _tpp, "entry_px": None,
                     "_mech": True, "_max_hold": int(m.get("timeout") or 16), "_chart_b64": chart,
                     "_mech_method": m["id"], "_entry_feats": _feats,
