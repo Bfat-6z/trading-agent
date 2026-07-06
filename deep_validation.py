@@ -303,7 +303,9 @@ def main() -> None:
         if p is None or n <= 0:
             return None
         try:
-            return round(min(1.0, 1.0 - (1.0 - float(p)) ** n), 6)
+            import math
+            # -expm1(n*log1p(-p)) == 1-(1-p)^n but stays precise for tiny p (Codex nit)
+            return round(min(1.0, -math.expm1(n * math.log1p(-min(float(p), 1.0 - 1e-15)))), 6)
         except Exception:
             return None
 

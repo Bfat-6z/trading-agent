@@ -26,6 +26,11 @@ updated: 2026-07-06
 14. **MCP server hoãn** — brain_query.py CLI cover 100% nhu cầu, 0 dependency.
 15. **Obsidian vault này** = narrative layer cho Claude + view cho sếp. Số liệu vẫn chỉ ở brain.db, vault/auto/ là RENDER read-only.
 
+16. **Purge/embargo tại biên split** (harvest playbook #2): label window từng xuyên biên → train peek OOS, OOS peek lockbox. Vá xong; **capitulation SỐNG SÓT purge** (lockbox +0.61→0.72R, p≈0.009-0.012) = edge thật, không phải leak. Block bootstrap không chữa được leak loại này — purge là bắt buộc.
+17. **Family exit-grid = SUPERSET, không bao giờ bớt** — Run B bác thuyết "MR cần timeout chặt" cho capitulation (TO8 sập lockbox). Grid theo family chỉ THÊM exit để test, data quyết. Armed params SL1/TP6/TO48 tái xác nhận (Run C).
+18. **DSR 2 mẫu số** (registry ~705 + lockbox-exposed): cột thông tin, không auto-tước. capitulation lb_p_defl ≈ 0.13-0.17 = "hứa hẹn đã xác nhận 2 lần", chưa phải chắc chắn — nói thật với chính mình.
+19. **Harvest có não ≠ harvest cũ**: 51/51 candidate mới thật (0 rebrand nhờ nghĩa địa trong prompt) nhưng 0 robust — sweep-reclaim/SMC folklore thua đo được trên nghìn lệnh. Giá trị thật của vòng cào = playbook engineering, không phải method.
+
 ## Đang mở (chưa quyết)
 - um_pb_02: lockbox $15M giữ (p=0.007) nhưng $50M mẫu mỏng (n=60) → forward-test phán.
 - Baseline-relative lesson promotion (Codex đề xuất) — chờ mẫu lớn hơn.
