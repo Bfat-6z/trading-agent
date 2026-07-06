@@ -290,11 +290,14 @@ def render_trade_chart(symbol: str, bars: Sequence[dict[str, Any]], *, side: str
             i_out = len(ts) - 1
         lo = max(0, i_in - 28)
         hi = min(len(bars), i_out + 9)
-        win = list(bars[lo:hi])
+        # pass FULL history up to `hi` and let render_chart crop the view: EMAs are
+        # computed over the whole series then cropped, so EMA50/200 stay REAL. Slicing
+        # first fed ~37 bars into the EMA -> the overlay lines were garbage (self-audit).
+        win = list(bars[:hi])
         ent_kind, ex_kind = ("buy", "sell") if side == "LONG" else ("sell", "buy")
         pnl = (exit_px / entry_px - 1) * (1 if side == "LONG" else -1) * 100
         return render_chart(
-            symbol, win, tf=tf, lookback=len(win),
+            symbol, win, tf=tf, lookback=hi - lo,
             hlines=[(float(entry_px), f"in {entry_px:.4g}", "#f0b90b"),
                     (float(exit_px), f"out {exit_px:.4g}", "#26a69a" if pnl >= 0 else "#ef5350")],
             markers=[(int(bars[i_in].get("ts_ms") or 0), float(entry_px), ent_kind),
