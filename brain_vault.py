@@ -63,23 +63,44 @@ def render_auto() -> None:
             body += f"| {r['source']} | {r['n']} | {r['d']} |\n"
         _w("trials-stats.md", body)
 
-        # per-armed method note (deep dive + wikilinks to lessons)
-        (AUTO / "methods").mkdir(parents=True, exist_ok=True)
-        for r in rows:
-            mid = r["method_id"]
-            t = con.execute("SELECT * FROM trials WHERE method_id=? ORDER BY created_at DESC LIMIT 5",
+        # ONE NOTE PER METHOD EVER TESTED (239+): the graph becomes the real brain
+        # web — every idea, dead or alive, is a node linking its verdict + family.
+        armed_ids = {r["method_id"] for r in rows}
+        mdir = AUTO / "methods"
+        mdir.mkdir(parents=True, exist_ok=True)
+        mids = [x[0] for x in con.execute(
+            "SELECT DISTINCT method_id FROM trials WHERE method_id IS NOT NULL")]
+        for mid in mids:
+            t = con.execute("SELECT * FROM trials WHERE method_id=? ORDER BY created_at DESC",
                             (mid,)).fetchall()
-            b = f"# {mid}\n\nstate: **{r['state']}** (từ {r['valid_at']})\n\n## 5 trial gần nhất\n" \
-                "| when | source | verdict | oosN | meanR | p | lockbox p |\n|---|---|---|---|---|---|---|\n"
-            for x in t:
-                b += (f"| {x['created_at']} | {x['source']} | {x['verdict']} | {x['oos_n']} | "
-                      f"{x['oos_mean_r']} | {x['pvalue']} | {x['lockbox_pvalue']} |\n")
+            latest = t[0]
+            status = "armed" if mid in armed_ids else (
+                "dead" if any(x["verdict"] == "DEAD" for x in t) and latest["verdict"] != "LOCKBOX_PASS"
+                else ("lockbox-pass" if latest["verdict"] == "LOCKBOX_PASS" else "pending"))
+            fam = latest["family"] or "unlabeled"
+            fm = (f"---\ntags: [method, {status}, {fam}, "
+                  f"{(latest['side'] or 'NA').lower()}]\n---\n\n")
+            b = f"# {mid}\n\n**{status.upper()}** · side {latest['side']} · family {fam} · {len(t)} trial(s)\n\n"
+            b += "| when | source | tf | verdict | fail | oosN | meanR | p | lb_p |\n|---|---|---|---|---|---|---|---|---|\n"
+            for x in t[:8]:
+                b += (f"| {x['created_at'][:10]} | {x['source']} | {x['timeframe']} | {x['verdict']} | "
+                      f"{x['failure_mode'] or ''} | {x['oos_n']} | {x['oos_mean_r']} | {x['pvalue']} | {x['lockbox_pvalue']} |\n")
             a = con.execute(
                 "SELECT COUNT(*) n, SUM(net>0) w, AVG(r) ar FROM trade_autopsy WHERE method_id=?",
                 (mid,)).fetchone()
-            b += (f"\n## Autopsy\nn={a['n']} wins={a['w']} avgR={round(a['ar'], 3) if a['ar'] is not None else None}\n"
-                  f"\nLiên quan: [[auto/lessons]] · [[validation-pipeline]] · [[sizing]]\n")
-            (AUTO / "methods" / f"{mid}.md").write_text(_HDR + b, encoding="utf-8")
+            if a["n"]:
+                b += f"\nAutopsy: n={a['n']} wins={a['w']} avgR={round(a['ar'], 3) if a['ar'] is not None else None}\n"
+            link = "[[auto/armed]]" if status == "armed" else "[[auto/graveyard]]" if status == "dead" else "[[auto/trials-stats]]"
+            b += f"\n{link} · [[validation-pipeline]] · [[auto/lessons]]\n"
+            (mdir / f"{mid}.md").write_text(fm + _HDR + b, encoding="utf-8")
+
+        # mission + shadow trade history (numbers view)
+        tr = con.execute("SELECT * FROM trade_autopsy ORDER BY created_at DESC LIMIT 40").fetchall()
+        body = "# Trade autopsies (40 gần nhất)\n\n| when | src | method | sym | side | net | r | mae% | mfe% | exit |\n|---|---|---|---|---|---|---|---|---|---|\n"
+        for x in tr:
+            body += (f"| {x['created_at'][:16]} | {x['src']} | [[auto/methods/{x['method_id']}|{x['method_id']}]] | "
+                     f"{x['symbol']} | {x['side']} | {x['net']} | {x['r']} | {x['mae_pct']} | {x['mfe_pct']} | {x['exit_reason']} |\n")
+        _w("trades.md", body)
     finally:
         con.close()
 

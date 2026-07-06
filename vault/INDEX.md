@@ -16,11 +16,24 @@ updated: 2026-07-06
 - [[sizing]] — mech_sizing: Kelly + haircut + crisis-correlation
 - [[codex-plugin]] — playbook dùng Codex review (đã fix 1312, file-access OK)
 
+## Bài học xương máu (curated)
+- [[lessons/llm-khong-co-edge]] — vì sao PROVEN_ONLY tồn tại (p=0.9998)
+- [[lessons/overfit-va-lockbox]] — chuyện S_QUIET_BEAR_COIL + 3 lớp tự-lừa
+- [[lessons/universe-dao-roi]] — vì sao floor $50M (−$30 học phí)
+- [[lessons/trade-thu-cong]] — 10 lỗi trade tay + nguyên tắc A+ (di sản 05/2026)
+
+## Kho research (full-text)
+- [[research/second-brain-blueprint]] — 15-agent research + blueprint (136k chữ)
+- [[research/codebase-recon]] — recon 5-agent trước khi build
+- [[harvest-2026-07-06]] — playbook engineering + 87 insights
+
 ## Số liệu sống (auto-render từ brain.db — ĐỪNG SỬA TAY)
 - [[auto/armed]] — method đang được đánh tiền mission
 - [[auto/lessons]] — 6 bài học pre-registered + trạng thái 3 bậc
 - [[auto/graveyard]] — nghĩa địa idea chết (chống re-test)
+- [[auto/trades]] — 40 autopsy gần nhất (mission + shadow)
 - [[auto/trials-stats]] — bộ đếm DSR
+- `auto/methods/` — **một note cho TỪNG method từng test (239+)** — mở Graph view để thấy cả mạng não
 
 ## Luật bất biến (tóm tắt — chi tiết trong [[system-map]])
 1. **PAPER-ONLY vĩnh viễn** — live LOCKED, không bao giờ gọi order thật.
