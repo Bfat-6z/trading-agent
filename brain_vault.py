@@ -94,6 +94,42 @@ def render_auto() -> None:
             b += f"\n{link} · [[validation-pipeline]] · [[auto/lessons]]\n"
             (mdir / f"{mid}.md").write_text(fm + _HDR + b, encoding="utf-8")
 
+        # ARENA (owner goal): methods are never killed — they compete. This table
+        # compares every armed/watch method's BACKTEST claim vs its LIVE record
+        # (shadow + mission autopsies) side by side: "áp thử nhiều pp, cái nào
+        # winrate cao nhất" — with the honest split between promise and proof.
+        try:
+            watch = json.loads((ROOT / "state" / "method_lab" / "forward_watch.json")
+                               .read_text(encoding="utf-8")).get("candidates", [])
+        except Exception:
+            watch = []
+        arena_ids = [r["method_id"] for r in rows] + [c.get("id") for c in watch]
+        body = ("# ⚔️ ARENA — so găng method (backtest vs LIVE)\n\n"
+                "| method | vai | lockbox_p | bt_win | live_n | live_win | live_avgR |\n"
+                "|---|---|---|---|---|---|---|\n")
+        for mid in dict.fromkeys(arena_ids):
+            if not mid:
+                continue
+            t = con.execute("SELECT lockbox_pvalue FROM trials WHERE method_id=? AND lockbox_pvalue "
+                            "IS NOT NULL ORDER BY created_at DESC LIMIT 1", (mid,)).fetchone()
+            dw = None
+            try:
+                import json as _j
+                dd = _j.loads((ROOT / "state" / "method_lab" / "survivor_distributions.json")
+                              .read_text(encoding="utf-8")).get(mid) or {}
+                dw = dd.get("win")
+            except Exception:
+                pass
+            a = con.execute("SELECT COUNT(*) n, SUM(net>0) w, AVG(r) ar FROM trade_autopsy "
+                            "WHERE method_id=?", (mid,)).fetchone()
+            role = "ARMED" if mid in {r["method_id"] for r in rows} else "watch"
+            lw = round(a["w"] / a["n"], 3) if a["n"] else None
+            body += (f"| [[auto/methods/{mid}\\|{mid}]] | {role} | {t[0] if t else None} | {dw} | "
+                     f"{a['n']} | {lw} | {round(a['ar'], 3) if a['ar'] is not None else None} |\n")
+        body += ("\nLuật: backtest chỉ là LỜI HỨA; cột live là BẰNG CHỨNG. Method lên "
+                 "hạng ARMED khi lockbox giữ; mất ghế khi live phản bội số hứa.\n")
+        _w("arena.md", body)
+
         # mission + shadow trade history (numbers view)
         tr = con.execute("SELECT * FROM trade_autopsy ORDER BY created_at DESC LIMIT 40").fetchall()
         body = "# Trade autopsies (40 gần nhất)\n\n| when | src | method | sym | side | net | r | mae% | mfe% | exit |\n|---|---|---|---|---|---|---|---|---|---|\n"
