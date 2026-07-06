@@ -71,13 +71,13 @@ def render_auto() -> None:
         mids = [x[0] for x in con.execute(
             "SELECT DISTINCT method_id FROM trials WHERE method_id IS NOT NULL")]
         for mid in mids:
-            t = con.execute("SELECT * FROM trials WHERE method_id=? ORDER BY created_at DESC",
-                            (mid,)).fetchall()
+            t = [dict(x) for x in con.execute(
+                "SELECT * FROM trials WHERE method_id=? ORDER BY created_at DESC", (mid,))]
             latest = t[0]
             status = "armed" if mid in armed_ids else (
                 "dead" if any(x["verdict"] == "DEAD" for x in t) and latest["verdict"] != "LOCKBOX_PASS"
                 else ("lockbox-pass" if latest["verdict"] == "LOCKBOX_PASS" else "pending"))
-            fam = latest["family"] or "unlabeled"
+            fam = latest.get("family") or "unlabeled"
             fm = (f"---\ntags: [method, {status}, {fam}, "
                   f"{(latest['side'] or 'NA').lower()}]\n---\n\n")
             b = f"# {mid}\n\n**{status.upper()}** · side {latest['side']} · family {fam} · {len(t)} trial(s)\n\n"

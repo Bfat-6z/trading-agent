@@ -139,6 +139,10 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
             con.execute("ALTER TABLE trade_autopsy ADD COLUMN entry_feats TEXT")
         except sqlite3.OperationalError:
             pass
+        try:                                       # migration: family added P5 (ALTER ADD is
+            con.execute("ALTER TABLE trials ADD COLUMN family TEXT")   # allowed by append-only triggers)
+        except sqlite3.OperationalError:
+            pass
         # migration: lessons schema v2 (3-tier status + cohort columns). The table is
         # a DERIVED projection (recomputed by mine_lessons) so drop-and-recreate is lossless.
         try:
