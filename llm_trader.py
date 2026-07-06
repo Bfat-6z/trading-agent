@@ -1266,6 +1266,19 @@ def resolve(client: Any, now_ms: int) -> int:
                "leverage": lev, "margin": round(margin, 4), "vol": p.get("vol"),
                "mech_method": p.get("mech_method"), "entry_feats": p.get("entry_feats"),
                "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
+        try:    # owner feature: closed-trade chart with BUY/SELL markers
+            b64 = ltc.render_trade_chart(p["symbol"], fb, side=side,
+                                         entry_ts=int(p["entry_ts"]), entry_px=entry,
+                                         exit_ts=exit_ts, exit_px=exit_px, reason=reason, tf=TF)
+            if b64:
+                import base64 as _b64
+                cdir = LT_DIR / "charts_closed"
+                cdir.mkdir(parents=True, exist_ok=True)
+                fn = f"{p['symbol']}_{exit_ts}.png"
+                (cdir / fn).write_bytes(_b64.b64decode(b64))
+                rec["chart_exit"] = f"charts_closed/{fn}"
+        except Exception:
+            pass
         _append(CLOSED, rec)
         _append(MEMORY, rec)   # self-learning: outcome tagged by context
         try:                    # second brain: mission closes feed lesson mining too

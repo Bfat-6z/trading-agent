@@ -103,6 +103,7 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
                  tf: str = "15m", lookback: int = 64,
                  ema_periods: tuple[int, ...] = (20, 50, 200),
                  hlines: Sequence[tuple[float, str, str]] | None = None,
+                 markers: Sequence[tuple[int, float, str]] | None = None,
                  title_suffix: str = "") -> str | None:
     """Dark TradingView-style chart: green/red candlesticks, EMA20/50/200, marked
     FVG / imbalance zones, recent swing support/resistance levels, and a volume
@@ -168,6 +169,26 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
             lo, hi = (o[bi], c[bi]) if up else (c[bi], o[bi])
             ax.add_patch(plt.Rectangle((xi - width / 2, lo), width, max(hi - lo, c[bi] * 1e-5),
                                        facecolor=col, edgecolor=col, linewidth=0.8, zorder=3))
+
+        # --- BUY/SELL markers (owner: 'vẽ chart buy/sell') ---
+        if markers:
+            ts_to_bi = {int(b.get("ts_ms") or 0): i for i, b in enumerate(bars)}
+            span = (h[idx].max() - l[idx].min()) or (c[-1] * 0.01)
+            for mts, mpx, kind in markers:
+                bi = ts_to_bi.get(int(mts))
+                xi = x_of.get(int(bi)) if bi is not None else None
+                if xi is None:
+                    continue
+                if str(kind).lower() == "buy":
+                    ax.scatter([xi], [mpx - span * 0.06], marker="^", s=90, color="#26a69a",
+                               edgecolors="white", linewidths=0.6, zorder=8)
+                    ax.annotate("BUY", xy=(xi, mpx - span * 0.10), ha="center", va="top",
+                                fontsize=7, fontweight="bold", color="#26a69a", zorder=8)
+                else:
+                    ax.scatter([xi], [mpx + span * 0.06], marker="v", s=90, color="#ef5350",
+                               edgecolors="white", linewidths=0.6, zorder=8)
+                    ax.annotate("SELL", xy=(xi, mpx + span * 0.10), ha="center", va="bottom",
+                                fontsize=7, fontweight="bold", color="#ef5350", zorder=8)
 
         # --- EMAs ---
         estyles = {20: ("-", 1.2, "#e6e6e6"), 50: ("-", 1.4, "#f0b90b"), 200: ("--", 1.3, "#787b86")}
@@ -246,4 +267,38 @@ def render_chart(symbol: str, bars: Sequence[dict[str, Any]], *,
             plt.close("all")
         except Exception:
             pass
+        return None
+
+
+def render_trade_chart(symbol: str, bars: Sequence[dict[str, Any]], *, side: str,
+                       entry_ts: int, entry_px: float, exit_ts: int, exit_px: float,
+                       reason: str = "", tf: str = "15m") -> str | None:
+    """Closed-trade chart with BUY/SELL markers (owner feature): window the bars
+    around the trade, mark entry/exit arrows + price lines. Returns base64 PNG."""
+    try:
+        ts = [int(b.get("ts_ms") or 0) for b in bars]
+        try:
+            i_in = ts.index(int(entry_ts))
+        except ValueError:
+            i_in = max(range(len(ts)), key=lambda i: -abs(ts[i] - int(entry_ts)))
+        i_out = i_in
+        for i in range(i_in, len(ts)):
+            if ts[i] >= int(exit_ts):
+                i_out = i
+                break
+        else:
+            i_out = len(ts) - 1
+        lo = max(0, i_in - 28)
+        hi = min(len(bars), i_out + 9)
+        win = list(bars[lo:hi])
+        ent_kind, ex_kind = ("buy", "sell") if side == "LONG" else ("sell", "buy")
+        pnl = (exit_px / entry_px - 1) * (1 if side == "LONG" else -1) * 100
+        return render_chart(
+            symbol, win, tf=tf, lookback=len(win),
+            hlines=[(float(entry_px), f"in {entry_px:.4g}", "#f0b90b"),
+                    (float(exit_px), f"out {exit_px:.4g}", "#26a69a" if pnl >= 0 else "#ef5350")],
+            markers=[(int(bars[i_in].get("ts_ms") or 0), float(entry_px), ent_kind),
+                     (int(bars[i_out].get("ts_ms") or 0), float(exit_px), ex_kind)],
+            title_suffix=f" · {side} {reason} {pnl:+.2f}%")
+    except Exception:
         return None

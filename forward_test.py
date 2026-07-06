@@ -171,6 +171,20 @@ def resolve_open(client, now_ms: int, hashes: dict[str, str] | None = None) -> i
                    "r": round(net / slp, 4) if slp else 0.0,
                    "mae_pct": mae_pct, "mfe_pct": mfe_pct,
                    "bars_held": used, "closed_ts_ms": now_ms}
+            try:    # owner feature: BUY/SELL-marked chart per shadow close
+                import llm_trader_charts as ltc, base64 as _b64
+                ex_ts = int(after[used - 1]["ts_ms"]) if after and used else now_ms
+                b64 = ltc.render_trade_chart(p["symbol"], bars, side=side,
+                                             entry_ts=int(p["entry_ts_ms"]), entry_px=entry,
+                                             exit_ts=ex_ts, exit_px=exit_px, reason=reason, tf=TF)
+                if b64:
+                    cdir = ROOT / "state" / "forward_test" / "charts"
+                    cdir.mkdir(parents=True, exist_ok=True)
+                    fn = f"{p['symbol']}_{ex_ts}.png"
+                    (cdir / fn).write_bytes(_b64.b64decode(b64))
+                    rec["chart"] = f"charts/{fn}"
+            except Exception:
+                pass
             _append(CLOSED, rec)
             try:                            # second brain: numbers-only autopsy row
                 import brain
