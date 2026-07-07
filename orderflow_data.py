@@ -28,6 +28,10 @@ def fetch_deriv_series(symbol: str, timeframe: str, *, start_ms: int, end_ms: in
     "ls":..}} (sparse — the caller forward-fills onto bars point-in-time, no lookahead).
     Public futures/data endpoints (no auth). Fail-soft: partial/empty on any error."""
     symbol = symbol.upper()
+    # Binance keeps only ~500 rows of these; at 15m that's ~5d (too shallow for backtest),
+    # so use a COARSER 1h period (~20d of history) and forward-fill onto the 15m bars —
+    # OI/positioning is a slow regime signal, hourly granularity is plenty and causal.
+    dperiod = "1h" if timeframe in ("5m", "15m", "30m") else timeframe
     start = max(start_ms, end_ms - 30 * 24 * 3600 * 1000 + 60_000)
     out: dict[int, dict[str, float]] = {}
     for ep, key, field in (("openInterestHist", "oi", "sumOpenInterest"),
@@ -37,7 +41,7 @@ def fetch_deriv_series(symbol: str, timeframe: str, *, start_ms: int, end_ms: in
             guard += 1
             try:
                 rows = requests.get(f"{_DERIV_BASE}/{ep}",
-                                    params={"symbol": symbol, "period": timeframe, "limit": 500,
+                                    params={"symbol": symbol, "period": dperiod, "limit": 500,
                                             "startTime": cursor, "endTime": end_ms}, timeout=10).json()
             except Exception:
                 break

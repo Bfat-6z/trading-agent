@@ -40,7 +40,7 @@ TF = "15m"
 MIN_QVOL = 50_000_000.0
 UNIV_N = 30
 STATS_TTL = 3 * 3600           # rebuild the (expensive) backtest leaderboard at most every 3h
-STATS_MONTHS = 0.8             # ~24d: within Binance OI/LS ~30d retention so the backtest
+STATS_MONTHS = 0.6             # ~18d: within the 1h-period OI/LS ~20d coverage so the backtest
                                # window has real derivatives data THROUGHOUT — no missing-
                                # prefix bias where old bars get neutral OI defaults (Codex #5)
 LIVE_MONTHS = 0.12             # short pull is enough to fire the latest bar
