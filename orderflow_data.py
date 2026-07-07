@@ -13,6 +13,7 @@ funding at a bar uses the last funding event with fundingTime <= bar close.
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -20,6 +21,25 @@ import pandas as pd
 import requests
 
 _DERIV_BASE = "https://fapi.binance.com/futures/data"
+
+
+def _bounded_get(url: str, params: dict, hard_deadline: float = 10.0):
+    """requests.get that CANNOT hang the caller (ck:debug 2026-07-08 root cause: the SSL
+    handshake to fapi.binance.com/futures/data blocked run_once() >70s despite timeout=10 —
+    the socket timeout doesn't reliably cover the TLS handshake on Windows). Runs in a daemon
+    thread; if it doesn't finish within hard_deadline the thread is abandoned and we return
+    None (fail-soft, caller degrades to no-deriv). The thread timeout is the GUARANTEE."""
+    box: list = [None]
+
+    def _run():
+        try:
+            box[0] = requests.get(url, params=params, timeout=(4, 6)).json()
+        except Exception:
+            box[0] = None
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(hard_deadline)
+    return box[0]                       # None = timed out (thread left to die) or errored
 
 
 def fetch_deriv_series(symbol: str, timeframe: str, *, start_ms: int, end_ms: int) -> dict[int, dict[str, float]]:
@@ -34,17 +54,17 @@ def fetch_deriv_series(symbol: str, timeframe: str, *, start_ms: int, end_ms: in
     dperiod = "1h" if timeframe in ("5m", "15m", "30m") else timeframe
     start = max(start_ms, end_ms - 30 * 24 * 3600 * 1000 + 60_000)
     out: dict[int, dict[str, float]] = {}
+    _t0 = time.time()
     for ep, key, field in (("openInterestHist", "oi", "sumOpenInterest"),
                            ("topLongShortAccountRatio", "ls", "longShortRatio")):
         cursor, guard = start, 0
         while cursor < end_ms and guard < 100:
+            if time.time() - _t0 > 25.0:          # total wall-clock budget for the whole call
+                break                              # (never let deriv fetch dominate a cycle)
             guard += 1
-            try:
-                rows = requests.get(f"{_DERIV_BASE}/{ep}",
-                                    params={"symbol": symbol, "period": dperiod, "limit": 500,
-                                            "startTime": cursor, "endTime": end_ms}, timeout=10).json()
-            except Exception:
-                break
+            rows = _bounded_get(f"{_DERIV_BASE}/{ep}",
+                                {"symbol": symbol, "period": dperiod, "limit": 500,
+                                 "startTime": cursor, "endTime": end_ms})
             if not isinstance(rows, list) or not rows:
                 break
             for r in rows:

@@ -306,7 +306,13 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
     whale = _whale_flow_map()   # per-symbol Telegram whale/liquidation pressure
     for sym in symbols:
         try:
-            fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02, with_deriv=True)
+            # with_deriv=False on the live hot path (ck:debug 2026-07-08 root cause): the OI/LS
+            # deriv fetch to fapi.binance.com/futures/data can HANG in the SSL handshake (requests
+            # timeout doesn't cover it on Windows) — it froze run_once() for >70s, no heartbeat,
+            # mission looked dead. Mission doesn't need deriv: no OI method is armed, and the
+            # gap-veto's gap_risk_pct is computed from OHLC, not deriv. Re-enable only when an OI
+            # method promotes AND fetch_deriv_series is proven hang-proof.
+            fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02, with_deriv=False)
             # CLOSED bars only (plan #13, VTL time-gating): drop the still-forming
             # candle so every decision input is immutable — its high/low/close and
             # derived indicators would otherwise repaint within the bar.
