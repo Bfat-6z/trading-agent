@@ -1496,8 +1496,29 @@ if __name__ == "__main__":
         try:
             import time as _t
             if lock.exists() and (_t.time() - lock.stat().st_mtime) < 600:
-                print(json.dumps({"error": "another llm_trader loop is active (loop.lock fresh)"}))
-                raise SystemExit(1)
+                # BUG FIX 2026-07-08: mtime-only 'fresh' check blocked for 600s after a dead
+                # pythonw spawn left a recent-mtime lock — the supervisor re-spawned every cycle,
+                # refreshing it -> PERMANENT self-block (mission couldn't start for hours). Only
+                # refuse if the lock-owner PID is actually ALIVE (Windows-safe OpenProcess, since
+                # os.kill(pid,0) TERMINATES on Windows). A dead owner's lock is stale -> proceed.
+                _owner_alive = True
+                try:
+                    _opid = int((lock.read_text(encoding="ascii") or "0").strip())
+                    if _opid > 0:
+                        import ctypes as _ct
+                        _h = _ct.windll.kernel32.OpenProcess(0x1000, False, _opid)  # QUERY_LIMITED
+                        if _h:
+                            _ct.windll.kernel32.CloseHandle(_h)
+                            _owner_alive = True
+                        else:
+                            _owner_alive = False        # PID not found -> dead -> stale lock
+                    else:
+                        _owner_alive = False
+                except Exception:
+                    _owner_alive = True                 # can't tell -> fail-safe: assume alive
+                if _owner_alive:
+                    print(json.dumps({"error": "another llm_trader loop is active (loop.lock fresh, pid alive)"}))
+                    raise SystemExit(1)
         except SystemExit:
             raise
         except Exception:
