@@ -35,6 +35,11 @@ HB = ROOT / "state" / "lane_promotion_heartbeat.json"
 MIN_N = int(os.environ.get("PROMO_MIN_N", "30"))
 MAX_PROMOTE = int(os.environ.get("PROMO_MAX", "8"))
 ALPHA = 0.05
+MIN_EXPECT_R = float(os.environ.get("PROMO_MIN_R", "0.05"))   # absolute expectancy floor (R)
+PERSIST = int(os.environ.get("PROMO_PERSIST", "2"))          # consecutive passes to promote (Codex #2)
+DEMOTE_FAILS = int(os.environ.get("PROMO_DEMOTE_FAILS", "2"))  # consecutive fails to demote (Codex #6)
+PERM_B = 2000                                                # sign-flip permutations
+STATE = ROOT / "state" / "lane_promo_state.json"
 # hand-validated methods that must ALWAYS stay armed regardless of the lane funnel.
 HAND_ARMED = {"wr_flush_notknife", "capitulation_long"}
 
@@ -51,61 +56,70 @@ def _load_jsonl(p: Path) -> list[dict]:
     return out
 
 
-def _t_p_one_sided(xs: list[float]) -> float:
-    """One-sided p-value for H1: mean(xs) > 0 via a t-approximation (normal tail).
-    Returns 1.0 for degenerate samples so they never pass the bar."""
+def _perm_p(xs: list[float]) -> float:
+    """Distribution-free one-sided p for H1: mean(xs) > 0 via a SIGN-FLIP permutation
+    test (Codex #1: normal/erfc is anti-conservative for n=30 heavy-tailed 6:1 R). Under
+    the symmetric null each R keeps or flips its sign with p=0.5; p = fraction of
+    permuted means >= observed. Deterministic seed -> reproducible. 1.0 for tiny/neg."""
     n = len(xs)
-    if n < 3:
+    if n < MIN_N:
         return 1.0
-    m = sum(xs) / n
-    var = sum((x - m) ** 2 for x in xs) / (n - 1)
-    if var <= 0:
-        return 0.0 if m > 0 else 1.0
-    t = m / math.sqrt(var / n)
-    # normal-tail approx of the t survival function (fine for n>=30; conservative below)
-    z = t
-    p = 0.5 * math.erfc(z / math.sqrt(2))     # P(Z > z)
-    return min(1.0, max(0.0, p))
+    obs = sum(xs) / n
+    if obs <= 0:
+        return 1.0
+    import random as _r
+    rng = _r.Random(1234567 + n)
+    ge = 0
+    for _ in range(PERM_B):
+        s = 0.0
+        for x in xs:
+            s += x if rng.random() < 0.5 else -x
+        if s / n >= obs:
+            ge += 1
+    return (ge + 1) / (PERM_B + 1)
 
 
-def lane_stats() -> tuple[list[dict], float]:
-    """Per-lane live stats from closed.jsonl. Returns (rows, random_mean_r)."""
+def lane_stats() -> tuple[list[dict], float, int]:
+    """Per-lane live stats from closed.jsonl. Returns (rows, random_mean_r, random_n)."""
     try:
         summary = json.loads((LANES / "summary.json").read_text(encoding="utf-8")).get("lanes", {})
     except Exception:
-        return [], 0.0
-    rows, rand_mr = [], 0.0
+        return [], 0.0, 0
+    rows, rand_mr, rand_n = [], 0.0, 0
     for k, v in summary.items():
         closed = _load_jsonl(LANES / k / "closed.jsonl")
         rs = [float(c.get("r") or 0) for c in closed]
         nets = [float(c.get("pnl") or 0) for c in closed]
         n = len(rs)
         mean_r = sum(rs) / n if n else 0.0
+        se = (math.sqrt(sum((x - mean_r) ** 2 for x in rs) / (n - 1) / n) if n > 1 else 0.0)
         row = {"k": k, "mid": v.get("mid", k), "desc": v.get("desc", ""),
-               "n": n, "mean_r": round(mean_r, 4),
+               "n": n, "mean_r": round(mean_r, 4), "lcb": round(mean_r - se, 4),
                "net": round(sum(nets), 3), "equity": v.get("equity"),
                "win": round(sum(1 for x in nets if x > 0) / n * 100, 1) if n else None,
-               "p": round(_t_p_one_sided(rs), 5), "is_random": k == "L00_random"}
+               "p": round(_perm_p(rs), 5), "is_random": k == "L00_random"}
         if row["is_random"]:
-            rand_mr = mean_r
+            rand_mr, rand_n = mean_r, n
         rows.append(row)
-    return rows, rand_mr
+    return rows, rand_mr, rand_n
 
 
-def evaluate(rows: list[dict], rand_mr: float) -> list[dict]:
+def evaluate(rows: list[dict], rand_mr: float, rand_n: int) -> list[dict]:
+    """Flag each lane pass/fail against the corrected bar. Persistence + winner's-curse
+    (LCB ranking) are handled in run_once via the promo-state; this only sets r['pass']."""
     n_lanes = max(1, len([r for r in rows if not r["is_random"]]))
-    sidak = 1.0 - (1.0 - ALPHA) ** (1.0 / n_lanes)     # multiple-comparisons corrected bar
-    winners = []
+    sidak = 1.0 - (1.0 - ALPHA) ** (1.0 / n_lanes)     # family-wise corrected bar (Codex #1)
+    # Codex #5: only trust the random baseline once it has a real sample; else a fixed floor.
+    floor = max(rand_mr if rand_n >= MIN_N else 0.0, MIN_EXPECT_R)
     for r in rows:
         if r["is_random"] or r["mid"] in HAND_ARMED:
+            r["pass"] = False
             continue
         r["sidak_bar"] = round(sidak, 6)
+        r["floor"] = round(floor, 4)
         r["pass"] = bool(r["n"] >= MIN_N and r["mean_r"] > 0 and (r["net"] or 0) > 0
-                         and r["mean_r"] > rand_mr and r["p"] < sidak)
-        if r["pass"]:
-            winners.append(r)
-    winners.sort(key=lambda r: -r["mean_r"])
-    return winners[:MAX_PROMOTE]
+                         and r["mean_r"] > floor and r["p"] < sidak)
+    return rows
 
 
 def _method_defs() -> dict:
@@ -113,9 +127,25 @@ def _method_defs() -> dict:
     return lane_farm._all_method_defs()
 
 
-def apply_promotions(winners: list[dict], dry: bool = False) -> dict:
-    """Merge winners into armed_methods.json (keep hand-armed + prior valid promotions;
-    demote promoted methods that no longer pass)."""
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_state(s: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s), encoding="utf-8")
+    os.replace(tmp, STATE)
+
+
+def apply_promotions(winners: list[dict], stat_by_mid: dict, state: dict, dry: bool = False) -> dict:
+    """Merge winners into armed_methods.json. Hand-armed ALWAYS kept; a lane-promoted
+    method is demoted only on a HARD fail (net<=0 or mean_r<=0 on fresh data) or after
+    DEMOTE_FAILS consecutive failed windows (Codex #6 hysteresis, not one-miss churn).
+    De-dupes by id so a winner that shares a hand-armed id is never duplicated (Codex #3)."""
     try:
         cur = json.loads(ARMED.read_text(encoding="utf-8"))
         cur = cur if isinstance(cur, list) else cur.get("methods", [])
@@ -123,22 +153,24 @@ def apply_promotions(winners: list[dict], dry: bool = False) -> dict:
         cur = []
     defs = _method_defs()
     win_ids = {w["mid"] for w in winners}
-    # keep: hand-armed always; existing lane_promoted only if still winning
-    kept = []
-    demoted = []
+    kept, demoted = [], []
     for m in cur:
-        src = m.get("source")
-        if src == "lane_promoted":
-            if m["id"] in win_ids:
-                kept.append(m)                          # still winning -> keep
+        if m.get("source") == "lane_promoted":
+            st = stat_by_mid.get(m["id"]) or {}
+            ps = state.get(m["id"], {})
+            has_data = (st.get("n", 0) or 0) > 0
+            hard_fail = has_data and ((st.get("net", 0) or 0) <= 0 or (st.get("mean_r", 0) or 0) <= 0)
+            persist_fail = ps.get("fails", 0) >= DEMOTE_FAILS
+            if m["id"] in win_ids or not (hard_fail or persist_fail):
+                kept.append(m)                          # still winning OR not failing enough -> keep
             else:
-                demoted.append(m["id"])                 # dropped from winners -> demote
+                demoted.append(m["id"])
         else:
             kept.append(m)                              # hand-armed / other -> always keep
     kept_ids = {m["id"] for m in kept}
     promoted = []
     for w in winners:
-        if w["mid"] in kept_ids:
+        if w["mid"] in kept_ids:                        # de-dupe by id (Codex #3)
             continue
         d = defs.get(w["mid"]) or {}
         if not (d.get("when") or d.get("conds")):
@@ -146,9 +178,10 @@ def apply_promotions(winners: list[dict], dry: bool = False) -> dict:
         kept.append({"id": w["mid"], "side": d.get("side", "LONG"),
                      "sl_pct": float(d.get("sl_pct") or 1.5), "tp_pct": float(d.get("tp_pct") or 3.0),
                      "timeout": int(d.get("timeout") or 16), "when": d.get("when") or d.get("conds"),
-                     "family": d.get("family"), "desc": d.get("desc", "")[:80],
+                     "family": d.get("family"), "desc": (d.get("desc") or "")[:80],
                      "source": "lane_promoted", "lane_n": w["n"], "lane_mean_r": w["mean_r"],
-                     "lane_p": w["p"]})
+                     "lane_lcb": w.get("lcb"), "lane_p": w["p"]})
+        kept_ids.add(w["mid"])
         promoted.append(w["mid"])
     out = {"promoted": promoted, "demoted": demoted, "armed_total": len(kept),
            "winners": [w["mid"] for w in winners]}
@@ -163,11 +196,28 @@ def apply_promotions(winners: list[dict], dry: bool = False) -> dict:
 
 
 def run_once(dry: bool = False) -> dict:
-    rows, rand_mr = lane_stats()
-    winners = evaluate(rows, rand_mr)
-    res = apply_promotions(winners, dry=dry)
-    res["random_mean_r"] = round(rand_mr, 4)
-    res["evaluated"] = len(rows)
+    rows, rand_mr, rand_n = lane_stats()
+    rows = evaluate(rows, rand_mr, rand_n)
+    state = _load_state()
+    stat_by_mid = {}
+    for r in rows:
+        if r["is_random"] or r["mid"] in HAND_ARMED:
+            continue
+        stat_by_mid[r["mid"]] = r
+        ps = state.setdefault(r["mid"], {"passes": 0, "fails": 0})
+        if r["pass"]:
+            ps["passes"] = ps.get("passes", 0) + 1; ps["fails"] = 0
+        else:
+            ps["fails"] = ps.get("fails", 0) + 1; ps["passes"] = 0
+    # eligible = PERSIST consecutive passes (Codex #2 winner's-curse), ranked by LCB.
+    eligible = [r for r in rows if state.get(r["mid"], {}).get("passes", 0) >= PERSIST]
+    eligible.sort(key=lambda r: -(r.get("lcb") if r.get("lcb") is not None else -9))
+    winners = eligible[:MAX_PROMOTE]
+    res = apply_promotions(winners, stat_by_mid, state, dry=dry)
+    if not dry:
+        _save_state(state)
+    res.update({"random_mean_r": round(rand_mr, 4), "random_n": rand_n,
+                "evaluated": len(rows), "eligible": len(eligible)})
     HB.write_text(json.dumps({"agent": "lane_promotion", "pid": os.getpid(),
                               "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                               "status": "running", **res}), encoding="utf-8")
