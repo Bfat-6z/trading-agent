@@ -241,8 +241,8 @@ def run_once(client):
                 _ld = 100.0 / max(1, LEV)
                 if float(atrp) * GAP_LIQ_ATR_MULT > _ld:
                     continue
-                _gr = row.get("gap_risk_pct")         # gap-tail veto (mission parity 2026-07-08)
-                if _gr is not None and float(_gr) * GAP_RISK_MULT > _ld:
+                _gr = row.get("gap_risk_pct")         # gap-tail veto, fail-CLOSED (Codex #4):
+                if _gr is None or _gr != _gr or float(_gr) * GAP_RISK_MULT > _ld:   # missing/NaN = block
                     continue
                 side = fire_m.get("side", "LONG")
                 entry = float(last["close"])

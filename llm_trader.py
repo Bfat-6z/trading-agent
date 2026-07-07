@@ -508,8 +508,11 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                 # liquidation risk -> refuse, don't fire blind. Same rule the lanes use.
                 # PLUS gap-tail veto: the worst recent single bar (gap_risk) reaching the
                 # liq distance = ruin risk ATR's average hides (2026-07-08 sizing fix).
+                # gap_risk fail-CLOSED too (Codex #4): a risk gate must refuse when it can't
+                # assess the risk. `_x != _x` is a no-import NaN test. Both risk metrics block.
                 if (_atr is None or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq_dist
-                        or (_gaprisk is not None and float(_gaprisk) * GAP_RISK_MULT > _liq_dist)):
+                        or _gaprisk is None or _gaprisk != _gaprisk
+                        or float(_gaprisk) * GAP_RISK_MULT > _liq_dist):
                     _append(LT_DIR / "governance.jsonl",
                             {"event": "gate_block_gap_risk", "symbol": c["symbol"],
                              "method": m["id"], "atr_pct": _atr, "gap_risk_pct": _gaprisk,

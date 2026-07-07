@@ -175,12 +175,13 @@ def live_matrix(client, stats: dict) -> dict:
             # gate would refuse this fire (atr too high for the stop) so the matrix
             # doesn't recommend a setup the executor will veto. Same constants as the
             # executor (Codex #5) so the advisory flag can't drift from the real veto.
-            atr = float(row.get("atr_pct") or 0.0)
-            _gr = row.get("gap_risk_pct"); _ld = 100.0 / max(1, MECH_LEV)
-            # fail-closed parity with the executor: gate_ok only when atr present AND within
-            # the liq band AND the worst recent bar (gap_risk) doesn't reach liq (2026-07-08).
-            gate_ok = bool(atr > 0 and atr * GAP_LIQ_ATR_MULT <= _ld
-                           and not (_gr is not None and float(_gr) * GAP_RISK_MULT > _ld))
+            _atr = row.get("atr_pct"); _gr = row.get("gap_risk_pct"); _ld = 100.0 / max(1, MECH_LEV)
+            # fail-closed parity with the executor (Codex #3/#4): explicit None/NaN guards on
+            # BOTH risk metrics (`_x == _x` is a no-import NaN test), identical logic to llm_trader.
+            atr = round(float(_atr), 2) if (_atr is not None and _atr == _atr) else 0.0
+            gate_ok = bool(_atr is not None and _atr == _atr and float(_atr) > 0
+                           and float(_atr) * GAP_LIQ_ATR_MULT <= _ld
+                           and _gr is not None and _gr == _gr and float(_gr) * GAP_RISK_MULT <= _ld)
             sig = {"coin": sym, "method": mid, "side": m.get("side", "LONG"),
                    "win": st.get("win"), "avg_r": st.get("avg_r"), "exp_net": st.get("exp_net"),
                    "n": st.get("n"), "atr_pct": round(atr, 2), "gate_ok": gate_ok,
