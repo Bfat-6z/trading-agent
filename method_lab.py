@@ -61,6 +61,65 @@ def _rsi(c: np.ndarray, p: int = 14) -> np.ndarray:
     return out
 
 
+def _wilder_atr(h: np.ndarray, lo: np.ndarray, c: np.ndarray, p: int = 14) -> np.ndarray:
+    n = len(c)
+    tr = np.zeros(n)
+    for i in range(1, n):
+        tr[i] = max(h[i] - lo[i], abs(h[i] - c[i - 1]), abs(lo[i] - c[i - 1]))
+    atr = np.zeros(n)
+    if n > p:
+        atr[p] = tr[1:p + 1].mean()
+        for i in range(p + 1, n):
+            atr[i] = (atr[i - 1] * (p - 1) + tr[i]) / p
+    return atr
+
+
+def _adx(h: np.ndarray, lo: np.ndarray, c: np.ndarray, p: int = 14) -> np.ndarray:
+    """Wilder ADX (trend strength 0-100). No lookahead: each i uses only data <= i."""
+    n = len(c)
+    out = np.zeros(n)
+    if n < 2 * p + 2:
+        return out
+    tr = np.zeros(n); pdm = np.zeros(n); ndm = np.zeros(n)
+    for i in range(1, n):
+        up = h[i] - h[i - 1]; dn = lo[i - 1] - lo[i]
+        pdm[i] = up if (up > dn and up > 0) else 0.0
+        ndm[i] = dn if (dn > up and dn > 0) else 0.0
+        tr[i] = max(h[i] - lo[i], abs(h[i] - c[i - 1]), abs(lo[i] - c[i - 1]))
+    atr = tr[1:p + 1].sum(); sp = pdm[1:p + 1].sum(); sn = ndm[1:p + 1].sum()
+    dx = np.zeros(n)
+    for i in range(p + 1, n):
+        atr = atr - atr / p + tr[i]
+        sp = sp - sp / p + pdm[i]
+        sn = sn - sn / p + ndm[i]
+        if atr > 1e-12:
+            pdi = 100 * sp / atr; ndi = 100 * sn / atr
+            s = pdi + ndi
+            dx[i] = 100 * abs(pdi - ndi) / s if s > 1e-12 else 0.0
+    out[2 * p] = dx[p + 1:2 * p + 1].mean()
+    for i in range(2 * p + 1, n):
+        out[i] = (out[i - 1] * (p - 1) + dx[i]) / p
+    return out
+
+
+def _supertrend(h: np.ndarray, lo: np.ndarray, c: np.ndarray, p: int = 10, mult: float = 3.0) -> np.ndarray:
+    """SuperTrend direction (+1 up / -1 down). No lookahead (band at i uses close[i], prior band)."""
+    n = len(c)
+    out = np.zeros(n)
+    if n < p + 2:
+        return out
+    atr = _wilder_atr(h, lo, c, p)
+    hl2 = (h + lo) / 2.0
+    ub = np.zeros(n); lb = np.zeros(n); d = np.ones(n, dtype=int)
+    for i in range(p, n):
+        bub = hl2[i] + mult * atr[i]; blb = hl2[i] - mult * atr[i]
+        ub[i] = bub if (ub[i - 1] == 0 or bub < ub[i - 1] or c[i - 1] > ub[i - 1]) else ub[i - 1]
+        lb[i] = blb if (lb[i - 1] == 0 or blb > lb[i - 1] or c[i - 1] < lb[i - 1]) else lb[i - 1]
+        d[i] = 1 if c[i] > ub[i - 1] else (-1 if c[i] < lb[i - 1] else d[i - 1])
+        out[i] = d[i]
+    return out
+
+
 def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> list[dict[str, float]]:
     """One feature row per bar (the columns methods reference). Values known AT
     THAT BAR's close — no lookahead. `funding` (optional): raw Binance funding
@@ -100,6 +159,34 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
         st4 = np.where(ef4 > es4, 1, -1)
     else:
         st4 = np.zeros(len(h4), dtype=int)
+    # --- extended TA indicators (2026-07-07, owner: broaden the futures indicator set).
+    # All from OHLCV up to & INCLUDING bar i (no lookahead); additive feature columns
+    # the lane farm can then test empirically instead of trusting internet folklore.
+    macd_line = _ema(c, 12) - _ema(c, 26)
+    macd_hist = macd_line - _ema(macd_line, 9)
+    adx14 = _adx(h, lo, c, 14)
+    st_dir = _supertrend(h, lo, c, 10, 3.0)
+    tp = (h + lo + c) / 3.0
+    roc10 = np.zeros(len(c)); roc10[10:] = (c[10:] / c[:-10] - 1.0) * 100.0
+    bb_pctb = np.full(len(c), 0.5); bb_width = np.zeros(len(c))
+    stoch_k = np.full(len(c), 50.0); cci20 = np.zeros(len(c)); wr14 = np.full(len(c), -50.0)
+    vwap20 = c.astype(float).copy()
+    for _i in range(len(c)):
+        if _i >= 19:
+            w = c[_i - 19:_i + 1]; m = float(w.mean()); sdv = float(w.std())
+            if sdv > 0:
+                bb_pctb[_i] = float((c[_i] - (m - 2 * sdv)) / (4 * sdv))
+                bb_width[_i] = float(4 * sdv / m * 100) if m else 0.0
+            wt = tp[_i - 19:_i + 1]; mt = float(wt.mean()); md = float(np.abs(wt - mt).mean())
+            cci20[_i] = float((tp[_i] - mt) / (0.015 * md)) if md > 0 else 0.0
+            vw = v[_i - 19:_i + 1]; sv = float(vw.sum())
+            vwap20[_i] = float((tp[_i - 19:_i + 1] * vw).sum() / sv) if sv > 0 else float(c[_i])
+        if _i >= 13:
+            hh = float(h[_i - 13:_i + 1].max()); ll = float(lo[_i - 13:_i + 1].min())
+            if hh > ll:
+                stoch_k[_i] = float((c[_i] - ll) / (hh - ll) * 100.0)
+                wr14[_i] = float((c[_i] - hh) / (hh - ll) * 100.0)
+    stoch_d = np.convolve(stoch_k, np.ones(3) / 3.0, mode="full")[:len(c)]
     rows = []
     for i in range(len(bars)):
         vr = float(v[i] / volma[i]) if i >= 20 and volma[i] > 0 else 1.0
@@ -186,6 +273,19 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
             "vol_ratio": round(vr, 3),
             "ret5": float(c[i] / c[i - 5] - 1) * 100 if i >= 5 else 0.0,
             "ret20": float(c[i] / c[i - 20] - 1) * 100 if i >= 20 else 0.0,
+            # --- extended TA (2026-07-07) ---
+            "macd_hist": round(float(macd_hist[i]), 5),
+            "macd_state": (1 if macd_hist[i] > 0 else -1),
+            "adx": round(float(adx14[i]), 2),
+            "supertrend_dir": int(st_dir[i]),
+            "bb_pctb": round(float(bb_pctb[i]), 3),
+            "bb_width_pct": round(float(bb_width[i]), 3),
+            "stoch_k": round(float(stoch_k[i]), 2),
+            "stoch_d": round(float(stoch_d[i]), 2),
+            "cci20": round(float(cci20[i]), 2),
+            "williams_r": round(float(wr14[i]), 2),
+            "roc10": round(float(roc10[i]), 3),
+            "px_vs_vwap20": round(float(c[i] / vwap20[i] - 1) * 100, 3) if vwap20[i] else 0.0,
         })
     return rows
 
