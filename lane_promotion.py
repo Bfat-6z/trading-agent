@@ -204,7 +204,10 @@ def run_once(dry: bool = False) -> dict:
         if r["is_random"] or r["mid"] in HAND_ARMED:
             continue
         stat_by_mid[r["mid"]] = r
-        ps = state.setdefault(r["mid"], {"passes": 0, "fails": 0})
+        ps = state.setdefault(r["mid"], {"passes": 0, "fails": 0, "last_n": 0})
+        if r["n"] < ps.get("last_n", 0):            # closed count went backwards = lanes were
+            ps["passes"] = 0; ps["fails"] = 0       # reset -> invalidate stale persistence (Codex #6)
+        ps["last_n"] = r["n"]
         if r["pass"]:
             ps["passes"] = ps.get("passes", 0) + 1; ps["fails"] = 0
         else:

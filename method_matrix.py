@@ -173,7 +173,9 @@ def live_matrix(client, stats: dict) -> dict:
             # doesn't recommend a setup the executor will veto. Same constants as the
             # executor (Codex #5) so the advisory flag can't drift from the real veto.
             atr = float(row.get("atr_pct") or 0.0)
-            gate_ok = not (atr > 0 and atr * GAP_LIQ_ATR_MULT > 100.0 / MECH_LEV)
+            # fail-closed parity with the executor: gate_ok only when atr is present AND
+            # within the liquidation band (missing atr => executor now refuses => not ok).
+            gate_ok = bool(atr > 0 and atr * GAP_LIQ_ATR_MULT <= 100.0 / max(1, MECH_LEV))
             sig = {"coin": sym, "method": mid, "side": m.get("side", "LONG"),
                    "win": st.get("win"), "avg_r": st.get("avg_r"), "exp_net": st.get("exp_net"),
                    "n": st.get("n"), "atr_pct": round(atr, 2), "gate_ok": gate_ok,

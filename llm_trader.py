@@ -496,9 +496,11 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                 # is only a couple of noise-bars away and a single flush candle blows
                 # past the 1% stop straight to liq. Refuse the fire when liquidation is
                 # closer than GAP_LIQ_ATR_MULT ATRs. atr_pct is a feature_frame column.
-                _atr = float(row.get("atr_pct") or 0.0)
-                _liq_dist = 100.0 / MECH_LEV                  # x10 -> ~10% to liquidation
-                if _atr > 0 and _atr * GAP_LIQ_ATR_MULT > _liq_dist:
+                _atr = row.get("atr_pct")
+                _liq_dist = 100.0 / max(1, MECH_LEV)          # x10 -> ~10% to liquidation
+                # fail-CLOSED (Codex): missing/degenerate atr means we can't size the
+                # liquidation risk -> refuse, don't fire blind. Same rule the lanes use.
+                if _atr is None or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq_dist:
                     _append(LT_DIR / "governance.jsonl",
                             {"event": "gate_block_gap_risk", "symbol": c["symbol"],
                              "method": m["id"], "atr_pct": _atr, "liq_dist_pct": _liq_dist,

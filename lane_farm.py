@@ -226,8 +226,10 @@ def run_once(client):
                 # so the lane MUST too — else lane edge harvested from high-vol coins the
                 # mission would never touch inflates the promotion signal. Applied to the
                 # RANDOM control as well so the alpha floor is measured on the same coins.
-                atrp = float(row.get("atr_pct") or 0.0)
-                if atrp > 0 and atrp * GAP_LIQ_ATR_MULT > 100.0 / LEV:
+                atrp = row.get("atr_pct")             # fail-CLOSED on missing atr (Codex): a coin
+                if atrp is None or float(atrp) <= 0:  # we can't risk-assess must be skipped, not fired
+                    continue
+                if float(atrp) * GAP_LIQ_ATR_MULT > 100.0 / max(1, LEV):
                     continue
                 side = fire_m.get("side", "LONG")
                 entry = float(last["close"])
