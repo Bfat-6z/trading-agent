@@ -40,7 +40,9 @@ TF = "15m"
 MIN_QVOL = 50_000_000.0
 UNIV_N = 30
 STATS_TTL = 3 * 3600           # rebuild the (expensive) backtest leaderboard at most every 3h
-STATS_MONTHS = 1.0             # history window for the winrate estimate
+STATS_MONTHS = 0.8             # ~24d: within Binance OI/LS ~30d retention so the backtest
+                               # window has real derivatives data THROUGHOUT — no missing-
+                               # prefix bias where old bars get neutral OI defaults (Codex #5)
 LIVE_MONTHS = 0.12             # short pull is enough to fire the latest bar
 
 # Gate constants SHARED with llm_trader via the SAME env vars + defaults (Codex #5:
@@ -101,7 +103,7 @@ def _frames(client, months: float) -> dict[str, tuple]:
     for s in syms:
         try:
             bars = [b for b in of.fetch_klines_with_flow(s, TF, months=months, end_ms=now,
-                                                         client=client, sleep_between=0.02)
+                                                         client=client, sleep_between=0.02, with_deriv=True)
                     if b.get("is_final", True)]
             if len(bars) >= 220:
                 frames[s] = (bars, ml.feature_frame(bars))

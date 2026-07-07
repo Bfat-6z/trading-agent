@@ -50,6 +50,7 @@ _BUCKET = {
     "cci20": 25.0, "williams_r": 5.0, "roc10": 0.5, "px_vs_vwap20": 0.5,
     "buy_frac": 0.05, "cvd_delta_norm": 0.25, "cvd_roll20_norm": 0.1,
     "zscore20": 0.25, "bb_squeeze_pct": 0.05,
+    "oi_chg_pct": 2.0, "oi_z": 0.5, "ls_ratio": 0.1, "ls_z": 0.5,
 }
 
 

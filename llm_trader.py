@@ -306,7 +306,7 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
     whale = _whale_flow_map()   # per-symbol Telegram whale/liquidation pressure
     for sym in symbols:
         try:
-            fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02)
+            fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02, with_deriv=True)
             # CLOSED bars only (plan #13, VTL time-gating): drop the still-forming
             # candle so every decision input is immutable — its high/low/close and
             # derived indicators would otherwise repaint within the bar.

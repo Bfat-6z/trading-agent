@@ -204,6 +204,26 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
         if _i >= 100:
             wsq = bb_width[_i - 99:_i + 1]
             bb_sq_pct[_i] = float((wsq <= bb_width[_i]).sum()) / 100.0   # rank of current width
+    # open-interest + long/short positioning (2026-07-07 futures-microstructure — the
+    # documented-edge signals retail TA ignores). Point-in-time attached to bars by
+    # fetch_klines_with_flow(with_deriv=True); absent -> neutral defaults (oi_chg 0, ls 1).
+    # All trailing/causal (z = current vs the PRIOR 96-bar window), no lookahead.
+    oi_a = np.array([float(b.get("oi") or 0.0) for b in bars])
+    ls_a = np.array([float(b.get("ls_ratio") or 1.0) for b in bars])
+    oi_chg_a = np.zeros(len(c))
+    oi_chg_a[1:] = np.where(oi_a[:-1] > 0, (oi_a[1:] / np.where(oi_a[:-1] > 0, oi_a[:-1], 1.0) - 1.0) * 100.0, 0.0)
+    oi_chg_a = np.nan_to_num(np.clip(oi_chg_a, -50.0, 50.0), nan=0.0)
+
+    def _roll_z(x, w):
+        z = np.zeros(len(x))
+        for _j in range(w, len(x)):
+            win = x[_j - w:_j]                        # PRIOR window, excludes current (no lookahead)
+            mu = float(win.mean()); sd = float(win.std())
+            if sd > 1e-9:
+                z[_j] = max(-6.0, min(6.0, (x[_j] - mu) / sd))
+        return z
+    oi_z_a = _roll_z(oi_chg_a, 96)
+    ls_z_a = _roll_z(ls_a, 96)
     rows = []
     for i in range(len(bars)):
         vr = float(v[i] / volma[i]) if i >= 20 and volma[i] > 0 else 1.0
@@ -309,6 +329,11 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
             "cvd_roll20_norm": round(float(cvd_roll_norm_a[i]), 4),
             "zscore20": round(float(4.0 * bb_pctb[i] - 2.0), 3),
             "bb_squeeze_pct": round(float(bb_sq_pct[i]), 3),
+            # open-interest + long/short positioning (2026-07-07)
+            "oi_chg_pct": round(float(oi_chg_a[i]), 3),
+            "oi_z": round(float(oi_z_a[i]), 3),
+            "ls_ratio": round(float(ls_a[i]), 4),
+            "ls_z": round(float(ls_z_a[i]), 3),
         })
     return rows
 

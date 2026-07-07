@@ -144,7 +144,7 @@ def run_once(client):
     for s in syms:                                  # ONE fetch pass shared by all 10 lanes
         try:
             bars = [b for b in of.fetch_klines_with_flow(s, TF, months=0.12, end_ms=now,
-                                                         client=client, sleep_between=0.02)
+                                                         client=client, sleep_between=0.02, with_deriv=True)
                     if int(b["ts_ms"]) + 0 <= now]
             bars = [b for b in bars if b.get("is_final", True)]
             if len(bars) < 220:                  # same gate as forward_test

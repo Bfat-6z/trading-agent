@@ -17,6 +17,45 @@ import time
 from typing import Any
 
 import pandas as pd
+import requests
+
+_DERIV_BASE = "https://fapi.binance.com/futures/data"
+
+
+def fetch_deriv_series(symbol: str, timeframe: str, *, start_ms: int, end_ms: int) -> dict[int, dict[str, float]]:
+    """Open-interest + top-trader long/short ACCOUNT ratio history, paged. Binance
+    retains only ~30d of this data, so start is clamped. Returns {ts_ms: {"oi":..,
+    "ls":..}} (sparse — the caller forward-fills onto bars point-in-time, no lookahead).
+    Public futures/data endpoints (no auth). Fail-soft: partial/empty on any error."""
+    symbol = symbol.upper()
+    start = max(start_ms, end_ms - 30 * 24 * 3600 * 1000 + 60_000)
+    out: dict[int, dict[str, float]] = {}
+    for ep, key, field in (("openInterestHist", "oi", "sumOpenInterest"),
+                           ("topLongShortAccountRatio", "ls", "longShortRatio")):
+        cursor, guard = start, 0
+        while cursor < end_ms and guard < 100:
+            guard += 1
+            try:
+                rows = requests.get(f"{_DERIV_BASE}/{ep}",
+                                    params={"symbol": symbol, "period": timeframe, "limit": 500,
+                                            "startTime": cursor, "endTime": end_ms}, timeout=10).json()
+            except Exception:
+                break
+            if not isinstance(rows, list) or not rows:
+                break
+            for r in rows:
+                try:
+                    out.setdefault(int(r["timestamp"]), {})[key] = float(r[field])
+                except Exception:
+                    pass
+            last = int(rows[-1]["timestamp"])
+            if last <= cursor:
+                break
+            cursor = last + 1
+            if len(rows) < 500:
+                break
+            time.sleep(0.05)
+    return dict(sorted(out.items()))
 
 _TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000, "1w": 604_800_000}
 _MAX_LIMIT = 1000
@@ -31,10 +70,13 @@ def _iso_ms(ms: int) -> str:
 
 
 def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms: int,
-                           client: Any, sleep_between: float = 0.02) -> list[dict[str, Any]]:
+                           client: Any, sleep_between: float = 0.02,
+                           with_deriv: bool = False) -> list[dict[str, Any]]:
     """Page CLOSED klines and KEEP taker-buy volume so CVD can be computed. Only
     is_final bars (close_time < end_ms). Returns bars with open/high/low/close/
-    volume/quote_volume/taker_buy_base/close_time/ts_ms."""
+    volume/quote_volume/taker_buy_base/close_time/ts_ms. with_deriv=True also attaches
+    point-in-time open-interest (`oi`) + long/short ratio (`ls_ratio`) forward-filled
+    onto each bar (fail-soft; extra API weight — only the strategy paths enable it)."""
     symbol = symbol.upper()
     tf_ms = _TF_MS[timeframe]
     start_ms = end_ms - int(months * 30 * 24 * 3600 * 1000)
@@ -70,7 +112,28 @@ def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms
             break
         if sleep_between:
             time.sleep(sleep_between)
-    return [seen[k] for k in sorted(seen)]
+    bars = [seen[k] for k in sorted(seen)]
+    if with_deriv and bars:
+        try:                                          # forward-fill OI + L/S onto bars
+            deriv = fetch_deriv_series(symbol, timeframe, start_ms=start_ms, end_ms=end_ms)
+            dts = sorted(deriv)
+            di, last_oi, last_ls = 0, None, None
+            for b in bars:
+                bt = int(b["ts_ms"])
+                while di < len(dts) and dts[di] <= bt:   # only prints AT/BEFORE this bar close
+                    dv = deriv[dts[di]]
+                    if "oi" in dv:
+                        last_oi = dv["oi"]
+                    if "ls" in dv:
+                        last_ls = dv["ls"]
+                    di += 1
+                if last_oi is not None:
+                    b["oi"] = last_oi
+                if last_ls is not None:
+                    b["ls_ratio"] = last_ls
+        except Exception:
+            pass
+    return bars
 
 
 def compute_cvd_columns(bars: list[dict[str, Any]]) -> pd.DataFrame:

@@ -120,7 +120,7 @@ def universe(client) -> list[str]:
 def _closed_bars(client, sym: str, now_ms: int) -> list[dict]:
     import orderflow_data as of
     bars = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms,
-                                     client=client, sleep_between=0.02)
+                                     client=client, sleep_between=0.02, with_deriv=True)
     return [b for b in bars if b.get("is_final", True)]
 
 

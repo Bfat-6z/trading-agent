@@ -54,7 +54,9 @@ FEATS = {"rsi14", "px_vs_ema20", "px_vs_ema50", "px_vs_ema200", "ema_stack",
          "macd_hist", "macd_state", "adx", "supertrend_dir", "bb_pctb", "bb_width_pct",
          "stoch_k", "stoch_d", "cci20", "williams_r", "roc10", "px_vs_vwap20",
          # order-flow + z-score + squeeze
-         "buy_frac", "cvd_delta_norm", "cvd_roll20_norm", "zscore20", "bb_squeeze_pct"}
+         "buy_frac", "cvd_delta_norm", "cvd_roll20_norm", "zscore20", "bb_squeeze_pct",
+         # open-interest + long/short positioning (futures microstructure)
+         "oi_chg_pct", "oi_z", "ls_ratio", "ls_z"}
 OPS = {"<", "<=", ">", ">=", "=="}
 
 
