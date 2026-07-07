@@ -389,10 +389,50 @@ def build() -> dict:
     except Exception:
         pass
 
+    # Lane farm: 10 parallel $100 paper lanes (owner: 'theo dõi cả 10 line'). Each lane
+    # is an independent experiment; L10 is the RANDOM-entry control (the alpha floor any
+    # lane must beat). Read the supervisor-written summary + surface the proven-vs-random
+    # gap so the honest edge signal is visible right on the trade wall.
+    LANE_DESC = {
+        "L1_proven": "Mirror mission (notknife→cap)", "L2_notknife_big": "notknife · 25% margin",
+        "L3_cap_loose": "Capitulation nới rsi<25", "L4_bear_noasia": "Mined bear ex-Asia",
+        "L5_deep15": "Deep flush rsi<15", "L6_reclaim": "um_reclaim (ex-cand)",
+        "L7_breakout": "Breakout retest-live", "L8_short_crowd": "SHORT crowded-top",
+        "L9_ensemble": "Ensemble toàn pool", "L10_random": "RANDOM control (sàn alpha)",
+    }
+    lanes = {"total_equity": None, "start_total": None, "pnl": None, "ts": None,
+             "proven_vs_random": None, "lanes": []}
+    try:
+        ls = json.loads((st / "lanes" / "summary.json").read_text())
+        lanes["ts"] = ls.get("ts")
+        rows = []
+        for k, v in (ls.get("lanes") or {}).items():
+            eq = round(float(v.get("equity", 100) or 100), 2)
+            w = v.get("win")
+            rows.append({"k": k, "desc": LANE_DESC.get(k, ""), "equity": eq,
+                         "pnl": round(eq - 100.0, 2), "trades": int(v.get("trades", 0) or 0),
+                         "win": round(float(w) * 100, 1) if w is not None else None,
+                         "open": int(v.get("open", 0) or 0), "busted": bool(v.get("busted")),
+                         "is_random": k == "L10_random"})
+        rows.sort(key=lambda r: -r["equity"])
+        lanes["lanes"] = rows
+        if rows:
+            tot = round(sum(r["equity"] for r in rows), 2)
+            lanes["total_equity"] = tot
+            lanes["start_total"] = 100.0 * len(rows)
+            lanes["pnl"] = round(tot - 100.0 * len(rows), 2)
+            pr = next((r for r in rows if r["k"] == "L1_proven"), None)
+            rd = next((r for r in rows if r["k"] == "L10_random"), None)
+            if pr and rd:
+                lanes["proven_vs_random"] = round(pr["equity"] - rd["equity"], 2)
+    except Exception:
+        pass
+
     return {
         "stamped": utc_now(),
         "mission": mission,
         "mode": "PAPER-ONLY · LIVE LOCKED",
+        "lanes": lanes,
         "llm_trader": lt,
         "manual": manual,
         "whale": whale,
