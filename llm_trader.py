@@ -459,6 +459,11 @@ def _survivor_methods() -> list[dict[str, Any]]:
 # see the gate below). 3.0 -> at x10 (~10% to liq) any coin with atr_pct > ~3.3% is
 # refused, the volatility band where a single flush gaps the stop straight to liq.
 GAP_LIQ_ATR_MULT = float(os.environ.get("MECH_GAP_LIQ_ATR_MULT", "3.0"))
+# gap-tail veto (2026-07-08): close-to-close ATR let 2 mission trades gap PAST the stop to
+# liquidation (−$15). gap_risk_pct = worst single-bar range in the last 48 bars — if that
+# alone × this mult already reaches the liquidation distance, one more such bar can liquidate
+# us, so refuse regardless of how calm the AVERAGE (atr) looks. 1.5 → veto at gap_risk > ~6.7%/x10.
+GAP_RISK_MULT = float(os.environ.get("MECH_GAP_RISK_MULT", "1.5"))
 # The mechanical path trades a single fixed leverage (owner: max conviction, x10).
 # Bind the gate's liquidation distance AND the sizer to the SAME value so they can
 # never drift apart — a hardcoded 10 in one place and a x5 sizer would wrong-sign
@@ -497,14 +502,18 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                 # past the 1% stop straight to liq. Refuse the fire when liquidation is
                 # closer than GAP_LIQ_ATR_MULT ATRs. atr_pct is a feature_frame column.
                 _atr = row.get("atr_pct")
+                _gaprisk = row.get("gap_risk_pct")
                 _liq_dist = 100.0 / max(1, MECH_LEV)          # x10 -> ~10% to liquidation
                 # fail-CLOSED (Codex): missing/degenerate atr means we can't size the
                 # liquidation risk -> refuse, don't fire blind. Same rule the lanes use.
-                if _atr is None or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq_dist:
+                # PLUS gap-tail veto: the worst recent single bar (gap_risk) reaching the
+                # liq distance = ruin risk ATR's average hides (2026-07-08 sizing fix).
+                if (_atr is None or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq_dist
+                        or (_gaprisk is not None and float(_gaprisk) * GAP_RISK_MULT > _liq_dist)):
                     _append(LT_DIR / "governance.jsonl",
                             {"event": "gate_block_gap_risk", "symbol": c["symbol"],
-                             "method": m["id"], "atr_pct": _atr, "liq_dist_pct": _liq_dist,
-                             "mult": GAP_LIQ_ATR_MULT})
+                             "method": m["id"], "atr_pct": _atr, "gap_risk_pct": _gaprisk,
+                             "liq_dist_pct": _liq_dist, "mult": GAP_LIQ_ATR_MULT})
                     continue
                 # LESSON GATE (second brain P4, Codex ship-gate): tiered.
                 # 'active' (eff_n>=12 clusters + mission cohort negative) = HARD

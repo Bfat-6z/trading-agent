@@ -51,6 +51,7 @@ _BUCKET = {
     "buy_frac": 0.05, "cvd_delta_norm": 0.25, "cvd_roll20_norm": 0.1,
     "zscore20": 0.25, "bb_squeeze_pct": 0.05,
     "oi_chg_pct": 2.0, "oi_z": 0.5, "ls_ratio": 0.1, "ls_z": 0.5,
+    "park_vol_pct": 0.25, "gap_risk_pct": 1.0,
 }
 
 

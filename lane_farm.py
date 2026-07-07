@@ -35,6 +35,7 @@ UNIV_N = 40
 LEV = int(os.environ.get("MECH_LEV", "10"))
 # mission-parity gap-gate multiplier (same env var the executor + method_matrix read)
 GAP_LIQ_ATR_MULT = float(os.environ.get("MECH_GAP_LIQ_ATR_MULT", "3.0"))
+GAP_RISK_MULT = float(os.environ.get("MECH_GAP_RISK_MULT", "1.5"))   # gap-tail veto, mission parity
 
 # ---- lane configs. Owner: 'KHÔNG bỏ con nào — giữ hết + tạo lane mới test'. One lane
 # per method (seeds + full pool + armed), plus a RANDOM control. Uniform 10% margin so
@@ -237,7 +238,11 @@ def run_once(client):
                 atrp = row.get("atr_pct")             # fail-CLOSED on missing atr (Codex): a coin
                 if atrp is None or float(atrp) <= 0:  # we can't risk-assess must be skipped, not fired
                     continue
-                if float(atrp) * GAP_LIQ_ATR_MULT > 100.0 / max(1, LEV):
+                _ld = 100.0 / max(1, LEV)
+                if float(atrp) * GAP_LIQ_ATR_MULT > _ld:
+                    continue
+                _gr = row.get("gap_risk_pct")         # gap-tail veto (mission parity 2026-07-08)
+                if _gr is not None and float(_gr) * GAP_RISK_MULT > _ld:
                     continue
                 side = fire_m.get("side", "LONG")
                 entry = float(last["close"])

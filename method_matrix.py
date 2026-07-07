@@ -51,6 +51,7 @@ LIVE_MONTHS = 0.12             # short pull is enough to fire the latest bar
 # the executor's actual veto move together.
 MECH_LEV = int(os.environ.get("MECH_LEV", "10"))
 GAP_LIQ_ATR_MULT = float(os.environ.get("MECH_GAP_LIQ_ATR_MULT", "3.0"))
+GAP_RISK_MULT = float(os.environ.get("MECH_GAP_RISK_MULT", "1.5"))   # gap-tail veto, executor parity
 # Core features every method reads; if any is non-finite on the latest bar the frame
 # is degenerate (kline gap / warmup) and we must NOT eval method_fires on it (Codex #4:
 # the live latest row has none of backtest_method's i>=200 warmup protection).
@@ -175,9 +176,11 @@ def live_matrix(client, stats: dict) -> dict:
             # doesn't recommend a setup the executor will veto. Same constants as the
             # executor (Codex #5) so the advisory flag can't drift from the real veto.
             atr = float(row.get("atr_pct") or 0.0)
-            # fail-closed parity with the executor: gate_ok only when atr is present AND
-            # within the liquidation band (missing atr => executor now refuses => not ok).
-            gate_ok = bool(atr > 0 and atr * GAP_LIQ_ATR_MULT <= 100.0 / max(1, MECH_LEV))
+            _gr = row.get("gap_risk_pct"); _ld = 100.0 / max(1, MECH_LEV)
+            # fail-closed parity with the executor: gate_ok only when atr present AND within
+            # the liq band AND the worst recent bar (gap_risk) doesn't reach liq (2026-07-08).
+            gate_ok = bool(atr > 0 and atr * GAP_LIQ_ATR_MULT <= _ld
+                           and not (_gr is not None and float(_gr) * GAP_RISK_MULT > _ld))
             sig = {"coin": sym, "method": mid, "side": m.get("side", "LONG"),
                    "win": st.get("win"), "avg_r": st.get("avg_r"), "exp_net": st.get("exp_net"),
                    "n": st.get("n"), "atr_pct": round(atr, 2), "gate_ok": gate_ok,

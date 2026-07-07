@@ -56,7 +56,9 @@ FEATS = {"rsi14", "px_vs_ema20", "px_vs_ema50", "px_vs_ema200", "ema_stack",
          # order-flow + z-score + squeeze
          "buy_frac", "cvd_delta_norm", "cvd_roll20_norm", "zscore20", "bb_squeeze_pct",
          # open-interest + long/short positioning (futures microstructure)
-         "oi_chg_pct", "oi_z", "ls_ratio", "ls_z"}
+         "oi_chg_pct", "oi_z", "ls_ratio", "ls_z",
+         # gap-tail volatility (for sizing/gating — captures wicks ATR misses)
+         "park_vol_pct", "gap_risk_pct"}
 OPS = {"<", "<=", ">", ">=", "=="}
 
 

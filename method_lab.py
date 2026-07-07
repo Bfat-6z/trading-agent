@@ -224,6 +224,18 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
         return z
     oi_z_a = _roll_z(oi_chg_a, 96)
     ls_z_a = _roll_z(ls_a, 96)
+    # gap-tail vol (2026-07-08): close-to-close ATR MISSES the liquidation wicks that blew
+    # up 2 mission trades. Parkinson vol (uses the bar RANGE) + the worst recent bar range
+    # capture single-bar gap risk ATR rates as calm. Both trailing/causal, % of price.
+    hl_ln2 = np.log(np.where(lo > 0, h / np.where(lo > 0, lo, 1.0), 1.0)) ** 2
+    bar_rng_a = np.where(c > 0, (h - lo) / c, 0.0)         # per-bar high-low range %
+    park_a = np.zeros(len(c)); gap_risk_a = np.zeros(len(c))
+    _k4 = 4.0 * np.log(2.0)
+    for _i in range(len(c)):
+        lo_p = max(0, _i - 19)
+        park_a[_i] = float(np.sqrt(hl_ln2[lo_p:_i + 1].mean() / _k4)) * 100.0
+        lo_g = max(0, _i - 47)
+        gap_risk_a[_i] = float(bar_rng_a[lo_g:_i + 1].max()) * 100.0   # worst 48-bar single-bar move
     rows = []
     for i in range(len(bars)):
         vr = float(v[i] / volma[i]) if i >= 20 and volma[i] > 0 else 1.0
@@ -334,6 +346,9 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
             "oi_z": round(float(oi_z_a[i]), 3),
             "ls_ratio": round(float(ls_a[i]), 4),
             "ls_z": round(float(ls_z_a[i]), 3),
+            # gap-tail vol (2026-07-08)
+            "park_vol_pct": round(float(park_a[i]), 3),
+            "gap_risk_pct": round(float(gap_risk_a[i]), 3),
         })
     return rows
 
