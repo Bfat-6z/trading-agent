@@ -36,12 +36,14 @@ LEV = int(os.environ.get("MECH_LEV", "10"))
 # mission-parity gap-gate multiplier (same env var the executor + method_matrix read)
 GAP_LIQ_ATR_MULT = float(os.environ.get("MECH_GAP_LIQ_ATR_MULT", "3.0"))
 
-# ---- lane configs. Owner scale-up ('100 kênh từ toàn bộ phương pháp'): one lane per
-# method (seeds + full pool + armed), plus a RANDOM control. Uniform 10% margin so the
-# comparison isolates the METHOD's edge, not sizing. Each method keeps its own sl/tp/to
-# so it is raced exactly as it would be traded. Slots go to the highest backtest
-# expectancy first (method_matrix), so the 100 cap keeps the most promising methods.
-MAX_LANES = int(os.environ.get("LANE_FARM_MAX", "100"))
+# ---- lane configs. Owner: 'KHÔNG bỏ con nào — giữ hết + tạo lane mới test'. One lane
+# per method (seeds + full pool + armed), plus a RANDOM control. Uniform 10% margin so
+# the comparison isolates the METHOD's edge, not sizing. Each method keeps its own
+# sl/tp/to. NO expectancy cull — every method (incl. backtest-negative ones) gets a lane,
+# because backtest != live and the disciplined funnel (n>=50 + Šidák + persistence) is
+# what gates the mission, not the lane roster. Ranking only orders the display; the cap
+# is a runaway-safety ceiling — if it ever bites we LOG it (no silent drop).
+MAX_LANES = int(os.environ.get("LANE_FARM_MAX", "400"))
 MARGIN_PCT = 10
 MAX_OPEN = 3
 
@@ -85,12 +87,14 @@ def lane_configs():
               "side": "NA", "margin": MARGIN_PCT, "sl": 1.0, "tp": 6.0, "to": 48,
               "max_open": MAX_OPEN, "methods": "RANDOM"}]
     seen = {"L00_random"}
+    evaluable = 0
     for mid in ids:
-        if len(lanes) >= MAX_LANES:
-            break
         m = defs.get(mid) or {}
         if not (m.get("when") or m.get("conds")):    # need an evaluable DSL rule
             continue
+        evaluable += 1
+        if len(lanes) >= MAX_LANES:
+            continue                                  # count the drop (logged below), don't break
         k = _safe_key(mid)
         if k in seen:
             continue
@@ -101,6 +105,10 @@ def lane_configs():
                       "margin": MARGIN_PCT, "sl": float(m.get("sl_pct") or 1.5),
                       "tp": float(m.get("tp_pct") or 3.0), "to": int(m.get("timeout") or 16),
                       "max_open": MAX_OPEN, "methods": [m]})
+    dropped = evaluable - (len(lanes) - 1)            # -1 for the random control
+    if dropped > 0:                                    # NO silent cull (owner: don't drop any)
+        print(json.dumps({"warn": "lane cap hit", "evaluable": evaluable,
+                          "lanes": len(lanes), "dropped": dropped, "cap": MAX_LANES}))
     return lanes
 
 def _lp(k): return LDIR / k
