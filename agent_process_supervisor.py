@@ -143,6 +143,8 @@ def specs() -> list[AgentSpec]:
         # 10 parallel paper experiment lanes incl. a random-entry control; feeds
         # trade_autopsy/lesson mining; paper-only, mission untouched.
         AgentSpec("lane_farm", "lane_farm.py", ("--interval", "300"), STATE_DIR / "lane_farm.pid", STATE_DIR / "lane_farm_heartbeat.json", 1200),
+        AgentSpec("lane_farm_1h", "lane_farm.py", ("--interval", "600", "--tf", "1h"), STATE_DIR / "lane_farm_1h.pid", STATE_DIR / "lane_farm_1h_heartbeat.json", 2400),
+
         # Method matrix (owner /goal: 'áp nhiều pp lên setup, cái nào winrate cao nhất')
         # — decision-support only, backtests all ~118 method defs -> live signal matrix.
         # Places no orders; the ARMED gate still rules execution. Stats cached 3h.

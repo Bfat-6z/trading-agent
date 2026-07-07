@@ -85,6 +85,14 @@ def main():
         print(f"  methods evaluable(n>=20): {len(allm)} | +EV: {len(pos)} ({100*len(pos)//max(1,len(allm))}%) | mean exp: {avg}%")
         for k, (e, w, n) in best:
             print(f"    {k:28s} exp={e:+.3f}% win={w:.0%} n={n}")
+        # MOMENTUM family focus (Phase 2b hypothesis: trend edge lives at longer horizons)
+        mo = {k: v for k, v in stats.items() if k.startswith("mo_")}
+        if mo:
+            mo_pos = [k for k, v in mo.items() if v[0] > 0]
+            mo_avg = round(sum(v[0] for v in mo.values()) / len(mo), 4)
+            mbest = sorted(mo.items(), key=lambda kv: -kv[1][0])[:3]
+            print(f"  >> MOMENTUM: {len(mo)} eval | +EV {len(mo_pos)}/{len(mo)} | mean {mo_avg}% | "
+                  + " ".join(f"{k}={v[0]:+.2f}%(n{v[2]})" for k, v in mbest))
         print()
 
 

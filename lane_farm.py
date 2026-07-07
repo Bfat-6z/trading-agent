@@ -24,9 +24,13 @@ import method_lab as ml
 from method_seeds import SEED_METHODS
 
 ROOT = Path(__file__).resolve().parent
-LDIR = ROOT / "state" / "lanes"
-HB = ROOT / "state" / "lane_farm_heartbeat.json"
-TF = "15m"
+import sys as _sys                            # read --tf at import so LDIR/HB/lock are TF-scoped
+_tf_arg = _sys.argv[_sys.argv.index("--tf") + 1] if "--tf" in _sys.argv else None
+TF = _tf_arg or os.environ.get("LANE_FARM_TF", "15m")   # 15m default; --tf 1h farms momentum (Phase 2b)
+_TFSFX = "" if TF == "15m" else f"_{TF}"       # keep 15m paths unchanged (backward compat)
+LDIR = ROOT / "state" / f"lanes{_TFSFX}"
+HB = ROOT / "state" / f"lane_farm{_TFSFX}_heartbeat.json"
+_MONTHS = {"15m": 0.12, "1h": 1.0, "4h": 3.0}.get(TF, 0.12)   # enough bars per TF for the 220 gate
 FEE = ml.FEE_RT
 START_EQ = 100.0
 BUST_EQ = 10.0
@@ -144,7 +148,7 @@ def run_once(client):
     bar_ms = of._TF_MS[TF]
     for s in syms:                                  # ONE fetch pass shared by all 10 lanes
         try:
-            bars = [b for b in of.fetch_klines_with_flow(s, TF, months=0.12, end_ms=now,
+            bars = [b for b in of.fetch_klines_with_flow(s, TF, months=_MONTHS, end_ms=now,
                                                          client=client, sleep_between=0.02, with_deriv=True)
                     if int(b["ts_ms"]) + 0 <= now]
             bars = [b for b in bars if b.get("is_final", True)]
@@ -286,10 +290,11 @@ def main():
     ap = argparse.ArgumentParser(description="10-lane paper farm (paper-only)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--interval", type=float, default=300.0)
+    ap.add_argument("--tf", default="15m")       # parsed at import for TF; declared here so argparse accepts it
     args = ap.parse_args()
     # single-instance: hold an EXCLUSIVE file lock for the whole process lifetime
     # (atomic — no pid probe races; Codex #5)
-    lock_f = open(ROOT / "state" / "lane_farm.lock", "a+b")
+    lock_f = open(ROOT / "state" / f"lane_farm{_TFSFX}.lock", "a+b")
     try:
         import msvcrt
         msvcrt.locking(lock_f.fileno(), msvcrt.LK_NBLCK, 1)
