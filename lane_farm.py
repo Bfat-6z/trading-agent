@@ -32,7 +32,9 @@ START_EQ = 100.0
 BUST_EQ = 10.0
 MIN_QVOL = 50e6
 UNIV_N = 40
-LEV = 10
+LEV = int(os.environ.get("MECH_LEV", "10"))
+# mission-parity gap-gate multiplier (same env var the executor + method_matrix read)
+GAP_LIQ_ATR_MULT = float(os.environ.get("MECH_GAP_LIQ_ATR_MULT", "3.0"))
 
 # ---- lane configs. Owner scale-up ('100 kênh từ toàn bộ phương pháp'): one lane per
 # method (seeds + full pool + armed), plus a RANDOM control. Uniform 10% margin so the
@@ -218,6 +220,14 @@ def run_once(client):
                         if ml.method_fires(row, m):
                             fire_m = m; break
                 if not fire_m:
+                    continue
+                # MISSION-PARITY gap-gate: the mission refuses fires where liquidation is
+                # < GAP_LIQ_ATR_MULT(3) ATRs away (atr_pct > ~100/lev/3 ≈ 3.33% at x10),
+                # so the lane MUST too — else lane edge harvested from high-vol coins the
+                # mission would never touch inflates the promotion signal. Applied to the
+                # RANDOM control as well so the alpha floor is measured on the same coins.
+                atrp = float(row.get("atr_pct") or 0.0)
+                if atrp > 0 and atrp * GAP_LIQ_ATR_MULT > 100.0 / LEV:
                     continue
                 side = fire_m.get("side", "LONG")
                 entry = float(last["close"])

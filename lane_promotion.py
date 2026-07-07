@@ -32,7 +32,7 @@ ARMED = ROOT / "state" / "method_lab" / "armed_methods.json"
 PROMO_LOG = ROOT / "state" / "lane_promotions.jsonl"
 HB = ROOT / "state" / "lane_promotion_heartbeat.json"
 
-MIN_N = int(os.environ.get("PROMO_MIN_N", "30"))
+MIN_N = int(os.environ.get("PROMO_MIN_N", "50"))   # thin for 6:1 payoff variance -> 50 (Codex/owner #3)
 MAX_PROMOTE = int(os.environ.get("PROMO_MAX", "8"))
 ALPHA = 0.05
 MIN_EXPECT_R = float(os.environ.get("PROMO_MIN_R", "0.05"))   # absolute expectancy floor (R)
