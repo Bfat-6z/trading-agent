@@ -34,56 +34,72 @@ MIN_QVOL = 50e6
 UNIV_N = 40
 LEV = 10
 
-# ---- lane configs: {id, desc, methods:[(conds-ref | dsl)], margin_pct, sl, tp, to, max_open}
-def _m(mid, **over):
-    d = {x["id"]: x for x in SEED_METHODS}
+# ---- lane configs. Owner scale-up ('100 kênh từ toàn bộ phương pháp'): one lane per
+# method (seeds + full pool + armed), plus a RANDOM control. Uniform 10% margin so the
+# comparison isolates the METHOD's edge, not sizing. Each method keeps its own sl/tp/to
+# so it is raced exactly as it would be traded. Slots go to the highest backtest
+# expectancy first (method_matrix), so the 100 cap keeps the most promising methods.
+MAX_LANES = int(os.environ.get("LANE_FARM_MAX", "100"))
+MARGIN_PCT = 10
+MAX_OPEN = 3
+
+
+def _all_method_defs() -> dict:
+    by_id = {m["id"]: dict(m) for m in SEED_METHODS}
     pool = ROOT / "state" / "method_lab" / "methods_pool.jsonl"
     if pool.exists():
         for l in pool.read_text(encoding="utf-8").splitlines():
-            try:
-                x = json.loads(l); d[x["id"]] = x
-            except Exception:
-                pass
-    base = d.get(mid)
-    if not base:                                    # pool evicted / id missing -> lane skips it
-        return None
-    m = dict(base); m.update(over)
-    return m
+            if l.strip():
+                try:
+                    x = json.loads(l); by_id[x["id"]] = x
+                except Exception:
+                    pass
+    armed = ROOT / "state" / "method_lab" / "armed_methods.json"
+    if armed.exists():
+        try:
+            d = json.loads(armed.read_text(encoding="utf-8"))
+            for m in (d if isinstance(d, list) else d.get("methods", [])):
+                by_id[m["id"]] = {**by_id.get(m["id"], {}), **m}
+        except Exception:
+            pass
+    return by_id
+
+
+def _safe_key(mid: str) -> str:
+    return "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(mid))[:48]
+
 
 def lane_configs():
-    return [
-        {"k": "L1_proven", "desc": "mirror mission: notknife>capitulation", "margin": 10,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 3,
-         "methods": [_m("wr_flush_notknife"), _m("capitulation_long")]},
-        {"k": "L2_notknife_big", "desc": "notknife only, VOL TO (25% margin)", "margin": 25,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 4,
-         "methods": [_m("wr_flush_notknife")]},
-        {"k": "L3_cap_loose", "desc": "capitulation nới (rsi<25, vol>1.5)", "margin": 15,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 4,
-         "methods": [{"id": "cap_loose", "side": "LONG", "when": [
-             {"feat": "rsi14", "op": "<", "val": 25}, {"feat": "vol_ratio", "op": ">", "val": 1.5}]}]},
-        {"k": "L4_bear_noasia", "desc": "mined bear-4h ex-Asia", "margin": 15,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 4, "methods": [_m("wr_mined_cap_bear_noasia")]},
-        {"k": "L5_deep15", "desc": "deep flush rsi<15", "margin": 20,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 4, "methods": [_m("wr_mined_cap_deep15")]},
-        {"k": "L6_reclaim", "desc": "um_reclaim_06 (ex-candidate)", "margin": 15,
-         "sl": 1.0, "tp": 6.0, "to": 16, "max_open": 4, "methods": [_m("um_reclaim_06")]},
-        {"k": "L7_breakout", "desc": "breakout retest-live (dead in backtest)", "margin": 15,
-         "sl": 1.5, "tp": 3.0, "to": 16, "max_open": 4,
-         "methods": [{"id": "brk_live", "side": "LONG", "when": [
-             {"feat": "brk20_pct", "op": ">", "val": 0.1}, {"feat": "vol_ratio", "op": ">", "val": 2.0}]}]},
-        {"k": "L8_short_crowd", "desc": "SHORT crowded-top reject", "margin": 15,
-         "sl": 1.5, "tp": 4.0, "to": 16, "max_open": 4,
-         "methods": [{"id": "short_crowd", "side": "SHORT", "when": [
-             {"feat": "funding_z", "op": ">", "val": 1.0}, {"feat": "rsi14", "op": ">", "val": 70},
-             {"feat": "bar_z", "op": "<", "val": -0.5}]}]},
-        {"k": "L9_ensemble", "desc": "first-match toàn pool armed+watch+loose", "margin": 12,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 5,
-         "methods": [_m("wr_flush_notknife"), _m("wr_mined_cap_deep15"), _m("capitulation_long"),
-                     _m("wr_mined_cap_bear_noasia")]},
-        {"k": "L10_random", "desc": "RANDOM control (đo alpha-floor của exit)", "margin": 10,
-         "sl": 1.0, "tp": 6.0, "to": 48, "max_open": 3, "methods": "RANDOM"},
-    ]
+    defs = _all_method_defs()
+    prio = {}                                        # rank slots by backtest expectancy
+    try:
+        mm = json.loads((ROOT / "state" / "memory" / "method_matrix_stats.json").read_text(encoding="utf-8"))
+        prio = {k: (v.get("exp_net") if v.get("exp_net") is not None else -9)
+                for k, v in (mm.get("methods") or {}).items()}
+    except Exception:
+        pass
+    ids = sorted(defs.keys(), key=lambda i: -prio.get(i, -9))
+    lanes = [{"k": "L00_random", "desc": "RANDOM control (sàn alpha)", "family": "control",
+              "side": "NA", "margin": MARGIN_PCT, "sl": 1.0, "tp": 6.0, "to": 48,
+              "max_open": MAX_OPEN, "methods": "RANDOM"}]
+    seen = {"L00_random"}
+    for mid in ids:
+        if len(lanes) >= MAX_LANES:
+            break
+        m = defs.get(mid) or {}
+        if not (m.get("when") or m.get("conds")):    # need an evaluable DSL rule
+            continue
+        k = _safe_key(mid)
+        if k in seen:
+            continue
+        seen.add(k)
+        lanes.append({"k": k, "mid": mid,
+                      "desc": (m.get("desc") or m.get("family") or mid)[:44],
+                      "family": m.get("family") or "?", "side": m.get("side", "LONG"),
+                      "margin": MARGIN_PCT, "sl": float(m.get("sl_pct") or 1.5),
+                      "tp": float(m.get("tp_pct") or 3.0), "to": int(m.get("timeout") or 16),
+                      "max_open": MAX_OPEN, "methods": [m]})
+    return lanes
 
 def _lp(k): return LDIR / k
 def _load(p):
@@ -221,13 +237,17 @@ def run_once(client):
                               "entry_ts_ms": int(last["ts_ms"]), "opened_ts_ms": now,
                               "pos_id": f"{s}_{int(last['ts_ms'])}_{k}"})
                 open_syms.add(s)
-        (_lp(k) / "open.jsonl").parent.mkdir(parents=True, exist_ok=True)
-        (_lp(k) / "open.jsonl").write_text(
-            "\n".join(json.dumps(x) for x in still) + ("\n" if still else ""), encoding="utf-8")
+        op = _lp(k) / "open.jsonl"
+        op.parent.mkdir(parents=True, exist_ok=True)
+        tmp = op.with_suffix(".tmp")                  # atomic replace (Codex #4)
+        tmp.write_text("\n".join(json.dumps(x) for x in still) + ("\n" if still else ""), encoding="utf-8")
+        os.replace(tmp, op)
         _save_acct(k, a)
         summary[k] = {"equity": a["equity"], "trades": a["trades"],
                       "win": round(a["wins"] / a["trades"], 3) if a["trades"] else None,
-                      "open": len(still), "closed_now": closed, "busted": a.get("busted", False)}
+                      "open": len(still), "closed_now": closed, "busted": a.get("busted", False),
+                      "desc": cfg.get("desc", ""), "family": cfg.get("family", "?"),
+                      "side": cfg.get("side", "LONG"), "mid": cfg.get("mid", k)}
     LDIR.mkdir(parents=True, exist_ok=True)
     (LDIR / "summary.json").write_text(json.dumps(
         {"ts": now, "lanes": summary}, indent=1), encoding="utf-8")

@@ -389,29 +389,28 @@ def build() -> dict:
     except Exception:
         pass
 
-    # Lane farm: 10 parallel $100 paper lanes (owner: 'theo dõi cả 10 line'). Each lane
-    # is an independent experiment; L10 is the RANDOM-entry control (the alpha floor any
-    # lane must beat). Read the supervisor-written summary + surface the proven-vs-random
-    # gap so the honest edge signal is visible right on the trade wall.
-    LANE_DESC = {
-        "L1_proven": "Mirror mission (notknife→cap)", "L2_notknife_big": "notknife · 25% margin",
-        "L3_cap_loose": "Capitulation nới rsi<25", "L4_bear_noasia": "Mined bear ex-Asia",
-        "L5_deep15": "Deep flush rsi<15", "L6_reclaim": "um_reclaim (ex-cand)",
-        "L7_breakout": "Breakout retest-live", "L8_short_crowd": "SHORT crowded-top",
-        "L9_ensemble": "Ensemble toàn pool", "L10_random": "RANDOM control (sàn alpha)",
-    }
+    # Lane farm: up to 100 parallel $100 paper lanes, one per method (owner: '100 kênh
+    # từ toàn bộ phương pháp'). L00_random is the RANDOM-entry control (the alpha floor).
+    # For 100 lanes the per-lane curves/trades are HEAVY, so the full detail is written to
+    # its own UI/lanes.json (the React explorer fetches that) and only a LIGHT summary
+    # goes into data.json for the main dashboard table.
+    armed_ids = set()
+    try:
+        _am = json.loads((st / "method_lab" / "armed_methods.json").read_text(encoding="utf-8"))
+        armed_ids = {m["id"] for m in (_am if isinstance(_am, list) else _am.get("methods", []))}
+    except Exception:
+        pass
     lanes = {"total_equity": None, "start_total": None, "pnl": None, "ts": None,
-             "proven_vs_random": None, "lanes": []}
+             "proven_vs_random": None, "n": 0, "lanes": []}
+    full_rows = []
     try:
         ls = json.loads((st / "lanes" / "summary.json").read_text())
         lanes["ts"] = ls.get("ts")
-        rows = []
         for k, v in (ls.get("lanes") or {}).items():
             eq = round(float(v.get("equity", 100) or 100), 2)
             w = v.get("win")
+            mid = v.get("mid", k)
             ldir = st / "lanes" / k
-            # per-lane equity curve (cumulative $100 + pnl per closed trade) so the
-            # explorer can chart each lane exactly like the main mission line.
             closed = sorted(_load_jsonl(ldir / "closed.jsonl"),
                             key=lambda c: int(c.get("closed_ts_ms") or 0))
             e = 100.0
@@ -428,23 +427,36 @@ def build() -> dict:
             opos = [{"sym": p.get("symbol"), "side": p.get("side"), "method": p.get("method"),
                      "entry": p.get("entry"), "margin": p.get("margin")}
                     for p in _load_jsonl(ldir / "open.jsonl")]
-            rows.append({"k": k, "desc": LANE_DESC.get(k, ""), "equity": eq,
-                         "pnl": round(eq - 100.0, 2), "trades": int(v.get("trades", 0) or 0),
-                         "win": round(float(w) * 100, 1) if w is not None else None,
-                         "open": int(v.get("open", 0) or 0), "busted": bool(v.get("busted")),
-                         "is_random": k == "L10_random",
-                         "curve": curve, "closed": recent, "open_pos": opos})
-        rows.sort(key=lambda r: -r["equity"])
-        lanes["lanes"] = rows
-        if rows:
-            tot = round(sum(r["equity"] for r in rows), 2)
+            base = {"k": k, "mid": mid, "desc": v.get("desc", ""), "family": v.get("family", "?"),
+                    "side": v.get("side", "LONG"), "equity": eq, "pnl": round(eq - 100.0, 2),
+                    "trades": int(v.get("trades", 0) or 0),
+                    "win": round(float(w) * 100, 1) if w is not None else None,
+                    "open": int(v.get("open", 0) or 0), "busted": bool(v.get("busted")),
+                    "is_random": k == "L00_random", "armed": mid in armed_ids}
+            full_rows.append({**base, "curve": curve, "closed": recent, "open_pos": opos})
+        full_rows.sort(key=lambda r: -r["equity"])
+        if full_rows:
+            tot = round(sum(r["equity"] for r in full_rows), 2)
             lanes["total_equity"] = tot
-            lanes["start_total"] = 100.0 * len(rows)
-            lanes["pnl"] = round(tot - 100.0 * len(rows), 2)
-            pr = next((r for r in rows if r["k"] == "L1_proven"), None)
-            rd = next((r for r in rows if r["k"] == "L10_random"), None)
-            if pr and rd:
-                lanes["proven_vs_random"] = round(pr["equity"] - rd["equity"], 2)
+            lanes["start_total"] = 100.0 * len(full_rows)
+            lanes["pnl"] = round(tot - 100.0 * len(full_rows), 2)
+            lanes["n"] = len(full_rows)
+            rd = next((r for r in full_rows if r["is_random"]), None)
+            armed_rows = [r for r in full_rows if r["armed"]]
+            best_proven = max(armed_rows, key=lambda r: r["equity"], default=None) or \
+                next((r for r in full_rows if not r["is_random"]), None)
+            if best_proven and rd:
+                lanes["proven_vs_random"] = round(best_proven["equity"] - rd["equity"], 2)
+        # heavy detail -> its own file for the explorer; keep data.json light.
+        try:
+            UI.mkdir(parents=True, exist_ok=True)
+            (UI / "lanes.json").write_text(json.dumps({**lanes, "lanes": full_rows}, default=str), encoding="utf-8")
+        except Exception:
+            pass
+        # LIGHT summary (no curve/closed/open_pos) for the dashboard table
+        lanes["lanes"] = [{kk: r[kk] for kk in ("k", "mid", "desc", "family", "side", "equity",
+                            "pnl", "trades", "win", "open", "busted", "is_random", "armed")}
+                          for r in full_rows]
     except Exception:
         pass
 
