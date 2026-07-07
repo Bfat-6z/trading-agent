@@ -49,7 +49,12 @@ FEATS = {"rsi14", "px_vs_ema20", "px_vs_ema50", "px_vs_ema200", "ema_stack",
          "vol_ratio", "ret5", "ret20", "close", "ema4h_state", "ema4h_cross",
          "hour_utc", "range20_pct", "brk20_pct", "brkdn20_pct",
          "streak_down", "streak_up", "dd96_pct", "rally96_pct", "atr_pct", "dow",
-         "streak", "bar_z", "close_pos", "funding_rate_bps", "funding_z", "dd_from_high96_pct"}
+         "streak", "bar_z", "close_pos", "funding_rate_bps", "funding_z", "dd_from_high96_pct",
+         # extended TA (2026-07-07): let validate_method + the auto-proposer use them too
+         "macd_hist", "macd_state", "adx", "supertrend_dir", "bb_pctb", "bb_width_pct",
+         "stoch_k", "stoch_d", "cci20", "williams_r", "roc10", "px_vs_vwap20",
+         # order-flow + z-score + squeeze
+         "buy_frac", "cvd_delta_norm", "cvd_roll20_norm", "zscore20", "bb_squeeze_pct"}
 OPS = {"<", "<=", ">", ">=", "=="}
 
 

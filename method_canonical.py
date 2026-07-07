@@ -27,7 +27,8 @@ from typing import Any
 from atomic_state import canonical_json
 
 # categorical features: exact identity, never bucketed
-CATEGORICAL = {"ema_stack", "ema4h_state", "ema4h_cross", "dow", "hour_utc",
+CATEGORICAL = {"macd_state", "supertrend_dir",
+               "ema_stack", "ema4h_state", "ema4h_cross", "dow", "hour_utc",
                "streak", "streak_up", "streak_down"}
 
 # advisory bucket width per feature family (val is snapped to nearest multiple)
@@ -43,6 +44,12 @@ _BUCKET = {
     "px_vs_ema20": 0.5, "px_vs_ema50": 0.5, "px_vs_ema200": 0.5,
     "dd96_pct": 0.5, "rally96_pct": 0.5, "dd_from_high96_pct": 0.5,
     "brk20_pct": 0.5, "brkdn20_pct": 0.5, "range20_pct": 0.5, "atr_pct": 0.5,
+    # extended TA + order-flow (2026-07-07) — bounded/normalized features only; macd_hist
+    # is price-scaled (varies by coin) so it's left unbucketed (methods use macd_state).
+    "adx": 2.0, "bb_pctb": 0.1, "bb_width_pct": 0.25, "stoch_k": 5.0, "stoch_d": 5.0,
+    "cci20": 25.0, "williams_r": 5.0, "roc10": 0.5, "px_vs_vwap20": 0.5,
+    "buy_frac": 0.05, "cvd_delta_norm": 0.25, "cvd_roll20_norm": 0.1,
+    "zscore20": 0.25, "bb_squeeze_pct": 0.05,
 }
 
 

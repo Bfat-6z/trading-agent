@@ -187,6 +187,23 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
                 stoch_k[_i] = float((c[_i] - ll) / (hh - ll) * 100.0)
                 wr14[_i] = float((c[_i] - hh) / (hh - ll) * 100.0)
     stoch_d = np.convolve(stoch_k, np.ones(3) / 3.0, mode="full")[:len(c)]
+    # --- order-flow (CVD) from the taker-buy volume baked into each kline + z-score /
+    # squeeze regime (owner research 2026-07-07: CVD/OFI has the strongest academic
+    # anchor of any TA signal; z-score is free from Bollinger). All causal, no lookahead.
+    tbb = np.array([float(b.get("taker_buy_base") or 0.0) for b in bars])
+    cvd_delta_a = 2.0 * tbb - v                    # net taker buy volume (buy - sell)
+    buy_frac_a = np.where(v > 0, tbb / v, 0.5)
+    # clip normalized CVD so a near-zero 20-bar avg vol on a dust/illiquid market can't
+    # explode the feature (Codex #3); a delta > 10x avg vol is nonsensical anyway.
+    cvd_norm_a = np.clip(np.where(volma > 1e-9, cvd_delta_a / volma, 0.0), -10.0, 10.0)
+    cvd_roll_a = np.convolve(cvd_delta_a, np.ones(20), mode="full")[:len(v)]   # trailing 20-sum (causal)
+    cvd_roll_norm_a = np.clip(np.where(volma > 1e-9, cvd_roll_a / (volma * 20.0), 0.0), -5.0, 5.0)
+    # Bollinger-width squeeze percentile (compression -> expansion regime)
+    bb_sq_pct = np.full(len(c), 1.0)
+    for _i in range(len(c)):
+        if _i >= 100:
+            wsq = bb_width[_i - 99:_i + 1]
+            bb_sq_pct[_i] = float((wsq <= bb_width[_i]).sum()) / 100.0   # rank of current width
     rows = []
     for i in range(len(bars)):
         vr = float(v[i] / volma[i]) if i >= 20 and volma[i] > 0 else 1.0
@@ -286,6 +303,12 @@ def feature_frame(bars: list[dict[str, Any]], funding: list | None = None) -> li
             "williams_r": round(float(wr14[i]), 2),
             "roc10": round(float(roc10[i]), 3),
             "px_vs_vwap20": round(float(c[i] / vwap20[i] - 1) * 100, 3) if vwap20[i] else 0.0,
+            # order-flow + z-score + squeeze (2026-07-07)
+            "buy_frac": round(float(buy_frac_a[i]), 4),
+            "cvd_delta_norm": round(float(cvd_norm_a[i]), 4),
+            "cvd_roll20_norm": round(float(cvd_roll_norm_a[i]), 4),
+            "zscore20": round(float(4.0 * bb_pctb[i] - 2.0), 3),
+            "bb_squeeze_pct": round(float(bb_sq_pct[i]), 3),
         })
     return rows
 
