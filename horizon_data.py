@@ -409,11 +409,31 @@ def build() -> dict:
         for k, v in (ls.get("lanes") or {}).items():
             eq = round(float(v.get("equity", 100) or 100), 2)
             w = v.get("win")
+            ldir = st / "lanes" / k
+            # per-lane equity curve (cumulative $100 + pnl per closed trade) so the
+            # explorer can chart each lane exactly like the main mission line.
+            closed = sorted(_load_jsonl(ldir / "closed.jsonl"),
+                            key=lambda c: int(c.get("closed_ts_ms") or 0))
+            e = 100.0
+            first_ts = int(closed[0].get("closed_ts_ms") or 0) if closed else 0
+            curve = [{"ts": (first_ts - 60000) if first_ts else 0, "equity": 100.0}]
+            for c in closed:
+                e += float(c.get("pnl") or 0)
+                curve.append({"ts": int(c.get("closed_ts_ms") or 0), "equity": round(e, 2)})
+            recent = [{"sym": c.get("symbol"), "side": c.get("side"),
+                       "pnl": round(float(c.get("pnl") or 0), 2), "r": c.get("r"),
+                       "reason": c.get("reason"), "entry": c.get("entry"), "exit": c.get("exit"),
+                       "ts": int(c.get("closed_ts_ms") or 0)}
+                      for c in reversed(closed)][:14]
+            opos = [{"sym": p.get("symbol"), "side": p.get("side"), "method": p.get("method"),
+                     "entry": p.get("entry"), "margin": p.get("margin")}
+                    for p in _load_jsonl(ldir / "open.jsonl")]
             rows.append({"k": k, "desc": LANE_DESC.get(k, ""), "equity": eq,
                          "pnl": round(eq - 100.0, 2), "trades": int(v.get("trades", 0) or 0),
                          "win": round(float(w) * 100, 1) if w is not None else None,
                          "open": int(v.get("open", 0) or 0), "busted": bool(v.get("busted")),
-                         "is_random": k == "L10_random"})
+                         "is_random": k == "L10_random",
+                         "curve": curve, "closed": recent, "open_pos": opos})
         rows.sort(key=lambda r: -r["equity"])
         lanes["lanes"] = rows
         if rows:
