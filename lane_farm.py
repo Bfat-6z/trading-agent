@@ -302,7 +302,7 @@ def main():
         print(json.dumps({"exit": "another lane_farm holds the lock"})); return
     except ImportError:
         pass
-    (ROOT / "state" / "lane_farm.pid").write_text(str(os.getpid()), encoding="utf-8")
+    (ROOT / "state" / f"lane_farm{_TFSFX}.pid").write_text(str(os.getpid()), encoding="utf-8")  # TF-scoped (bughunt R6 #3): 1h no longer clobbers the 15m pid
     from tradingagents.binance.client import spot_client
     client = spot_client()
     while True:

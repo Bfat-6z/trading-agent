@@ -384,11 +384,24 @@ def heartbeat_age_seconds(path: Path | None) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
 
+# bughunt 2026-07-08 (R6 #1): a freshly-spawned agent has NO heartbeat yet (age is None). The old
+# `stale = age is None or ...` killed it on the very next cycle before it could prove liveness ->
+# relaunch -> 3x -> 6h quarantine = the "mission stuck for hours". Track spawn time and give a
+# startup grace during which "no heartbeat yet" is NOT stale.
+STARTUP_GRACE_SECONDS = 180.0
+_started_at: dict[str, float] = {}
+
+
 def stale(spec: AgentSpec) -> bool:
     if spec.max_heartbeat_age_seconds is None:
         return False
     age = heartbeat_age_seconds(spec.heartbeat_file)
-    return age is None or age > spec.max_heartbeat_age_seconds
+    if age is None:
+        started = _started_at.get(spec.name)
+        if started is not None and (time.time() - started) < STARTUP_GRACE_SECONDS:
+            return False                        # still inside its startup grace -> not stale
+        return True
+    return age > spec.max_heartbeat_age_seconds
 
 def restart_gate(agent: str, *, now: datetime | None = None, state_path: Path = RESTART_STATE_PATH) -> dict:
     current = now or datetime.now(timezone.utc)
@@ -525,7 +538,23 @@ def cleanup_runtime(exclude_current_supervisor: bool = True) -> dict:
             append_jsonl("runtime_cleanup_stop", {"script": script, "pid": pid, "kept_pid": current if script == SUPERVISOR_SCRIPT else None})
     unlink_pid_files()
     unlink_pid_files(supervisor_lock_files())
-    return {"stopped": stopped, "pid_files_removed": [str(path) for path in supervised_pid_files()], "lock_files_removed": [str(path) for path in supervisor_lock_files()]}
+    # bughunt R6 #4: --restart-clean must ALSO clear what previously made it a no-op — the restart/
+    # quarantine state (else a quarantined agent stays quarantined up to 6h), stale heartbeat files
+    # (else the just-relaunched agent is instantly judged stale -> killed, R6 #1), and the agents'
+    # own child loop.locks (the fresh-mtime lock that self-blocked llm_trader).
+    _extra_cleared: list[str] = []
+    for p in [RESTART_STATE_PATH, *(sp.heartbeat_file for sp in specs() if sp.heartbeat_file),
+              STATE_DIR / "llm_trader" / "loop.lock", STATE_DIR / "lane_farm.lock",
+              STATE_DIR / "lane_farm_1h.lock", STATE_DIR / "manual_trader" / "loop.lock"]:
+        try:
+            if p and Path(p).exists():
+                Path(p).unlink()
+                _extra_cleared.append(str(p))
+        except Exception as exc:
+            append_jsonl("runtime_cleanup_extra_error", {"path": str(p), "error": str(exc)[:120]})
+    _started_at.clear()                          # forget spawn times so the grace re-arms cleanly
+    return {"stopped": stopped, "pid_files_removed": [str(path) for path in supervised_pid_files()],
+            "lock_files_removed": [str(path) for path in supervisor_lock_files()], "extra_cleared": _extra_cleared}
 
 def acquire_supervisor_lock() -> bool:
     current = os.getpid()
@@ -601,6 +630,7 @@ def start_agent(spec: AgentSpec) -> int:
             pass
     with out_path.open("ab") as out_fh, err_path.open("ab") as err_fh:
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out_fh, stderr=err_fh, creationflags=creationflags, env=scrub_child_env())
+    _started_at[spec.name] = time.time()        # bughunt R6 #1: stamp spawn time for the startup grace
     if spec.heartbeat_file is None:
         write_pid(spec.pid_file, proc.pid)
     append_jsonl("agent_start", {"agent": spec.name, "pid": proc.pid, "cmd": cmd})
