@@ -774,11 +774,17 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
         action = str(dec.get("action", "SKIP")).upper()
         if not ctx or action not in ("LONG", "SHORT"):
             continue
-        try:                                                              # bughunt LLM#2: a malformed
-            lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5      # LLM field ("10x"/NaN/[..])
-            size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # must skip
-            sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))  # just THIS decision, not crash
-            tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3))) # the whole batch (x5/x10, 5-10%)
+        try:                                                              # bughunt LLM#2 + Codex#3: a
+            import math as _math                                          # malformed LLM field
+            _sz = float(dec.get("size_pct", 5) or 5)                      # ("10x"/NaN/Inf/[..]) must skip
+            _sl = float(dec.get("sl_pct", 2) or 2)                        # only THIS decision, not crash
+            _tp = float(dec.get("tp_pct", 3) or 3)                        # the batch — AND NaN/Inf must not
+            if not (_math.isfinite(_sz) and _math.isfinite(_sl) and _math.isfinite(_tp)):
+                raise ValueError("non-finite numeric")                    # slip the clamp as a boundary value
+            lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5     # (NaN size -> max size). x5/x10 only
+            size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, _sz))          # 5-10%
+            sl_pct = max(0.3, min(8.0, _sl))
+            tp_pct = max(0.3, min(15.0, _tp))
         except Exception:
             _append(LT_DIR / "governance.jsonl", {"event": "llm_decision_coercion_skip", "symbol": sym})
             continue
@@ -1188,6 +1194,18 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
             if (side == "LONG" and float(b["low"]) <= limit) or (side == "SHORT" and float(b["high"]) >= limit):
                 fill_ts = int(b["ts_ms"]); break
         if fill_ts is not None:                       # FILLED -> open at the limit price
+            # Codex #2: RE-VETO gap risk at FILL. The gap-veto ran when the limit was PLACED, but the
+            # coin may have turned volatile while it rested (a flush candle after placement). Re-check the
+            # gap-tail against fresh bars before opening — same fail-closed rule as entry.
+            _rngs = [(float(b["high"]) - float(b["low"])) / float(b["close"])
+                     for b in fb[-48:] if float(b.get("close") or 0) > 0]
+            _grisk = (max(_rngs) * 100) if _rngs else None
+            _liqd = 100.0 / max(1, int(po.get("leverage") or MECH_LEV))
+            if _grisk is None or _grisk != _grisk or _grisk * GAP_RISK_MULT > _liqd:
+                _append(LT_DIR / "pending_events.jsonl",
+                        {"symbol": sym, "side": side, "event": "fill_blocked_gap_risk",
+                         "gap_risk_pct": _grisk, "ts": now_ms})
+                continue
             d = {"symbol": sym, "action": side, "price": limit, "leverage": po["leverage"],
                  "size_pct": po["size_pct"], "sl_pct": po["sl_pct"], "tp_pct": po["tp_pct"], "entry_px": None,
                  "_smc": po.get("smc") or {}, "atr": po.get("atr", 0), "_quote_vol_24h": po.get("quote_vol_24h", 0),
