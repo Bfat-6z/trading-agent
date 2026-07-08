@@ -1252,7 +1252,14 @@ def resolve(client: Any, now_ms: int) -> int:
                     if hi_ >= liq_px: hit = (liq_px, "liquidation")
                     elif hi_ >= sl: hit = (sl, "sl")
             else:
-                hit = lr.exit_check(b, side, liq_px, sl, tp)  # pessimistic: liq -> sl -> tp
+                try:
+                    hit = lr.exit_check(b, side, liq_px, sl, tp)  # pessimistic: liq -> sl -> tp
+                except Exception:
+                    # data-flow audit 2026-07-08: a corrupt (NaN) liq_px/sl/tp on a legacy position
+                    # makes exit_check raise, and this call is OUTSIDE resolve's fetch-try -> it would
+                    # crash the whole batch (every open position unresolved that tick). Skip the bar;
+                    # the position falls through to the timeout close instead of killing the loop.
+                    hit = None
             if hit is not None:
                 exit_px, reason = hit
                 # a stop that has ratcheted to/above breakeven is a managed exit

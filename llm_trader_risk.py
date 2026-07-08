@@ -63,6 +63,11 @@ def liquidation_price(entry: float, leverage: int, side: str, mmr: float) -> flo
         raise ValueError(f"leverage must be positive, got {leverage!r}")
     e = float(entry)
     m = float(mmr)
+    # data-flow audit 2026-07-08: a NaN/inf/0 entry (or NaN mmr) sails through and yields a NaN/absurd
+    # liq price that gets STORED on the position, then crashes exit_check (a raise OUTSIDE resolve's
+    # try) on the next cycle -> the whole resolve batch dies. Fail loud HERE, consistent with lev<=0.
+    if not (math.isfinite(e) and e > 0 and math.isfinite(m)):
+        raise ValueError(f"liquidation_price needs finite entry>0 and finite mmr, got entry={entry!r} mmr={mmr!r}")
     if s == "LONG":
         return e * (1.0 - 1.0 / lev + m)
     if s == "SHORT":
@@ -215,7 +220,11 @@ def net_pnl(side: str, entry: float, exit_px: float, qty: float, margin: float,
     else:
         raise ValueError(f"unknown side {side!r}")
     net = gross - float(fee) - float(funding)
-    return max(net, -m)
+    # NaN-safe (data-flow audit 2026-07-08): a non-finite leg (e.g. a "nan" funding rate) makes
+    # net=NaN, and max(NaN,-m) returns NaN in Python (first-arg-wins) -> written to equity
+    # permanently -> daily_breaker then fail-closes ALL trading forever. Non-finite -> the -margin
+    # floor (the worst realized case). Same isfinite discipline the gating funcs already use.
+    return -m if not math.isfinite(net) else max(net, -m)
 
 
 def can_open(new_margin: float, equity: float, open_positions: list[dict],
