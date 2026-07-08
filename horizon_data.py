@@ -91,6 +91,7 @@ def build() -> dict:
     # last-good price cache: a transient Binance hiccup must NOT blank the ticker
     # tape or zero-out open-position MTM (that would read as a wrong number).
     cache_path = st / "llm_trader" / "price_cache.json"
+    price_stale = False; price_age_s = 0        # bughunt R5: surfaced so the UI can flag stale prices
     cli = None
     try:
         from tradingagents.binance.client import spot_client
@@ -123,11 +124,29 @@ def build() -> dict:
                                    "px": float(t.get("lastPrice", 0) or 0),
                                    "chg": round(float(t.get("priceChangePercent", 0) or 0), 2)})
         except Exception:
-            pass
-    # Fallback to last-good cache when the bulk ticker missed this cycle.
+            # bughunt R2/R5: the ticker fetch failed — the singleton client's Session may be wedged
+            # (this is what silently served a 21h-stale cache). Reset it so NEXT cycle rebuilds fresh.
+            try:
+                from tradingagents.binance.client import reset_client
+                reset_client()
+            except Exception:
+                pass
+    # Fallback to last-good cache when the bulk ticker missed this cycle — but BOUND its age
+    # (bughunt R5): a cache older than PRICE_STALE_S must be flagged, not served as if live.
     if not quotes or not price_map:
         try:
             cached = json.loads(cache_path.read_text())
+            _ca = cached.get("cached_at")
+            if _ca:
+                try:
+                    from datetime import datetime, timezone
+                    _dt = datetime.fromisoformat(str(_ca).replace("Z", "+00:00"))
+                    price_age_s = int((datetime.now(timezone.utc) - _dt).total_seconds())
+                    price_stale = price_age_s > 120
+                except Exception:
+                    price_stale = True                 # unparseable stamp -> assume stale
+            else:
+                price_stale = True                     # no stamp -> can't trust freshness
             if not quotes:
                 quotes = cached.get("quotes", [])
             if not price_map:
@@ -462,6 +481,8 @@ def build() -> dict:
 
     return {
         "stamped": utc_now(),
+        "price_stale": price_stale,             # bughunt R5: True when marks come from an aged cache
+        "price_age_s": price_age_s,             # so the UI shows STALE instead of pretending live
         "mission": mission,
         "mode": "PAPER-ONLY · LIVE LOCKED",
         "lanes": lanes,
