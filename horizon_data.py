@@ -10,6 +10,11 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+try:                                    # BE robustness: ensure BINANCE_* env is loaded regardless of
+    from dotenv import load_dotenv      # launch method — a detached Start-Process/pythonw won't inherit
+    load_dotenv(ROOT / ".env")          # the shell env, and without keys spot_client() silently falls
+except Exception:                       # back to the stale price cache (frozen marks).
+    pass
 UI = ROOT.parent / "horizon-ui"
 OUT = UI / "data.json"
 CHARTS_DIR = UI / "charts"
@@ -539,21 +544,81 @@ def run_once():
             "ft_labels": data["forward_test"]["labels"], "trials": data["research"]["global_trials"]}
 
 
+def refresh_open_marks():
+    """LIGHTWEIGHT live-price refresh (no klines/charts): re-fetch current prices and recompute each
+    open lane position's mark + uPnL in lanes.json, so open positions show live-moving prices BETWEEN
+    the heavy ~20s full builds. Decouples fast prices from slow heavy state. On a price-fetch failure
+    it leaves the last-good marks untouched (never fakes a price)."""
+    try:
+        lj = json.loads((UI / "lanes.json").read_text(encoding="utf-8"))
+    except Exception:
+        return
+    price_map = {}
+    try:
+        from tradingagents.binance.client import spot_client
+        for t in spot_client().futures_ticker():
+            s = t.get("symbol")
+            if s:
+                price_map[s] = float(t.get("lastPrice", 0) or 0)
+    except Exception:
+        try:                                          # wedged session -> reset so next tick self-heals
+            from tradingagents.binance.client import reset_client
+            reset_client()
+        except Exception:
+            pass
+        return                                        # no fresh prices -> keep last-good, don't fake
+    if not price_map:
+        return
+    lev = int(os.environ.get("MECH_LEV", "10"))
+    changed = False
+    for ln in lj.get("lanes", []):
+        for p in (ln.get("open_pos") or []):
+            mk = price_map.get(p.get("sym"))
+            if mk is None:
+                continue
+            e = p.get("entry")
+            try:
+                if e and float(e) > 0:
+                    pct = (float(mk) - float(e)) / float(e)
+                    if p.get("side") == "SHORT":
+                        pct = -pct
+                    p["mark"] = mk
+                    p["upnl"] = round(float(p.get("margin") or 0) * lev * pct, 2)
+                    changed = True
+            except Exception:
+                pass
+    if changed:
+        try:
+            from timebase import utc_now
+            lj["marks_refreshed"] = utc_now()
+        except Exception:
+            pass
+        try:
+            (UI / "lanes.json").write_text(json.dumps(lj, default=str), encoding="utf-8")
+        except Exception as e:
+            print(json.dumps({"marks_refresh_write_error": repr(e)[:150]}))
+
+
 if __name__ == "__main__":
     import argparse, time
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval-seconds", type=float, default=20.0)
+    ap.add_argument("--mark-refresh-seconds", type=float, default=5.0)   # fast live-price cadence
     a = ap.parse_args()
     if a.loop:
         stop = UI / "horizon_data.stop"
         while not stop.exists():
             try:
-                run_once()
+                run_once()                              # heavy full build (klines/charts/state)
             except Exception:
                 pass
             t = time.time() + a.interval_seconds
-            while time.time() < t and not stop.exists():
-                time.sleep(1)
+            while time.time() < t and not stop.exists():   # between builds, refresh open marks fast
+                time.sleep(max(1.0, a.mark_refresh_seconds))
+                try:
+                    refresh_open_marks()
+                except Exception:
+                    pass
     else:
         print(json.dumps(run_once(), default=str))
