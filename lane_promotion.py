@@ -37,8 +37,13 @@ MAX_PROMOTE = int(os.environ.get("PROMO_MAX", "8"))
 ALPHA = 0.05
 MIN_EXPECT_R = float(os.environ.get("PROMO_MIN_R", "0.05"))   # absolute expectancy floor (R)
 PERSIST = int(os.environ.get("PROMO_PERSIST", "2"))          # consecutive passes to promote (Codex #2)
+MIN_STEP = int(os.environ.get("PROMO_MIN_STEP", "15"))       # bughunt: a counted pass needs >=15 NEW
+# closed trades since the last counted pass, else a static closed.jsonl re-scored every tick reaches
+# PERSIST on ONE window and the winner's-curse protection is nullified.
 DEMOTE_FAILS = int(os.environ.get("PROMO_DEMOTE_FAILS", "2"))  # consecutive fails to demote (Codex #6)
-PERM_B = 2000                                                # sign-flip permutations
+PERM_B = 5000                                                # sign-flip permutations (bughunt 2026-07-08:
+# 2000 gave a p-floor 1/2001=0.0005 that the Šidák bar could dip below at ~100 tested lanes -> gate
+# unsatisfiable; 5000 -> floor 0.0002 keeps the bar resolvable up to ~250 tested lanes)
 STATE = ROOT / "state" / "lane_promo_state.json"
 # hand-validated methods that must ALWAYS stay armed regardless of the lane funnel.
 HAND_ARMED = {"wr_flush_notknife", "capitulation_long"}
@@ -107,7 +112,11 @@ def lane_stats() -> tuple[list[dict], float, int]:
 def evaluate(rows: list[dict], rand_mr: float, rand_n: int) -> list[dict]:
     """Flag each lane pass/fail against the corrected bar. Persistence + winner's-curse
     (LCB ranking) are handled in run_once via the promo-state; this only sets r['pass']."""
-    n_lanes = max(1, len([r for r in rows if not r["is_random"]]))
+    # bughunt 2026-07-08 (SHOWSTOPPER): the family size must count only the lanes actually TESTED
+    # (n>=MIN_N), not all ~168 incl. the ~63 empty ones. Counting all made sidak=0.000305 FINER than
+    # the sign-flip permutation's floor 1/(PERM_B+1)=0.0005, so `p < sidak` was ALWAYS False -> the
+    # funnel promoted NOTHING, ever. Correct statistically too (you don't test the empty lanes).
+    n_lanes = max(1, len([r for r in rows if not r["is_random"] and r["n"] >= MIN_N]))
     sidak = 1.0 - (1.0 - ALPHA) ** (1.0 / n_lanes)     # family-wise corrected bar (Codex #1)
     # Codex #5: only trust the random baseline once it has a real sample; else a fixed floor.
     floor = max(rand_mr if rand_n >= MIN_N else 0.0, MIN_EXPECT_R)
@@ -204,12 +213,16 @@ def run_once(dry: bool = False) -> dict:
         if r["is_random"] or r["mid"] in HAND_ARMED:
             continue
         stat_by_mid[r["mid"]] = r
-        ps = state.setdefault(r["mid"], {"passes": 0, "fails": 0, "last_n": 0})
+        ps = state.setdefault(r["mid"], {"passes": 0, "fails": 0, "last_n": 0, "last_pass_n": 0})
         if r["n"] < ps.get("last_n", 0):            # closed count went backwards = lanes were
-            ps["passes"] = 0; ps["fails"] = 0       # reset -> invalidate stale persistence (Codex #6)
+            ps["passes"] = 0; ps["fails"] = 0; ps["last_pass_n"] = 0   # reset stale persistence (Codex #6)
         ps["last_n"] = r["n"]
         if r["pass"]:
-            ps["passes"] = ps.get("passes", 0) + 1; ps["fails"] = 0
+            # bughunt: only count a pass on a GENUINELY FRESH window (>=MIN_STEP new closes since the
+            # last counted pass) — re-scoring a static closed.jsonl every tick must not advance PERSIST.
+            if r["n"] - ps.get("last_pass_n", 0) >= MIN_STEP:
+                ps["passes"] = ps.get("passes", 0) + 1; ps["last_pass_n"] = r["n"]; ps["fails"] = 0
+            # else: passing but no fresh data -> hold the counter (neither promote-progress nor fail)
         else:
             ps["fails"] = ps.get("fails", 0) + 1; ps["passes"] = 0
     # eligible = PERSIST consecutive passes (Codex #2 winner's-curse), ranked by LCB.
