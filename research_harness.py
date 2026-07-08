@@ -75,9 +75,13 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
     holdout = None
     holdout_blocked = None
     if verdict["pre_holdout_pass"]:
-        spec_id = best["spec_id"]
+        import strategy_compiler as _sc
+        # bughunt H1: key the peek-once budget on the spec's BEHAVIOR, not the positional/label-sensitive
+        # spec_id — otherwise the SAME strategy re-peeks the sealed holdout under a new sweep index /
+        # name across nights, burning the one-shot holdout and eventually promoting an overfit method.
+        peek_key = _sc.spec_behavior_id(best["spec"])
         holdout_key = rg._holdout_digest(split_ts_ms)
-        if not rg.can_peek_holdout(spec_id):
+        if not rg.can_peek_holdout(peek_key):
             # HOLDOUT BUDGET: this spec already spent its one-and-only peek.
             holdout_blocked = "holdout_already_peeked"
         else:
@@ -88,7 +92,7 @@ def run_family(family: str, spec_factory: Callable[[dict[str, Any]], dict[str, A
             else:
                 holdout = og.peek_holdout_once(best["spec"], datasets, split_ts_ms,
                                                exit_cfg=best["spec"].get("exit"), precomputed=precomputed)
-                rg.record_holdout_peek(spec_id, holdout_key, stamped_at)
+                rg.record_holdout_peek(peek_key, holdout_key, stamped_at)
     final_verdict = "KILL"
     reason = holdout_blocked or "failed_in_sample_overfit_gate"
     if verdict["pre_holdout_pass"] and holdout:

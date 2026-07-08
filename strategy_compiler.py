@@ -45,6 +45,23 @@ def spec_id(spec: dict[str, Any]) -> str:
     return "setup_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+# bughunt H1: cosmetic / provenance / positional keys that MUST NOT change a spec's identity for the
+# sealed-holdout peek-once budget. The raw spec_id (above) hashes ALL of these, so the SAME strategy
+# gets a different id when relabeled or repositioned (e.g. a different `_sweep_params={"i":index}`
+# across nights) -> it re-peeks the "sealed once" holdout -> the holdout is burned -> overfit promotion.
+_SPEC_COSMETIC_KEYS = frozenset({"_sweep_params", "name", "hypothesis", "source",
+                                 "id", "spec_id", "_id", "notes", "desc", "label"})
+
+
+def spec_behavior_id(spec: dict[str, Any]) -> str:
+    """Identity of a spec by BEHAVIOR only (entry/exit blocks, direction, sl/tp, family) — invariant to
+    relabeling / repositioning. Use this, not spec_id, for the holdout-peek budget so a strategy cannot
+    buy a fresh peek by changing its name or sweep index."""
+    core = {k: v for k, v in spec.items() if k not in _SPEC_COSMETIC_KEYS}
+    payload = json.dumps(core, sort_keys=True, default=str)
+    return "beh_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def validate_spec(spec: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if spec.get("direction") not in ("LONG", "SHORT"):
