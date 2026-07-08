@@ -291,19 +291,12 @@ def main() -> None:
     # weak there by chance). So require: lockbox significant (p<0.05, n>=100) + positive,
     # and merely DIRECTIONALLY positive on OOS-select. This is the only armable tier —
     # S_QUIET_BEAR_COIL passed BH on OOS-select but FAILED the lockbox (overfit).
-    for r in results:
-        r["robust"] = bool(r.get("lockbox_held")
-                           and (r.get("lockbox_pvalue") is not None and r["lockbox_pvalue"] < 0.05)
-                           and (r.get("lockbox_n") or 0) >= 100
-                           and (r.get("lockbox_mean_r") or 0) > 0
-                           and (r["oos_mean_r"] or 0) > 0)
-
-    # Fix #3 (harvest playbook): deflate p-values against the CUMULATIVE registry
-    # trial count — BH-FDR corrects per-batch only; best-of-N over an ever-growing
-    # registry is spuriously significant as N grows. Šidák: p_defl = 1-(1-p)^N.
-    # Two honest denominators: N_reg = every trial ever (brutal upper bound) and
-    # N_lb = only trials that actually faced a lockbox (the arming decision's real
-    # multiplicity). INFORMATIONAL columns — surfaced, never auto-disarm.
+    # Deflate p-values against the CUMULATIVE registry trial count — BH-FDR corrects per-batch only;
+    # best-of-N over an ever-growing registry is spuriously significant as N grows. Šidák: p_defl =
+    # 1-(1-p)^N. Two honest denominators: N_reg = every trial ever (brutal upper bound) and N_lb =
+    # only trials that actually faced a lockbox (the arming decision's real multiplicity).
+    # bughunt DSR#2: computed BEFORE the robust tier now, so the ONLY armable tier can gate on the
+    # multiplicity-corrected lockbox p instead of the raw one.
     try:
         import brain as _brain
         _c = _brain.connect(readonly=True)
@@ -328,6 +321,23 @@ def main() -> None:
         r["pvalue_defl_reg"] = _sidak(r.get("pvalue"), n_reg)
         r["lockbox_pvalue_defl"] = _sidak(r.get("lockbox_pvalue"), n_lb)
     print(json.dumps({"dsr_denominators": {"n_registry": n_reg, "n_lockbox_exposed": n_lb}}))
+
+    # ROBUST = LOCKBOX-PRIMARY. The untouched holdout is the trustworthy judge; the 25% OOS-select
+    # window is small + noisy so its p is unreliable. Require: lockbox significant + positive, and
+    # merely DIRECTIONALLY positive on OOS-select. Only armable tier.
+    # bughunt DSR#2: gate on the DEFLATED lockbox p (multiplicity-corrected for n_lb = the real
+    # arming multiplicity), NOT the raw p — testing K methods at raw α=0.05 armed ~0.05·K false
+    # ROBUSTs. deflated p >= raw p, so this strictly tightens the bar: a multiplicity artifact can no
+    # longer be armed, while a genuinely strong edge (tiny raw p) still clears it. If NOTHING clears,
+    # the honest conclusion is "no edge survives multiplicity" — a valid prove-or-KILL outcome, not a
+    # false pass. n_lb (lockbox-exposed only) is the moderate denominator, not the brutal all-trials N.
+    for r in results:
+        _lbpd = r.get("lockbox_pvalue_defl")
+        r["robust"] = bool(r.get("lockbox_held")
+                           and (_lbpd is not None and _lbpd < 0.05)
+                           and (r.get("lockbox_n") or 0) >= 100
+                           and (r.get("lockbox_mean_r") or 0) > 0
+                           and (r["oos_mean_r"] or 0) > 0)
 
     dist = {}
     for r in results:
