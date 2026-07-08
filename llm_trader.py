@@ -174,15 +174,23 @@ def _dedupe_closed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def load_account() -> dict[str, Any]:
+    # fail-CLOSED (bughunt 2026-07-08): a present-but-corrupt account must NOT silently reset to
+    # START_EQUITY — resolve() would then book PnL onto $100 and PERMANENTLY erase accumulated
+    # equity. RAISE so the cycle fails loud (a transient mid-write heals next cycle; persistent
+    # corruption needs a human, not a silent wipe). Only a genuinely-absent file starts fresh.
     if ACCOUNT.exists():
-        try: return json.loads(ACCOUNT.read_text())
-        except Exception: pass
+        try:
+            return json.loads(ACCOUNT.read_text())
+        except Exception as e:
+            raise RuntimeError(f"account file exists but is unreadable ({e}) — refusing to reset equity") from e
     return {"equity": START_EQUITY, "realized": 0.0, "trades": 0, "wins": 0}
 
 
 def save_account(a: dict[str, Any]) -> None:
     ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
-    ACCOUNT.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")
+    tmp = ACCOUNT.with_suffix(".tmp")          # atomic write (bughunt 2026-07-08): a crash mid-write
+    tmp.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")  # must NOT truncate the
+    os.replace(tmp, ACCOUNT)                    # account file into a corrupt/empty state -> $100 wipe
 
 
 # charts saved next to the UI so the static server serves them (/charts/<f>.png),
@@ -516,7 +524,7 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
                 # liq distance = ruin risk ATR's average hides (2026-07-08 sizing fix).
                 # gap_risk fail-CLOSED too (Codex #4): a risk gate must refuse when it can't
                 # assess the risk. `_x != _x` is a no-import NaN test. Both risk metrics block.
-                if (_atr is None or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq_dist
+                if (_atr is None or _atr != _atr or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq_dist
                         or _gaprisk is None or _gaprisk != _gaprisk
                         or float(_gaprisk) * GAP_RISK_MULT > _liq_dist):
                     _append(LT_DIR / "governance.jsonl",

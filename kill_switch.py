@@ -1,6 +1,7 @@
 """Local kill switch for autonomous paper/live-capable daemons."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -32,4 +33,14 @@ def clear_kill_switch(operator: str = "operator", path: Path = KILL_SWITCH_FILE)
 
 
 def kill_switch_active(path: Path = KILL_SWITCH_FILE) -> bool:
-    return bool(read_json(path, default={}).get("active"))
+    # fail-CLOSED (bughunt 2026-07-08): read_json can't distinguish "file missing" from
+    # "corrupt/locked/half-written", so `default={}` would silently return active=False and
+    # BYPASS the emergency stop during exactly the incident it exists for. A present-but-
+    # unreadable kill-switch file must be treated as ACTIVE.
+    if not path.exists():
+        return False                       # no kill-switch set -> inactive (normal)
+    try:                                    # read+parse DIRECTLY, not via read_json — read_json
+        data = json.loads(path.read_text(encoding="utf-8"))   # returns {} for BOTH missing and
+    except Exception:                       # corrupt (root R1), which would re-open this hole.
+        return True                        # exists but unparseable -> assume ACTIVE (safety)
+    return bool(isinstance(data, dict) and data.get("active"))

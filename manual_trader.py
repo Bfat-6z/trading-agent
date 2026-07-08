@@ -59,15 +59,20 @@ def _append(p: Path, row: dict[str, Any]) -> None:
 
 
 def load_account() -> dict[str, Any]:
+    # fail-CLOSED (bughunt 2026-07-08): don't silently reset a corrupt account to $100 (erases equity).
     if ACCOUNT.exists():
-        try: return json.loads(ACCOUNT.read_text())
-        except Exception: pass
+        try:
+            return json.loads(ACCOUNT.read_text())
+        except Exception as e:
+            raise RuntimeError(f"account file exists but is unreadable ({e}) — refusing to reset equity") from e
     return {"equity": START_EQUITY, "realized": 0.0, "trades": 0, "wins": 0}
 
 
 def save_account(a: dict[str, Any]) -> None:
     ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
-    ACCOUNT.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")
+    tmp = ACCOUNT.with_suffix(".tmp")          # atomic (bughunt 2026-07-08): crash mid-write must not
+    tmp.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")  # truncate the account -> $100 wipe
+    os.replace(tmp, ACCOUNT)
 
 
 def _save_chart(client, symbol, entry, sl, tp, now_ms) -> str | None:
