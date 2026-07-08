@@ -70,9 +70,9 @@ def load_account() -> dict[str, Any]:
 
 def save_account(a: dict[str, Any]) -> None:
     ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ACCOUNT.with_suffix(".tmp")          # atomic (bughunt 2026-07-08): crash mid-write must not
-    tmp.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")  # truncate the account -> $100 wipe
-    os.replace(tmp, ACCOUNT)
+    tmp = ACCOUNT.with_name(f".{ACCOUNT.name}.{os.getpid()}.tmp")   # PID-suffixed (re-audit): manual_trader
+    tmp.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")  # has no lock, so a fixed .tmp
+    os.replace(tmp, ACCOUNT)                    # could be torn by a concurrent run
 
 
 def _save_chart(client, symbol, entry, sl, tp, now_ms) -> str | None:

@@ -135,8 +135,10 @@ def _acct(k):
     except Exception:
         # bughunt 2026-07-08: a PRESENT-but-corrupt account must NOT silently reset to a fresh $100
         # (that un-busts busted lanes and resets equity, corrupting the exact numbers the farm
-        # measures). Skip the lane this cycle via a transient busted marker — it self-heals once the
-        # file reads again (atomic _save_acct below makes corruption rare in the first place).
+        # measures). Skip the lane via `busted` so it's excluded, never re-saved (the caller
+        # `continue`s before _save_acct). re-audit HONESTY: this does NOT auto-heal a PERMANENTLY
+        # corrupt file (nothing rewrites it) — the lane freezes until a human fixes/deletes the file;
+        # `_unreadable` is surfaced in the summary so it's distinguishable from a real bust.
         return {"equity": START_EQ, "trades": 0, "wins": 0, "busted": True, "_unreadable": True}
 def _save_acct(k, a):
     p = _lp(k) / "account.json"; p.parent.mkdir(parents=True, exist_ok=True)
@@ -174,6 +176,8 @@ def run_once(client):
         cur_bar = now // bar_ms
         if a.get("busted"):
             summary[k] = {"equity": a["equity"], "busted": True}
+            if a.get("_unreadable"):        # re-audit: distinguish a corrupt-frozen lane from a real bust
+                summary[k]["unreadable"] = True
             continue
         opens = _load(_lp(k) / "open.jsonl")
         closed_ids = {c.get("pos_id") for c in _load(_lp(k) / "closed.jsonl") if c.get("pos_id")}

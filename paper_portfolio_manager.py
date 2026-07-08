@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Iterable
@@ -117,7 +118,16 @@ def default_account(equity: Decimal = DEFAULT_EQUITY) -> dict[str, Any]:
 
 
 def load_account(path: Path = ACCOUNT_PATH) -> dict[str, Any]:
-    payload = read_json(path, default={})
+    # bughunt re-audit (HIGH): read_json can't distinguish "missing" from "corrupt/locked", so a
+    # corrupt paper_account.json silently reset to $100 and the lifecycle loop PERSISTED the wipe
+    # (this is the account the always-on autonomous loop runs on). Read directly: absent -> fresh;
+    # present-but-unparseable -> RAISE (fail-loud, the caller skips the cycle, no silent equity wipe).
+    if not path.exists():
+        return default_account()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"paper_account exists but is unreadable ({e}) — refusing to reset equity") from e
     if not isinstance(payload, dict) or not payload:
         return default_account()
     merged = {**default_account(dec(payload.get("starting_equity"), "100")), **payload}

@@ -87,8 +87,9 @@ def validate_method(m: dict[str, Any]) -> dict[str, Any] | None:
         # optional family label (metadata, NOT part of the novelty hash): conditions
         # the exit grid in deep_validation (MR vs momentum exits behave oppositely).
         fam = str(m.get("family") or "").strip().lower()
-        if fam in ("mr", "momentum", "squeeze", "breakout", "flow"):
-            out["family"] = fam
+        if fam in ("mr", "momentum", "squeeze", "breakout", "flow", "microstructure"):
+            out["family"] = fam    # re-audit: 'microstructure' was advertised in the proposer prompt but
+            # dropped here -> order-flow methods showed as unlabeled "?" in trials/vault. Now accepted.
         return out
     except Exception:
         return None
@@ -145,8 +146,11 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
             # proposer NEVER used the OI/CVD/positioning features — exactly the ones with any edge.
             # Now advertise every FEATS family (kept in sync with method_lab_runner.FEATS).
             "Allowed feat (percent unless noted): "
-            "TREND/MA — rsi14(0-100), px_vs_ema20/50/200, ema_stack(-1/0/1), ema4h_state(-1/0/1), "
-            "adx(0-100 strength), macd_state(-1/0/1), supertrend_dir(-1/1), px_vs_vwap20; "
+            # re-audit: ema4h_state DROPPED — it needs >=400 15m bars but the live mechanical path feeds
+            # only ~220, so it pins to 0 live while backtest sees -1/+1 (a method using it fires in
+            # backtest, never live). macd_state emits only -1/+1 (never 0).
+            "TREND/MA — rsi14(0-100), px_vs_ema20/50/200, ema_stack(-1/0/1), "
+            "adx(0-100 strength), macd_state(-1/1), supertrend_dir(-1/1), px_vs_vwap20; "
             "MOMENTUM — ret5, ret20, roc10, streak_up, streak_down, bar_z(1-bar move in ATR units); "
             "MEAN-REV/BANDS — bb_pctb(0-1), bb_width_pct, bb_squeeze_pct(0-1, low=tight), zscore20(price z), "
             "stoch_k(0-100), stoch_d, cci20, williams_r(-100..0), close_pos(0-1 where in bar), dd96_pct, "
@@ -154,8 +158,8 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
             "ORDER-FLOW — buy_frac(0-1 taker-buy share), cvd_delta_norm, cvd_roll20_norm; "
             "POSITIONING — oi_chg_pct, oi_z, ls_ratio(>1=more longs), ls_z, funding_z, funding_rate_bps; "
             "TIME — hour_utc, dow. "
-            "Allowed op: <,<=,>,>= for continuous feats; use == ONLY on the (-1/0/1) state feats "
-            "(ema_stack, ema4h_state, macd_state, supertrend_dir) — == on a float never fires. "
+            "Allowed op: <,<=,>,>= for continuous feats; use == ONLY on the state feats "
+            "(ema_stack ∈ -1/0/1, macd_state & supertrend_dir ∈ -1/1) — == on a float never fires. "
             "Use 1-4 conditions, sl_pct 0.5-4, tp_pct 1-8, aim tp_pct >= 1.5*sl_pct. Be creative and DIVERSE — "
             "combine across families, ESPECIALLY the under-explored order-flow / positioning ones. Do NOT "
             "re-propose these already-FAILED ideas: " + "; ".join(killed_descs[:16]))

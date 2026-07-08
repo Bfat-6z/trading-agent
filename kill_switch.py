@@ -43,4 +43,6 @@ def kill_switch_active(path: Path = KILL_SWITCH_FILE) -> bool:
         data = json.loads(path.read_text(encoding="utf-8"))   # returns {} for BOTH missing and
     except Exception:                       # corrupt (root R1), which would re-open this hole.
         return True                        # exists but unparseable -> assume ACTIVE (safety)
-    return bool(isinstance(data, dict) and data.get("active"))
+    if not isinstance(data, dict):         # re-audit: a valid-JSON non-dict (null/[]/123) is a
+        return True                        # malformed switch file -> fail-CLOSED, not "trading allowed"
+    return bool(data.get("active"))

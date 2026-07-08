@@ -112,12 +112,18 @@ def lane_stats() -> tuple[list[dict], float, int]:
 def evaluate(rows: list[dict], rand_mr: float, rand_n: int) -> list[dict]:
     """Flag each lane pass/fail against the corrected bar. Persistence + winner's-curse
     (LCB ranking) are handled in run_once via the promo-state; this only sets r['pass']."""
-    # bughunt 2026-07-08 (SHOWSTOPPER): the family size must count only the lanes actually TESTED
-    # (n>=MIN_N), not all ~168 incl. the ~63 empty ones. Counting all made sidak=0.000305 FINER than
-    # the sign-flip permutation's floor 1/(PERM_B+1)=0.0005, so `p < sidak` was ALWAYS False -> the
-    # funnel promoted NOTHING, ever. Correct statistically too (you don't test the empty lanes).
-    n_lanes = max(1, len([r for r in rows if not r["is_random"] and r["n"] >= MIN_N]))
+    # bughunt 2026-07-08 (SHOWSTOPPER): the funnel promoted NOTHING because sidak(168)=0.000305 was
+    # FINER than the sign-flip floor 1/(PERM_B+1)=0.0005 -> `p < sidak` structurally impossible. The
+    # fix is the PERM_B bump ALONE (floor now 0.0002 < 0.000305, satisfiable at the FULL family).
+    # Re-audit caveat: do NOT shrink the family to "currently-tested" lanes — lanes cross MIN_N one at
+    # a time, so a tested-count of 1 gives sidak=ALPHA=0.05 = an ~uncorrected bar for the first lucky
+    # lane (a 168-method dredge). Keep the FIXED pre-registered family (all non-random lanes launched).
+    n_lanes = max(1, len([r for r in rows if not r["is_random"]]))
     sidak = 1.0 - (1.0 - ALPHA) ** (1.0 / n_lanes)     # family-wise corrected bar (Codex #1)
+    if sidak <= 1.0 / (PERM_B + 1):                     # surface the silent-death mode instead of
+        print(json.dumps({"promo_warn": "sidak_below_perm_floor", "n_lanes": n_lanes,   # promoting nothing
+                          "sidak": round(sidak, 6), "perm_floor": round(1.0 / (PERM_B + 1), 6),
+                          "hint": "raise PERM_B or cap lanes"}))
     # Codex #5: only trust the random baseline once it has a real sample; else a fixed floor.
     floor = max(rand_mr if rand_n >= MIN_N else 0.0, MIN_EXPECT_R)
     for r in rows:
@@ -214,6 +220,9 @@ def run_once(dry: bool = False) -> dict:
             continue
         stat_by_mid[r["mid"]] = r
         ps = state.setdefault(r["mid"], {"passes": 0, "fails": 0, "last_n": 0, "last_pass_n": 0})
+        if "last_pass_n" not in ps:                 # migration (re-audit #4): pre-upgrade entries lack
+            ps["last_pass_n"] = ps.get("last_n", 0)  # this key; seed to last_n so the first post-upgrade
+            # tick can't hand a free +1 pass (n-0>=MIN_STEP always true) to a lane with existing passes>=1
         if r["n"] < ps.get("last_n", 0):            # closed count went backwards = lanes were
             ps["passes"] = 0; ps["fails"] = 0; ps["last_pass_n"] = 0   # reset stale persistence (Codex #6)
         ps["last_n"] = r["n"]

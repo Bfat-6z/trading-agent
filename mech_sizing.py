@@ -96,6 +96,8 @@ def size_fires(firing: list[tuple[str, str]], dists: dict[str, dict[str, Any]],
     steps; the correlation divisor + aggregate cap make the CLUSTER the constraint."""
     if not firing:
         return []
+    lev = max(1, int(lev))    # re-audit: clamp ONCE so margin (e/lev) and exposure (margin*lev) agree;
+    # a per-line max(1,lev) left exposure=0 while margin>0 (internally contradictory) for MECH_LEV=0.
     k = len(firing)
     # cluster correlation (equicorrelation model), SIDE-AWARE + crisis-level: same-side
     # pairs co-move toward RHO_CRISIS in a stress bar; opposite-side pairs hedge (RHO_OPP).
@@ -140,7 +142,7 @@ def size_fires(firing: list[tuple[str, str]], dists: dict[str, dict[str, Any]],
         # forward-test data (no selection/grid/regime bias); else half (Codex review).
         hair = 1.0 if d.get("forward_confirmed") else SELECTION_HAIRCUT
         e = C_DD * e_full * hair / corr_div              # drawdown governor + correlation + selection haircut
-        margin = min(e / max(1, lev), PER_POS_CAP)   # bughunt: max(1,lev) — MECH_LEV=0 was a ZeroDivisionError that crashed the whole run cycle
+        margin = min(e / lev, PER_POS_CAP)   # lev clamped >=1 at top (re-audit) — no ZeroDivisionError, and consistent with exposure=margin*lev below
         if margin < MIN_MARGIN:
             continue
         out.append({"coin": coin, "method": mid, "exposure": margin * lev,

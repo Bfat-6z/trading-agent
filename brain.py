@@ -329,8 +329,15 @@ def record_trials(rows: list[dict[str, Any]], defs: dict[str, dict[str, Any]],
 
 def _autopsy_row(rec: dict[str, Any], src: str, novelty_hash: str | None) -> dict[str, Any]:
     feats = rec.get("entry_feats")
+    # re-audit (accounting): deterministic trade_id from the natural key so INSERT OR IGNORE actually
+    # dedups a crash-replayed shadow/mission close. Was _ulid() (fresh every call) -> a re-resolution
+    # got a new PK -> duplicate autopsy row -> biased lesson-mining (shadow_n/eff_n). Fall back to
+    # _ulid() only when the natural key is incomplete.
+    _nat = rec.get("fwd_id")
+    if not _nat and rec.get("symbol") and rec.get("entry_ts_ms") is not None:
+        _nat = f"{rec.get('symbol')}:{rec.get('entry_ts_ms')}:{rec.get('method')}"
     return {
-        "trade_id": _ulid(), "src": src,
+        "trade_id": (f"{src}:{_nat}" if _nat else _ulid()), "src": src,
         "method_id": rec.get("method"), "novelty_hash": novelty_hash,
         "symbol": rec.get("symbol"), "side": rec.get("side"),
         "entry": rec.get("entry"), "exit_px": rec.get("exit"),

@@ -398,7 +398,12 @@ def stale(spec: AgentSpec) -> bool:
     age = heartbeat_age_seconds(spec.heartbeat_file)
     if age is None:
         started = _started_at.get(spec.name)
-        if started is not None and (time.time() - started) < STARTUP_GRACE_SECONDS:
+        # re-audit BUG 3: heavy agents (method_lab ~hours, lane_farm/llm_trader cold cycle) write their
+        # FIRST heartbeat only at the END of the first cycle. A flat 180s grace expired mid-startup ->
+        # killed -> quarantine (the very bug this fixes). The startup grace must be >= the RUNNING
+        # staleness bound, never stricter — a starting agent gets at least as long as a running one.
+        grace = max(STARTUP_GRACE_SECONDS, float(spec.max_heartbeat_age_seconds))
+        if started is not None and (time.time() - started) < grace:
             return False                        # still inside its startup grace -> not stale
         return True
     return age > spec.max_heartbeat_age_seconds
@@ -543,9 +548,23 @@ def cleanup_runtime(exclude_current_supervisor: bool = True) -> dict:
     # (else the just-relaunched agent is instantly judged stale -> killed, R6 #1), and the agents'
     # own child loop.locks (the fresh-mtime lock that self-blocked llm_trader).
     _extra_cleared: list[str] = []
-    for p in [RESTART_STATE_PATH, *(sp.heartbeat_file for sp in specs() if sp.heartbeat_file),
-              STATE_DIR / "llm_trader" / "loop.lock", STATE_DIR / "lane_farm.lock",
-              STATE_DIR / "lane_farm_1h.lock", STATE_DIR / "manual_trader" / "loop.lock"]:
+    # re-audit BUG 1: subdir agents (llm_trader, manual_trader, forward_*) write quarantine to their
+    # OWN subdir (spec.pid_file.parent/agent_restart_state.json), NOT the top-level RESTART_STATE_PATH
+    # — so clearing only RESTART_STATE_PATH left the MISSION quarantined 6h through --restart-clean.
+    # Clear every spec's per-agent quarantine file too. (manual_trader/loop.lock dropped — it doesn't
+    # exist; manual_trader has no file lock, re-audit BUG 5.)
+    _quar = {sp.pid_file.parent / "agent_restart_state.json" for sp in specs()}
+    # re-audit BUG 4: only clear the child loop.locks if the stop actually took. WMI/CIM can be blind
+    # for the first minutes after a Windows restart (exactly when --restart-clean runs) -> stop_pid
+    # silently believes a live process is dead -> we'd delete a still-alive owner's loop.lock -> a
+    # second loop starts -> double-book. If any supervised process survived the stop, KEEP the locks
+    # (the live owner keeps its lock; a genuinely-dead owner leaves no survivor so its lock is cleared).
+    _survivors = any(running_script_pids(sc) for sc in {sp.script for sp in specs()})
+    _locks: list[Path] = [] if _survivors else [STATE_DIR / "llm_trader" / "loop.lock",
+                          STATE_DIR / "lane_farm.lock", STATE_DIR / "lane_farm_1h.lock"]
+    if _survivors:
+        append_jsonl("runtime_cleanup_locks_kept", {"reason": "a supervised process survived stop; loop.locks left for the live owner"})
+    for p in [RESTART_STATE_PATH, *_quar, *(sp.heartbeat_file for sp in specs() if sp.heartbeat_file), *_locks]:
         try:
             if p and Path(p).exists():
                 Path(p).unlink()
@@ -592,8 +611,29 @@ def release_supervisor_lock() -> None:
     except Exception as exc:
         append_jsonl("supervisor_lock_release_error", {"pid": os.getpid(), "error": str(exc)[:200]})
 
+def _tf_token(spec: AgentSpec) -> str | None:
+    """The `--tf X` value in a spec's args, if any (re-audit BUG 2)."""
+    a = list(spec.args)
+    if "--tf" in a:
+        i = a.index("--tf")
+        if i + 1 < len(a):
+            return a[i + 1]
+    return None
+
+
 def dedupe_agent_processes(spec: AgentSpec, preferred_pid: int | None) -> int | None:
-    pids = running_script_pids(spec.script)
+    # re-audit BUG 2: lane_farm (15m) and lane_farm_1h share script "lane_farm.py". Dedup by script
+    # name alone returned BOTH pids, so each spec killed the other sibling as a "duplicate" every
+    # cycle (mutual eviction). Disambiguate by the --tf token in the actual command line: a --tf
+    # variant keeps only procs carrying the same "--tf X"; the base (no --tf) excludes any --tf
+    # sibling. No-op for every single-script agent (their cmdlines carry no --tf).
+    procs = running_script_processes(spec.script)
+    tf = _tf_token(spec)
+    if tf is not None:
+        procs = [(p, c) for (p, c) in procs if f"--tf {tf}" in c]
+    else:
+        procs = [(p, c) for (p, c) in procs if "--tf" not in c]
+    pids = sorted({p for (p, _c) in procs})
     if not pids:
         return None
     keep = preferred_pid if preferred_pid in pids else pids[0]

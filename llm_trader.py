@@ -188,9 +188,9 @@ def load_account() -> dict[str, Any]:
 
 def save_account(a: dict[str, Any]) -> None:
     ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ACCOUNT.with_suffix(".tmp")          # atomic write (bughunt 2026-07-08): a crash mid-write
-    tmp.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")  # must NOT truncate the
-    os.replace(tmp, ACCOUNT)                    # account file into a corrupt/empty state -> $100 wipe
+    tmp = ACCOUNT.with_name(f".{ACCOUNT.name}.{os.getpid()}.tmp")   # PID-suffixed (re-audit): a fixed
+    tmp.write_text(json.dumps(a, indent=1, default=str), encoding="utf-8")  # account.tmp would be torn
+    os.replace(tmp, ACCOUNT)                    # by a concurrent --once (which bypasses loop.lock)
 
 
 # charts saved next to the UI so the static server serves them (/charts/<f>.png),
