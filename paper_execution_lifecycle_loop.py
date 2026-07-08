@@ -1065,7 +1065,12 @@ def monitor_open_positions(account: dict[str, Any], market: dict[str, Any], max_
             "execution_simulator": close_plan.get("execution_simulator"),
         }
         close_event = build_close_event(position, closed_position, candle)
-        append_jsonl(PAPER_TRADES_PATH, close_event)
+        # bughunt 2026-07-08 (CRITICAL C2): the OPEN event is idempotent (append_jsonl_once by
+        # trade_id) but the CLOSE was a plain append -> a replayed/concurrent close double-booked
+        # realized PnL into paper_trades.jsonl (the learning/scorecard source of truth). Dedup the
+        # close on a distinct close_id (trade_id would collide with the open and skip the close).
+        close_event["close_id"] = f"{close_event.get('trade_id') or position.get('position_id')}:close"
+        append_jsonl_once(PAPER_TRADES_PATH, close_event, "close_id")
         review_candles = [row for row in close_event.get("position", {}).get("replay_candles", []) if isinstance(row, dict)] or [candle]
         review = review_closed_trade(close_event, review_candles, setup_score={"score": 0.6}, append=True)
         account = closed_result["account"]

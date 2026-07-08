@@ -140,10 +140,24 @@ def propose_methods(existing_ids: set[str], killed_descs: list[str], k: int = 6,
             "(you are NOT trading). Encode real, commonly-shared trading ideas (trend-following, mean-reversion, "
             "breakout, pullback, divergence-proxy, volume-confirmation, regime filters) as a strict JSON DSL. "
             f"Return ONLY a JSON array of {k} method objects. Each: {{id, name, desc, side:'LONG'|'SHORT', "
-            "when:[{feat,op,val}...], sl_pct, tp_pct, family:'mr'|'momentum'|'squeeze'}}. Allowed feat: rsi14, px_vs_ema20, px_vs_ema50, "
-            "px_vs_ema200 (percent above/below EMA), ema_stack (-1 bear / 0 / 1 bull), vol_ratio (x vs 20-bar avg), "
-            "ret5, ret20 (percent). Allowed op: <,<=,>,>=,==. Use 1-4 conditions, sl_pct 0.5-4, tp_pct 1-8, and "
-            "aim for tp_pct >= 1.5*sl_pct. Be creative and DIVERSE — combine features across families. Do NOT "
+            "when:[{feat,op,val}...], sl_pct, tp_pct, family:'mr'|'momentum'|'squeeze'|'microstructure'}}. "
+            # bughunt 2026-07-08: the old prompt named only 8 of the ~50 whitelisted feats, so the
+            # proposer NEVER used the OI/CVD/positioning features — exactly the ones with any edge.
+            # Now advertise every FEATS family (kept in sync with method_lab_runner.FEATS).
+            "Allowed feat (percent unless noted): "
+            "TREND/MA — rsi14(0-100), px_vs_ema20/50/200, ema_stack(-1/0/1), ema4h_state(-1/0/1), "
+            "adx(0-100 strength), macd_state(-1/0/1), supertrend_dir(-1/1), px_vs_vwap20; "
+            "MOMENTUM — ret5, ret20, roc10, streak_up, streak_down, bar_z(1-bar move in ATR units); "
+            "MEAN-REV/BANDS — bb_pctb(0-1), bb_width_pct, bb_squeeze_pct(0-1, low=tight), zscore20(price z), "
+            "stoch_k(0-100), stoch_d, cci20, williams_r(-100..0), close_pos(0-1 where in bar), dd96_pct, "
+            "rally96_pct, dd_from_high96_pct; VOL/RISK — atr_pct, park_vol_pct, gap_risk_pct, vol_ratio(x vs 20-bar); "
+            "ORDER-FLOW — buy_frac(0-1 taker-buy share), cvd_delta_norm, cvd_roll20_norm; "
+            "POSITIONING — oi_chg_pct, oi_z, ls_ratio(>1=more longs), ls_z, funding_z, funding_rate_bps; "
+            "TIME — hour_utc, dow. "
+            "Allowed op: <,<=,>,>= for continuous feats; use == ONLY on the (-1/0/1) state feats "
+            "(ema_stack, ema4h_state, macd_state, supertrend_dir) — == on a float never fires. "
+            "Use 1-4 conditions, sl_pct 0.5-4, tp_pct 1-8, aim tp_pct >= 1.5*sl_pct. Be creative and DIVERSE — "
+            "combine across families, ESPECIALLY the under-explored order-flow / positioning ones. Do NOT "
             "re-propose these already-FAILED ideas: " + "; ".join(killed_descs[:16]))
         body = json.dumps({"model": lt.MODEL, "max_tokens": 8000, "temperature": 0.8,
                            "reasoning_effort": getattr(lt, "REASONING_EFFORT", "high"),

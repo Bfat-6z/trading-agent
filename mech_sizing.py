@@ -140,7 +140,7 @@ def size_fires(firing: list[tuple[str, str]], dists: dict[str, dict[str, Any]],
         # forward-test data (no selection/grid/regime bias); else half (Codex review).
         hair = 1.0 if d.get("forward_confirmed") else SELECTION_HAIRCUT
         e = C_DD * e_full * hair / corr_div              # drawdown governor + correlation + selection haircut
-        margin = min(e / lev, PER_POS_CAP)
+        margin = min(e / max(1, lev), PER_POS_CAP)   # bughunt: max(1,lev) — MECH_LEV=0 was a ZeroDivisionError that crashed the whole run cycle
         if margin < MIN_MARGIN:
             continue
         out.append({"coin": coin, "method": mid, "exposure": margin * lev,
