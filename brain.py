@@ -275,6 +275,11 @@ def record_trials(rows: list[dict[str, Any]], defs: dict[str, dict[str, Any]],
     try:
         with con:
             for r in rows:
+              # bughunt 2026-07-08 (CRITICAL): isolate each row. Previously one poison row (e.g.
+              # method_hash throwing on a null sl_pct) rolled back the WHOLE batch's inserts while
+              # events.jsonl kept them -> the DB (which the DSR trial-count reads) silently
+              # under-counted -> the Deflated-Sharpe bar was too generous -> false winners.
+              try:
                 d = defs.get(r.get("id"))
                 nh = method_hash(d) if d else None
                 bh = bucketed_hash(d) if d else None
@@ -309,11 +314,14 @@ def record_trials(rows: list[dict[str, Any]], defs: dict[str, dict[str, Any]],
                     "verdict": verdict, "failure_mode": fmode,
                     "source": source, "created_at": _now_iso(),
                 }
-                _append_event("trial", rec)
                 con.execute(
                     f"INSERT INTO trials ({','.join(rec)}) VALUES ({','.join('?' * len(rec))})",
                     list(rec.values()))
-                n += 1
+                _append_event("trial", rec)      # log AFTER the insert -> the log is a subset of the
+                n += 1                            # DB, never the reverse (which under-counted the DSR)
+              except Exception as _exc:
+                _append_event("trial_record_error", {"id": r.get("id"), "error": str(_exc)[:150]})
+                continue                          # skip the poison row; keep the rest of the batch
     finally:
         con.close()
     return n

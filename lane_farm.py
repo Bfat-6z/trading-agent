@@ -128,13 +128,21 @@ def _append(p, r):
         f.write(json.dumps(r) + "\n")
 def _acct(k):
     p = _lp(k) / "account.json"
+    if not p.exists():
+        return {"equity": START_EQ, "trades": 0, "wins": 0, "busted": False}   # genuinely new lane
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {"equity": START_EQ, "trades": 0, "wins": 0, "busted": False}
+        # bughunt 2026-07-08: a PRESENT-but-corrupt account must NOT silently reset to a fresh $100
+        # (that un-busts busted lanes and resets equity, corrupting the exact numbers the farm
+        # measures). Skip the lane this cycle via a transient busted marker — it self-heals once the
+        # file reads again (atomic _save_acct below makes corruption rare in the first place).
+        return {"equity": START_EQ, "trades": 0, "wins": 0, "busted": True, "_unreadable": True}
 def _save_acct(k, a):
     p = _lp(k) / "account.json"; p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(a), encoding="utf-8")
+    tmp = p.with_suffix(".tmp")                  # atomic (bughunt): a crash mid-write must not truncate
+    tmp.write_text(json.dumps(a), encoding="utf-8")   # account.json into an empty/corrupt state
+    os.replace(tmp, p)
 
 def run_once(client):
     import orderflow_data as of
