@@ -6,6 +6,7 @@ research ledger. Paper-only; reads state only, never trades.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -441,11 +442,24 @@ def build() -> dict:
             recent = [{"sym": c.get("symbol"), "side": c.get("side"),
                        "pnl": round(float(c.get("pnl") or 0), 2), "r": c.get("r"),
                        "reason": c.get("reason"), "entry": c.get("entry"), "exit": c.get("exit"),
+                       "margin": c.get("margin"), "bars_held": c.get("bars_held"),  # size + duration for the UI detail
                        "ts": int(c.get("closed_ts_ms") or 0)}
                       for c in reversed(closed)][:14]
-            opos = [{"sym": p.get("symbol"), "side": p.get("side"), "method": p.get("method"),
-                     "entry": p.get("entry"), "margin": p.get("margin")}
-                    for p in _load_jsonl(ldir / "open.jsonl")]
+            _lev = int(os.environ.get("MECH_LEV", "10"))     # lane leverage (for live uPnL on notional)
+            opos = []
+            for p in _load_jsonl(ldir / "open.jsonl"):
+                _e = p.get("entry"); _mk = price_map.get(p.get("symbol")); _up = None
+                try:                                          # live uPnL$ = margin * lev * signed pct move
+                    if _e and _mk and float(_e) > 0:
+                        _pct = (float(_mk) - float(_e)) / float(_e)
+                        if p.get("side") == "SHORT":
+                            _pct = -_pct
+                        _up = round(float(p.get("margin") or 0) * _lev * _pct, 2)
+                except Exception:
+                    _up = None
+                opos.append({"sym": p.get("symbol"), "side": p.get("side"), "method": p.get("method"),
+                             "entry": _e, "margin": p.get("margin"), "mark": _mk, "upnl": _up,
+                             "sl": p.get("sl"), "tp": p.get("tp"), "opened": int(p.get("opened_ts_ms") or 0)})
             base = {"k": k, "mid": mid, "desc": v.get("desc", ""), "family": v.get("family", "?"),
                     "side": v.get("side", "LONG"), "equity": eq, "pnl": round(eq - 100.0, 2),
                     "trades": int(v.get("trades", 0) or 0),
@@ -470,14 +484,16 @@ def build() -> dict:
         try:
             UI.mkdir(parents=True, exist_ok=True)
             (UI / "lanes.json").write_text(json.dumps({**lanes, "lanes": full_rows}, default=str), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as _we:
+            print(json.dumps({"lanes_write_error": repr(_we)[:200]}))
         # LIGHT summary (no curve/closed/open_pos) for the dashboard table
         lanes["lanes"] = [{kk: r[kk] for kk in ("k", "mid", "desc", "family", "side", "equity",
                             "pnl", "trades", "win", "open", "busted", "is_random", "armed")}
                           for r in full_rows]
-    except Exception:
-        pass
+    except Exception as _le:
+        # bughunt: was `pass` — it silently swallowed a NameError (missing `import os`) for ~an hour,
+        # leaving lanes.json stale with no signal. Surface build errors instead of hiding them.
+        print(json.dumps({"lanes_build_error": repr(_le)[:200]}))
 
     return {
         "stamped": utc_now(),
