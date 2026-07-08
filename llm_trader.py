@@ -71,7 +71,12 @@ MIN_ENTRY_VOL = float(os.environ.get("LLM_TRADER_MIN_ENTRY_VOL", "1.5"))
 # a survivor's mechanical condition fires on live bars — evaluated by the SAME
 # method_lab code that backtested it (zero mapping drift). The lab keeps testing
 # new methods 24/7; new survivors auto-arm, dropped survivors auto-disarm.
-PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "1") == "1"
+# 2026-07-09 (owner: "dùng model mạnh, đừng bảo thủ cứng nhắc"): default to DISCRETIONARY so gpt-5.5
+# vision actually trades. PROVEN_ONLY was the "bleed fix" (the LLM path lost before), so this is a
+# guarded re-try: the gap-tail ruin veto now applies to LLM decisions too (_apply_gap_veto), x5/x10 +
+# size caps + kill-switch + live-LOCKED all stay. Watch the scorecard; if it bleeds, KILL (or set
+# LLM_TRADER_PROVEN_ONLY=1 to revert). Paper only.
+PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "0") == "1"
 # MISSION (boss's boss, 2026-07-05): grow \$100 -> \$1000, sizing at the bot's
 # discretion. Sizing chosen by HALF-KELLY math on capitulation_long's FULL-SCALE
 # stats (win 54.7%, ~1.6R payoff => full Kelly ~26% risk/fire is suicide-variance;
@@ -335,9 +340,15 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
             closes = [round(float(x), 4) for x in enr["close"].iloc[-8:].tolist()]
             reg = _regime(enr)
             feats = _features(enr, fb)
+            # gap_risk_pct: worst single-bar range in the last 48 bars (matches method_lab's feature).
+            # The gap-veto reads this on BOTH paths — without it on the discretionary ctx the LLM
+            # gap-veto fail-closes and blocks every entry (the real "0 trades" trap).
+            _gr_rngs = [(float(b["high"]) - float(b["low"])) / float(b["close"])
+                        for b in fb[-48:] if float(b.get("close") or 0) > 0]
+            gap_risk_pct = round(max(_gr_rngs) * 100, 3) if _gr_rngs else None
             out.append({
                 "symbol": sym, "price": round(float(enr["close"].iloc[i]), 4),
-                "last8_closes": closes, **reg, **feats,
+                "last8_closes": closes, "gap_risk_pct": gap_risk_pct, **reg, **feats,
                 "whale": whale.get(sym),   # Telegram whale/liquidation pressure (may be None)
                 "funding_rate": round(float(enr["funding_rate"].iloc[i]) if "funding_rate" in enr else 0.0, 6),
                 "cvd_norm": round(float(enr["cvd_delta_norm"].iloc[i]) if "cvd_delta_norm" in enr and enr["cvd_delta_norm"].iloc[i]==enr["cvd_delta_norm"].iloc[i] else 0.0, 3),
@@ -763,10 +774,14 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
         action = str(dec.get("action", "SKIP")).upper()
         if not ctx or action not in ("LONG", "SHORT"):
             continue
-        lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5          # x5/x10 only
-        size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # 5-10%
-        sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))
-        tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3)))
+        try:                                                              # bughunt LLM#2: a malformed
+            lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5      # LLM field ("10x"/NaN/[..])
+            size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, float(dec.get("size_pct", 5) or 5)))  # must skip
+            sl_pct = max(0.3, min(8.0, float(dec.get("sl_pct", 2) or 2)))  # just THIS decision, not crash
+            tp_pct = max(0.3, min(15.0, float(dec.get("tp_pct", 3) or 3))) # the whole batch (x5/x10, 5-10%)
+        except Exception:
+            _append(LT_DIR / "governance.jsonl", {"event": "llm_decision_coercion_skip", "symbol": sym})
+            continue
         # LIMIT entry FIRST: keep entry_px only if it's a FAVORABLE pullback limit
         # within ~5% (LONG below price / SHORT above); else treat as market.
         entry_px = None
@@ -1023,6 +1038,29 @@ def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float 
     else:
         tp = entry + 1.8 * risk if side == "LONG" else entry - 1.8 * risk
     return sl, tp
+
+
+def _apply_gap_veto(decisions: list[dict[str, Any]], ctx: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply the gap-tail RUIN veto to DISCRETIONARY (LLM) decisions too. The mechanical path enforces
+    it internally, but the LLM path bypassed it (bughunt LLM#1). An entry on a high-gap coin — the worst
+    recent single bar reaching the liquidation distance — can gap THROUGH the stop straight to
+    liquidation (the -$14 HMSTR ruin). Keep this even when loosening: it's ruin protection, NOT
+    conservatism. Same fail-CLOSED logic (None/NaN/degenerate -> block) as _mechanical_decisions."""
+    by_sym = {c.get("symbol"): c for c in ctx}
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    out = []
+    for d in decisions:
+        row = by_sym.get(d.get("symbol")) or {}
+        _atr = row.get("atr_pct"); _gr = row.get("gap_risk_pct")
+        _liq = 100.0 / max(1, int(d.get("leverage") or MECH_LEV))
+        if (_atr is None or _atr != _atr or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq
+                or _gr is None or _gr != _gr or float(_gr) * GAP_RISK_MULT > _liq):
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "gate_block_gap_risk_llm", "symbol": d.get("symbol")})
+            continue
+        out.append(d)
+    return out
 
 
 def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
@@ -1481,7 +1519,10 @@ def run_once() -> dict[str, Any]:
         # the bleed fix: no discretionary entries — only lab-proven survivors fire.
         decisions = _mechanical_decisions(ctx)
     else:
-        decisions = decide(ctx, equity, status=status)
+        # DISCRETIONARY: gpt-5.5 vision reads the charts and decides. Loosened from PROVEN_ONLY so the
+        # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),
+        # because "don't get liquidated on a gap" is safety, not rigidity.
+        decisions = _apply_gap_veto(decide(ctx, equity, status=status), ctx)
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
     wr = round(acct["wins"] / acct["trades"], 3) if acct["trades"] else None
     return {"equity": acct["equity"], "trades": acct["trades"], "win_rate": wr,
