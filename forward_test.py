@@ -187,6 +187,7 @@ def resolve_open(client, now_ms: int, hashes: dict[str, str] | None = None) -> i
                     print(json.dumps({"chart_render_none": p.get("symbol")}))
             except Exception as _ce:
                 print(json.dumps({"chart_error": repr(_ce)[:120]}))
+            rec["fwd_id"] = f"{p.get('symbol')}:{p.get('entry_ts_ms')}:{p.get('method')}"  # bughunt: idempotency key
             _append(CLOSED, rec)
             try:                            # second brain: numbers-only autopsy row
                 import brain
@@ -244,6 +245,18 @@ def scan_open(client, methods: list[dict], params: dict[str, dict], now_ms: int)
 def write_stats(methods: list[dict]) -> dict:
     from timebase import utc_now
     closed = _load(CLOSED)
+    # bughunt 2026-07-08: dedup by fwd_id — a crash between _append(CLOSED) and _rewrite(POSN) can
+    # re-resolve a position next cycle, and duplicate rows would inflate n and optimistically tighten
+    # the block-bootstrap p-value the whole promotion path trusts.
+    _seen: set = set(); _dd: list[dict] = []
+    for _c in closed:
+        _k = _c.get("fwd_id")
+        if _k is not None and _k in _seen:
+            continue
+        if _k is not None:
+            _seen.add(_k)
+        _dd.append(_c)
+    closed = _dd
     openp = _load(POSN)
     per: dict[str, dict] = {}
     for t in closed:

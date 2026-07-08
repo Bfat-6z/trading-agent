@@ -174,8 +174,12 @@ def compute_cvd_columns(bars: list[dict[str, Any]]) -> pd.DataFrame:
     df["buy_frac"] = (tbb / vol.replace(0, float("nan"))).fillna(0.5)
     # rolling cvd sum over a trailing window (trend of aggression)
     df["cvd_roll20"] = df["cvd_delta"].rolling(20, min_periods=5).sum()
-    # normalized: cvd_delta relative to trailing volume (comparable across coins)
-    df["cvd_delta_norm"] = df["cvd_delta"] / vol.rolling(20, min_periods=5).mean().replace(0, float("nan"))
+    # normalized: cvd_delta relative to trailing volume (comparable across coins).
+    # bughunt 2026-07-08 (train/serve skew): clip ±10 + fill 0 to MATCH method_lab.feature_frame's
+    # cvd_delta_norm exactly — otherwise this live/enrich path produced unclipped/NaN values while the
+    # backtest that minted the method used clipped ones, so the same rule fired differently live.
+    df["cvd_delta_norm"] = (df["cvd_delta"] / vol.rolling(20, min_periods=5).mean().replace(0, float("nan"))
+                            ).clip(-10.0, 10.0).fillna(0.0)
     return df
 
 
