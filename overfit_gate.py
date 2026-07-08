@@ -199,6 +199,16 @@ def plateau_check(sweep_results: list[dict[str, Any]], best_spec_id: str,
 # The gate
 # ---------------------------------------------------------------------------
 
+# bughunt DSR#1: expected_max_sharpe uses the GLOBAL cumulative N (thousands) but the variance V is
+# estimated from only THIS sweep's cells. A HOMOGENEOUS sweep (e.g. an exit-param grid on one entry
+# family) has tiny V_local, which collapses SR0 toward 0 REGARDLESS of the huge N -> a mediocre Sharpe
+# passes the DSR (false edge). V_local is a small-sample estimate; the TRUE trial-generating dispersion
+# isn't ~0 just because this sweep was narrow. Floor V at a representative cross-strategy Sharpe
+# variance so the best-of-N penalty can't be nullified by a homogeneous sweep. Fails SAFE (higher V ->
+# higher SR0 -> harder gate); only tightens homogeneous sweeps, leaves diverse ones (V>prior) unchanged.
+VAR_SHARPE_PRIOR = 0.03     # ~ (Sharpe SD 0.17)^2, representative cross-strategy dispersion
+
+
 def variance_of_trial_sharpes(sweep_results: list[dict[str, Any]]) -> float:
     """Var of per-cell SHARPE across the sweep, for E[max SR] (Bailey/LdP).
     Must use each cell's Sharpe (mean/std of R), NOT its expectancy_r (mean-R):
@@ -242,7 +252,9 @@ def evaluate_candidate(best: dict[str, Any], sweep_results: list[dict[str, Any]]
     verdict dict; holdout is only peeked if pre_holdout_pass is True."""
     trades = purge_overlaps(best.get("trades", []))
     returns = [float(t.get("r_multiple", 0)) for t in trades]
-    var_sharpe = variance_of_trial_sharpes(sweep_results)
+    # DSR#1: floor V at the cross-strategy prior so a homogeneous sweep's tiny V_local can't collapse
+    # SR0 and nullify the global-N best-of-N penalty (see VAR_SHARPE_PRIOR note).
+    var_sharpe = max(variance_of_trial_sharpes(sweep_results), VAR_SHARPE_PRIOR)
     dsr = deflated_sharpe_ratio(returns, n_trials, var_sharpe)
     cc = cross_consistency(trades)
     plat = plateau_check(sweep_results, best["spec_id"])
