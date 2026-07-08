@@ -186,12 +186,14 @@ def hidden_subprocess_kwargs() -> dict:
 
 
 def default_python() -> str:
-    if os.name == "nt":
-        venv_pythonw = ROOT / "venv" / "Scripts" / "pythonw.exe"
-        if venv_pythonw.exists():
-            return str(venv_pythonw)
+    # re-audit CRITICAL: prefer python.exe over pythonw.exe. Agents are spawned with CREATE_NO_WINDOW
+    # + redirected stdout/stderr (start_agent), so python.exe pops NO console window either — but
+    # pythonw.exe has no real console (sys.stdin/out quirks) and was implicated in llm_trader dying at
+    # startup. python.exe is the safe interpreter; the no-window behavior comes from the creationflag.
     venv_python = ROOT / "venv" / "Scripts" / "python.exe"
-    return str(venv_python if venv_python.exists() else Path(sys.executable))
+    if venv_python.exists():
+        return str(venv_python)
+    return str(Path(sys.executable))
 
 
 def scrub_child_env(env: dict[str, str] | None = None) -> dict[str, str]:
