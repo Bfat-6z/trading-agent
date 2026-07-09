@@ -1314,6 +1314,8 @@ def resolve(client: Any, now_ms: int) -> int:
         sl_orig = sl
         risk = abs(entry - sl_orig)
         peak = entry
+        mfe_px = 0.0; mae_px = 0.0   # P0 learning-metric: max favorable / adverse price excursion while held
+                                     # (noise-stop vs thesis-wrong). Measurement only — never affects exits.
         # TRUE breakeven must cover round-trip fees + the STOP slippage resolve()
         # itself charges by tier (audit: 12bps flat made every 'BE' exit a
         # guaranteed loss — micro tier slips 150bps). Skip the BE ratchet entirely
@@ -1365,6 +1367,18 @@ def resolve(client: Any, now_ms: int) -> int:
                 # have held through (optimistic leak, twin of the TP-off-fill-bar
                 # bug). The ratchet starts from the NEXT bar.
                 continue
+            # P0 MFE/MAE — fill bar already skipped above (no-lookahead), so this bar's high/low is a
+            # move we actually held through. Pure measurement; tracked for ALL positions before the
+            # mech 'no-trailing' skip. try/except (Opus xhigh review): a malformed bar must NOT crash
+            # the resolve() batch — this line is OUTSIDE the fetch-try, and for mech positions there is
+            # no other OHLC deref, so an unguarded raise here would reopen the 2026-07-08 corrupt-bar hole.
+            try:
+                if side == "LONG":
+                    mfe_px = max(mfe_px, float(b["high"]) - entry); mae_px = max(mae_px, entry - float(b["low"]))
+                else:
+                    mfe_px = max(mfe_px, entry - float(b["low"])); mae_px = max(mae_px, float(b["high"]) - entry)
+            except (KeyError, TypeError, ValueError):
+                pass
             if is_mech:
                 continue                       # proven methods run EXACTLY as backtested: no trailing
             if risk > 0:                       # ratchet AFTER surviving this bar
@@ -1405,7 +1419,18 @@ def resolve(client: Any, now_ms: int) -> int:
         fee = float(lr.trade_costs(entry, exit_px, qty, quote_vol)["fee"])
         net = lr.net_pnl(side, entry, exit_px, qty, margin, fee, funding,
                          liquidated=(reason == "liquidation"))
-        r = net / margin if margin > 0 else 0.0  # R vs margin risked
+        r = net / margin if margin > 0 else 0.0  # R vs margin risked (leverage-scaled; NOT the R:R multiple)
+        # P0 LEARNING METRICS (measurement only — do not affect the account/scorecard). actual_R/predicted_R
+        # are true R:R multiples (price move ÷ stop distance), the right units for calibration — unlike
+        # `r` above which is return-on-margin. noise_stop vs thesis_wrong disambiguates the 75% stop-out rate.
+        gain_px = (exit_px - entry) if side == "LONG" else (entry - exit_px)
+        actual_R = round(gain_px / risk, 3) if risk > 0 else 0.0
+        predicted_R = round(abs(tp - entry) / risk, 3) if risk > 0 else 0.0
+        mfe_R = round(mfe_px / risk, 3) if risk > 0 else 0.0
+        mae_R = round(mae_px / risk, 3) if risk > 0 else 0.0
+        noise_stop = bool(net < 0 and mfe_R >= 1.0)    # offered >=1R profit, then wiggled to the stop
+        thesis_wrong = bool(net < 0 and mfe_R < 0.5)   # went ~straight against the entry
+        bars_held = int((exit_ts - int(p["entry_ts"])) / bar_ms) if bar_ms > 0 else 0
         acct["equity"] = round(float(acct["equity"]) + net, 4)
         acct["realized"] = round(float(acct["realized"]) + net, 4)
         acct["trades"] = int(acct["trades"]) + 1
@@ -1414,6 +1439,8 @@ def resolve(client: Any, now_ms: int) -> int:
                "entry": entry, "exit": exit_px, "reason": reason, "net": round(net, 4), "r": round(r, 3),
                "fee": round(fee, 4), "funding": round(funding, 4), "liq_px": round(liq_px, 6), "tier": tier,
                "leverage": lev, "margin": round(margin, 4), "vol": p.get("vol"),
+               "predicted_R": predicted_R, "actual_R": actual_R, "mfe_R": mfe_R, "mae_R": mae_R,  # P0 learning
+               "noise_stop": noise_stop, "thesis_wrong": thesis_wrong, "bars_held": bars_held,
                "mech_method": p.get("mech_method"), "entry_feats": p.get("entry_feats"),
                "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         try:    # owner feature: closed-trade chart with BUY/SELL markers
