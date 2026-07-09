@@ -132,6 +132,10 @@ DAILY_BREAKER_ON = os.environ.get("LLM_TRADER_DAILY_BREAKER", "0") != "0"
 # not-yet-proven strategy = faster data AND faster bleed; the scorecard is the judge.
 MIN_CONFLUENCE = int(os.environ.get("LLM_TRADER_MIN_CONFLUENCE", "2"))
 EXPLORE_MODE = os.environ.get("LLM_TRADER_EXPLORE", "1") == "1"
+# "rút râu" chop filter (owner 2026-07-09): when >= WICK_CHOP_MIN of recent bars are wick-dominated
+# (stop-hunt chop), only let a high-conviction WICK_CHOP_MIN_RR reward:risk setup through; skip the rest.
+WICK_CHOP_MIN = float(os.environ.get("LLM_TRADER_WICK_CHOP", "0.5"))
+WICK_CHOP_MIN_RR = float(os.environ.get("LLM_TRADER_WICK_RR", "2.5"))
 
 
 # ---------------------------------------------------------------------------
@@ -346,9 +350,19 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
             _gr_rngs = [(float(b["high"]) - float(b["low"])) / float(b["close"])
                         for b in fb[-48:] if float(b.get("close") or 0) > 0]
             gap_risk_pct = round(max(_gr_rngs) * 100, 3) if _gr_rngs else None
+            # wick_intensity (owner 2026-07-09 "rút râu"): fraction of the last 12 bars DOMINATED by wick
+            # (tail >=60% of the bar range, small body) = stop-hunt / rejection chop where 15m noise
+            # clips stops — the measured 75%-SL death zone. High value => only high-conviction trades.
+            _w12 = fb[-12:]; _wd = 0
+            for _b in _w12:
+                _h = float(_b["high"]); _l = float(_b["low"]); _c = float(_b["close"]); _o = float(_b.get("open") or _c)
+                _rng = _h - _l
+                if _rng > 0 and (_rng - abs(_c - _o)) / _rng >= 0.6:
+                    _wd += 1
+            wick_intensity = round(_wd / len(_w12), 2) if _w12 else None
             out.append({
                 "symbol": sym, "price": round(float(enr["close"].iloc[i]), 4),
-                "last8_closes": closes, "gap_risk_pct": gap_risk_pct, **reg, **feats,
+                "last8_closes": closes, "gap_risk_pct": gap_risk_pct, "wick_intensity": wick_intensity, **reg, **feats,
                 "whale": whale.get(sym),   # Telegram whale/liquidation pressure (may be None)
                 "funding_rate": round(float(enr["funding_rate"].iloc[i]) if "funding_rate" in enr else 0.0, 6),
                 "cvd_norm": round(float(enr["cvd_delta_norm"].iloc[i]) if "cvd_delta_norm" in enr and enr["cvd_delta_norm"].iloc[i]==enr["cvd_delta_norm"].iloc[i] else 0.0, 3),
@@ -1066,6 +1080,17 @@ def _apply_gap_veto(decisions: list[dict[str, Any]], ctx: list[dict[str, Any]]) 
             _append(LT_DIR / "governance.jsonl",
                     {"ts_ms": now_ms, "event": "gate_block_choppy_llm", "symbol": d.get("symbol")})
             continue
+        # "rút râu" CHOP gate (owner 2026-07-09): in a stop-hunt chop (>= WICK_CHOP_MIN of recent bars
+        # wick-dominated), a low-R:R trade just feeds the 75%-SL noise. Only a high-conviction R:R
+        # ("chắc ăn") setup earns the window; otherwise skip it ("né những khung giờ đó").
+        _wick = row.get("wick_intensity")
+        if _wick is not None and _wick >= WICK_CHOP_MIN:
+            _rr = float(d.get("tp_pct") or 0) / max(0.1, float(d.get("sl_pct") or 1))
+            if _rr < WICK_CHOP_MIN_RR:
+                _append(LT_DIR / "governance.jsonl",
+                        {"ts_ms": now_ms, "event": "gate_block_wick_chop", "symbol": d.get("symbol"),
+                         "wick": _wick, "rr": round(_rr, 2)})
+                continue
         _atr = row.get("atr_pct"); _gr = row.get("gap_risk_pct")
         _liq = 100.0 / max(1, int(d.get("leverage") or MECH_LEV))
         if (_atr is None or _atr != _atr or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq
