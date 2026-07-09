@@ -77,6 +77,13 @@ MIN_ENTRY_VOL = float(os.environ.get("LLM_TRADER_MIN_ENTRY_VOL", "1.5"))
 # size caps + kill-switch + live-LOCKED all stay. Watch the scorecard; if it bleeds, KILL (or set
 # LLM_TRADER_PROVEN_ONLY=1 to revert). Paper only.
 PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "0") == "1"
+# R2 (plans/redesign_tin_va_chart_v1.md): information+chart redesign. OFF by default — flipping it on
+# requires (a) trigger thresholds tuned on trigger_log data, (b) Opus adversarial review of the flip.
+# When ON: discretionary candidates are GATED to trigger-hit coins, and every actionable decision must
+# survive a STAGE-2 second look (fresh focused chart of the chosen TF) before it executes.
+REDESIGN = os.environ.get("LLM_TRADER_REDESIGN", "0") == "1"
+STAGE2_MAX = int(os.environ.get("LLM_TRADER_STAGE2_MAX", "4"))   # focused re-look calls per cycle; =max_charts
+                                                                 # so no actionable decision skips the look (review #2)
 # MISSION (boss's boss, 2026-07-05): grow \$100 -> \$1000, sizing at the bot's
 # discretion. Sizing chosen by HALF-KELLY math on capitulation_long's FULL-SCALE
 # stats (win 54.7%, ~1.6R payoff => full Kelly ~26% risk/fire is suicide-variance;
@@ -1012,6 +1019,88 @@ def decide(context: list[dict[str, Any]], equity: float,
     return _decide_numeric(charted, equity, status)   # vision failed/empty -> numeric fallback
 
 
+def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -> list[dict[str, Any]]:
+    """R2 SECOND LOOK (owner: 'chọn đánh khung nào thì nhìn lại khung đó rồi quyết định'). For each
+    actionable stage-1 decision (bounded STAGE2_MAX), re-render ONLY the chosen TF fresh (more bars +
+    S/R zones) and ask the model to CONFIRM or REJECT its own proposal. Model REJECT -> the trade is
+    dropped (that is the point of the second look). TECHNICAL failure (fetch/render/LLM error) ->
+    pass-through tagged 'error_passthrough': an outage must not silently zero all trading (the
+    '0 trades' trap) — it is logged and visible, not a silent block. Never raises."""
+    if not REDESIGN or not decisions:
+        return decisions
+    out: list[dict[str, Any]] = []
+    looked = 0
+    for d in decisions:
+        if looked >= STAGE2_MAX:               # over budget: pass through untagged-looked
+            d["_stage2"] = "skipped_budget"
+            out.append(d)
+            continue
+        looked += 1
+        sym = d.get("symbol"); tf = str(d.get("tf_basis") or "15m")
+        try:      # mid-cycle heartbeat (review FIX-BEFORE-FLIP #1): 3 stage-2 vision calls can push
+            _hb({"phase": "stage2", "symbol": sym, "looked": looked})   # run_once past the supervisor's
+        except Exception:                                               # 1200s stale bound — touching the
+            pass                                                        # hb per look caps the gap at ~1 call
+        try:
+            if tf == "15m":
+                bars = list(d.get("_bars") or [])
+            else:
+                _mo = 0.5 if tf == "1h" else 2.0
+                bars = of.fetch_klines_with_flow(sym, tf, months=_mo, end_ms=now_ms,
+                                                 client=client, sleep_between=0.02, with_deriv=False)
+                bars = [b for b in bars if int(b["ts_ms"]) + of._TF_MS[tf] <= now_ms]
+            if len(bars) < 30:
+                raise ValueError("not enough bars for stage-2")
+            sm = smc.smc_summary(bars, sym, tf)
+            b64 = ltc.render_chart(sym, bars[-260:], tf=tf, hlines=(sm.get("hlines") or None))
+            if not b64:
+                raise ValueError("stage-2 render failed")
+            sys2 = ("SECOND LOOK — you are the same trader. On your broad 3-timeframe scan you proposed "
+                    "the trade below and chose the " + tf + " timeframe as its basis. This is that SAME "
+                    "coin redrawn FRESH on " + tf + " only, with more bars and S/R zones. Decide FINAL: "
+                    "does structure on THIS timeframe still support the entry RIGHT NOW? Be strict — a "
+                    "marginal setup on the second look is a REJECT (rejecting is free, a bad entry is not). "
+                    "Reply STRICT JSON only: {\"confirm\": true|false, \"reason\": \"<=120 chars\", "
+                    "\"sl_pct\": <number or null>, \"tp_pct\": <number or null>} — set sl/tp to THIS "
+                    "timeframe's structure if the old ones don't fit (sl 0.3-8, tp 0.3-15; null keeps old).")
+            body = json.dumps({"proposal": {k: d.get(k) for k in
+                                            ("symbol", "action", "leverage", "size_pct", "sl_pct",
+                                             "tp_pct", "entry_px", "tf_basis", "rationale")},
+                               "trigger_info": d.get("trigger_info"),
+                               "numbers": {k: d.get(k) for k in
+                                           ("price", "atr_pct", "rsi14", "vol_ratio", "funding_rate",
+                                            "regime", "wick_intensity")},
+                               "smc_" + tf: sm.get("summary") or {}}, default=str)
+            v = _split_thinking(_llm_vision(sys2, body, [(str(sym) + " " + tf + " (second look)", b64)]))
+            if isinstance(v, list):
+                v = v[0] if v and isinstance(v[0], dict) else None
+            if not isinstance(v, dict):
+                raise ValueError("stage-2 reply not a dict")
+            if not bool(v.get("confirm")):
+                _append(LT_DIR / "governance.jsonl",
+                        {"ts_ms": now_ms, "event": "stage2_reject", "symbol": sym, "tf": tf,
+                         "reason": str(v.get("reason", ""))[:140]})
+                continue                        # model rejected its own idea on the focused look -> drop
+            import math as _m
+            for k, lo, hi in (("sl_pct", 0.3, 8.0), ("tp_pct", 0.3, 15.0)):
+                try:
+                    nv = float(v.get(k))
+                    if _m.isfinite(nv):
+                        d[k] = max(lo, min(hi, nv))   # same clamps as _validate_decisions
+                except (TypeError, ValueError):
+                    pass                             # null/absent -> keep stage-1 value
+            d["_stage2"] = "confirmed"
+            d["rationale"] = (str(d.get("rationale") or "") + " | s2:" + str(v.get("reason", ""))[:100])[:340]
+            out.append(d)
+        except Exception as _s2e:
+            d["_stage2"] = "error_passthrough"
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "stage2_error_passthrough", "symbol": sym, "tf": tf,
+                     "error": repr(_s2e)[:140]})
+            out.append(d)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # paper execution + resolution (never live)
 # ---------------------------------------------------------------------------
@@ -1144,6 +1233,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                                   "price0": float(d["price"]), "placed_ms": now_ms, "ts": d.get("_ts"),
                                   "tf_basis": d.get("tf_basis", "15m"),
                                   "trigger_paths": d.get("_trigger_paths"),   # R1 measurement tag
+                                  "stage2": d.get("_stage2"),                 # R2 second-look outcome
                                   "rationale": d.get("rationale", "")})
                 pend_syms.add(d["symbol"])
             else:
@@ -1196,6 +1286,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "mech": bool(d.get("_mech")), "max_hold": (int(d.get("_max_hold") or 16) if d.get("_mech") else None),
                          "mech_method": d.get("_mech_method"), "entry_feats": d.get("_entry_feats"),
                          "trigger_paths": d.get("_trigger_paths"),   # R1: which selection paths fired (measurement)
+                         "stage2": d.get("_stage2"),   # R2: confirmed | error_passthrough | skipped_budget | None
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
@@ -1251,6 +1342,7 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
                  "_ts": fill_ts - 1, "_fill_bar_ts": fill_ts,
                  "tf_basis": po.get("tf_basis", "15m"),
                  "_trigger_paths": po.get("trigger_paths"),   # R1 tag flows through the limit path too
+                 "_stage2": po.get("stage2"),                 # R2 tag flows through the limit path too
                  "rationale": (po.get("rationale") or "") + " [limit filled]"}
             got = open_positions([d], equity, now_iso, now_ms=now_ms)
             if got:
@@ -1453,6 +1545,7 @@ def resolve(client: Any, now_ms: int) -> int:
                "noise_stop": noise_stop, "thesis_wrong": thesis_wrong, "bars_held": bars_held,
                "mech_method": p.get("mech_method"), "entry_feats": p.get("entry_feats"),
                "trigger_paths": p.get("trigger_paths"),   # R1: per-path expectancy is judged on THIS field
+               "stage2": p.get("stage2"),                 # R2: second-look outcome rides to the ledger
                "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         try:    # owner feature: closed-trade chart with BUY/SELL markers
             b64 = ltc.render_trade_chart(p["symbol"], fb, side=side,
@@ -1642,6 +1735,21 @@ def run_once() -> dict[str, Any]:
     if PROVEN_ONLY:
         # the bleed fix: no discretionary entries — only lab-proven survivors fire.
         decisions = _mechanical_decisions(ctx)
+    elif REDESIGN:
+        # R2 (owner-approved redesign): candidates are GATED to trigger-hit coins — no trigger, the
+        # model never sees the coin as a trade option this cycle (selection in CODE, not prompt: the
+        # model has proven it ignores prompt rules). trigger_info rides into the prompt so the model
+        # knows WHY each coin is on the list. Then every actionable decision must survive the
+        # STAGE-2 second look on its chosen TF. Mechanical/proven path is NOT gated (own governance).
+        ctx_gated = [c for c in ctx if c.get("symbol") in trig_map]
+        for c in ctx_gated:
+            c["trigger_info"] = (trig_map.get(c.get("symbol")) or {}).get("vals")
+        if ctx_gated:
+            decisions = _apply_gap_veto(
+                decide(ctx_gated, equity, status=status, client=client, now_ms=now_ms), ctx_gated)
+            decisions = _stage2_confirm(decisions, client, now_ms)
+        else:
+            decisions = []   # no coin triggered -> no discretionary trades this cycle (by design)
     else:
         # DISCRETIONARY: gpt-5.5 vision reads the charts and decides. Loosened from PROVEN_ONLY so the
         # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),

@@ -90,6 +90,24 @@ contract), reflection→playbook loop (research: theater), any live-order path (
 - **R3 (n≥30):** read per-path verdicts → owner prunes/keeps; iterate thresholds.
 - Every step: Opus-xhigh adversarial review before flip (Codex out of tokens). Rollback = env flag, instant.
 
+**R2 CODE STATUS (2026-07-10): BUILT behind `LLM_TRADER_REDESIGN=0` + REVIEWED (Opus xhigh: SHIP — flag-off
+bit-for-bit identical, LAW un-weakenable by stage-2, tag flow verified).** Gate + `_stage2_confirm` (second
+look, ≤STAGE2_MAX=4/cycle, REJECT drops / technical-error passes through tagged) + `stage2` tag on all 4 rec
+sites + trigger_log rotation + `trigger_stats.py` tuning tool. Tests 27 (R1+R2) + 39 existing green.
+Review fixes applied pre-commit: mid-cycle heartbeat per stage-2 look (#1 — caps hb gap under the supervisor's
+1200s stale bound), STAGE2_MAX 3→4 =max_charts (#2 — no unvetted 4th decision).
+
+**FIX/VERIFY-BEFORE-FLIP checklist (blocking `LLM_TRADER_REDESIGN=1`, NOT the commit):**
+1. Tune trigger thresholds on ≥1 day of trigger_log via `trigger_stats.py` (whale over-fires: score=1.0 from
+   1 Telegram event; chart_align fired 24/60 on cycle 1 — too loose as a gate).
+2. Empirically verify a 3-4-look cycle keeps heartbeat gap < 1200s (mid-cycle hb shipped; confirm in logs).
+3. Final Opus review of the flip config (thresholds + any wiring delta).
+4. Acknowledged (review, no code change): pending-limit fills do NOT re-run stage-2 (gap-tail re-veto at fill
+   covers ruin; re-running would blow the vision budget — accepted trade-off). 15m stage-2 re-renders stage-1's
+   220 bars rather than fetching more (weaker than "more bars" intent; revisit only if the 15m path survives
+   measurement). News titles reach the prompt when ON — title-only, 80-char cap, sanitize-filtered; blast
+   radius bounded by LAW clamps (rated LOW).
+
 **R1 STATUS (2026-07-10): BUILT + REVIEWED (Opus xhigh: SHIP, no critical/high) + tests 20/20 + 39 existing
 green.** `llm_trader_triggers.py` (read_news/evaluate/log_cycle, fail-soft) wired into run_once; tags flow
 decision→position→PENDING→closed.jsonl; `by_trigger_path` in calibration_report. Deviation from plan: R1 runs

@@ -155,11 +155,18 @@ def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any]) -> dict[str, 
 
 def log_cycle(path: Path, now_ms: int, trig_map: dict[str, dict[str, Any]], n_ctx: int) -> None:
     """One JSONL line per cycle: what fired and with which values (the R2 tuning dataset).
-    Best-effort — logging failure must never affect trading."""
+    Best-effort — logging failure must never affect trading. Rotates at ~15MB (Opus review M2):
+    current -> .1 (previous .1 overwritten) so the log never grows unbounded."""
     try:
+        p = Path(path)
+        try:
+            if p.exists() and p.stat().st_size > 15_000_000:
+                p.replace(p.with_suffix(p.suffix + ".1"))
+        except Exception:
+            pass
         rec = {"ts_ms": now_ms, "n_ctx": n_ctx, "n_hit": len(trig_map),
                "thresholds": _THRESHOLDS, "hits": trig_map}
-        with Path(path).open("a", encoding="utf-8") as f:
+        with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=True) + "\n")
     except Exception:
         pass
