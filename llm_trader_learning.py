@@ -30,6 +30,16 @@ def _setup_type(rationale: str | None) -> str:
     return "other"
 
 
+def _trigger_key(c: dict[str, Any]) -> str:
+    """Group key for by_trigger_path: sorted '+'-joined paths, or 'none'. A trade tagged with
+    several paths counts once under the combined key (e.g. 'chart_align+whale') — combos are
+    themselves hypotheses worth measuring separately from single paths."""
+    tp = c.get("trigger_paths")
+    if isinstance(tp, list) and tp:
+        return "+".join(sorted(str(x) for x in tp))
+    return "none"
+
+
 def _num(x: Any) -> float | None:
     try:
         v = float(x)
@@ -105,6 +115,9 @@ def calibration_report(closed: list[dict[str, Any]], window: int = 40,
         "over_optimism_R": _mean(over),            # positive => predicts more R than it achieves
         "by_setup": _group_stats(rows, lambda c: _setup_type(c.get("rationale"))),
         "by_regime": _group_stats(rows, lambda c: c.get("regime") or "?"),
+        # R1 (redesign_tin_va_chart_v1): per-trigger-path expectancy — THE numbers that green-light or
+        # kill each candidate-selection path at n>=20. "none" = the coin hit no path that cycle.
+        "by_trigger_path": _group_stats(rows, _trigger_key),
         # honest interpretation flag for whoever reads this:
         "verdict_hint": _verdict_hint(noise, thesis, n_loss),
     }

@@ -299,6 +299,7 @@ def _features(enr, fb) -> dict[str, Any]:
 
 
 _WHALE_PATH = ROOT / "state" / "agent_memory" / "whale_flow_latest.json"
+_NEWS_PATH = ROOT / "state" / "agent_memory" / "news_latest.json"   # news_observer output (R1 triggers)
 
 
 def _whale_flow_map() -> dict[str, dict[str, Any]]:
@@ -1142,6 +1143,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                                   "vol": d.get("vol_ratio"), "regime": d.get("regime"), "chart_b64": d.get("_chart_b64"),
                                   "price0": float(d["price"]), "placed_ms": now_ms, "ts": d.get("_ts"),
                                   "tf_basis": d.get("tf_basis", "15m"),
+                                  "trigger_paths": d.get("_trigger_paths"),   # R1 measurement tag
                                   "rationale": d.get("rationale", "")})
                 pend_syms.add(d["symbol"])
             else:
@@ -1193,6 +1195,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "fill_bar_ts": d.get("_fill_bar_ts"),
                          "mech": bool(d.get("_mech")), "max_hold": (int(d.get("_max_hold") or 16) if d.get("_mech") else None),
                          "mech_method": d.get("_mech_method"), "entry_feats": d.get("_entry_feats"),
+                         "trigger_paths": d.get("_trigger_paths"),   # R1: which selection paths fired (measurement)
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
@@ -1247,6 +1250,7 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
                  "regime": po.get("regime"), "_chart_b64": po.get("chart_b64"),
                  "_ts": fill_ts - 1, "_fill_bar_ts": fill_ts,
                  "tf_basis": po.get("tf_basis", "15m"),
+                 "_trigger_paths": po.get("trigger_paths"),   # R1 tag flows through the limit path too
                  "rationale": (po.get("rationale") or "") + " [limit filled]"}
             got = open_positions([d], equity, now_iso, now_ms=now_ms)
             if got:
@@ -1448,6 +1452,7 @@ def resolve(client: Any, now_ms: int) -> int:
                "predicted_R": predicted_R, "actual_R": actual_R, "mfe_R": mfe_R, "mae_R": mae_R,  # P0 learning
                "noise_stop": noise_stop, "thesis_wrong": thesis_wrong, "bars_held": bars_held,
                "mech_method": p.get("mech_method"), "entry_feats": p.get("entry_feats"),
+               "trigger_paths": p.get("trigger_paths"),   # R1: per-path expectancy is judged on THIS field
                "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         try:    # owner feature: closed-trade chart with BUY/SELL markers
             b64 = ltc.render_trade_chart(p["symbol"], fb, side=side,
@@ -1622,6 +1627,18 @@ def run_once() -> dict[str, Any]:
                                       min_daily_quote_volume=UNIVERSE_MIN_QVOL,
                                       max_symbols=UNIVERSE_MAX)["selected"]
     ctx = build_context(client, selected, now_ms)
+    # R1 trigger engine — DARK measurement ONLY (plans/redesign_tin_va_chart_v1.md §5-R1): evaluates
+    # which candidate-selection paths (news/whale/funding_oi/chart_align) each coin hits, logs the
+    # cycle, and tags opened trades. Changes NO behavior — the per-path expectancy it accumulates on
+    # live closes is what green-lights (or kills) the R2 gate. Fail-soft: errors are logged, never raised.
+    trig_map: dict[str, Any] = {}
+    try:
+        import llm_trader_triggers as ltt
+        trig_map = ltt.evaluate(ctx, ltt.read_news(_NEWS_PATH, now_ms))
+        ltt.log_cycle(LT_DIR / "trigger_log.jsonl", now_ms, trig_map, len(ctx))
+    except Exception as _te:
+        _append(LT_DIR / "governance.jsonl",
+                {"ts_ms": now_ms, "event": "trigger_engine_error", "error": repr(_te)[:150]})
     if PROVEN_ONLY:
         # the bleed fix: no discretionary entries — only lab-proven survivors fire.
         decisions = _mechanical_decisions(ctx)
@@ -1630,6 +1647,11 @@ def run_once() -> dict[str, Any]:
         # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),
         # because "don't get liquidated on a gap" is safety, not rigidity.
         decisions = _apply_gap_veto(decide(ctx, equity, status=status, client=client, now_ms=now_ms), ctx)
+    for _d in decisions:   # tag which trigger paths the coin hit THIS cycle (measurement metadata)
+        try:
+            _d["_trigger_paths"] = (trig_map.get(_d.get("symbol")) or {}).get("paths")
+        except Exception:
+            pass
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
     try:
         _write_daily_progress(now_ms)   # P1 KPI snapshot; best-effort, never blocks the cycle
