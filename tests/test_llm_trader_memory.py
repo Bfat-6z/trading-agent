@@ -359,6 +359,7 @@ def _decide_market_ctx(symbol="SOLUSDT"):
              "ret20_pct": 1.2, "trend": "up", "adx": 28.0, "efficiency": 0.41,
              "regime": "trending", "atr_pct": 1.1, "funding_rate": 0.0001,
              "cvd_norm": 0.2, "atr": 1.1, "_quote_vol_24h": 3e9,
+             "vol_ratio": 2.0,   # a real build_context row carries this; the vol gate (>=1.5) needs it
              "_ts": 1_760_000_000_000}]
 
 

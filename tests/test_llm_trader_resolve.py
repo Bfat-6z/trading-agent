@@ -89,11 +89,13 @@ def test_liquidation_is_emitted_and_nets_full_margin(env, monkeypatch):
 # ---------------------------------------------------------------------------
 def test_funding_is_charged_on_timeout_hold(env, monkeypatch):
     # LONG x5 (liq 81), sl/tp never touched -> timeout after MAX_HOLD_BARS.
+    # NOTE (2026-07-09): only MECH/proven positions time out now — discretionary trades ride to SL/TP
+    # (owner). So this funding-on-timeout case is a mech position (mech=True).
     # One 0.1% funding event inside the hold: LONG pays rate*qty*entry = 0.05.
     qty = 0.5  # margin 10 * lev 5 / entry 100
     bars = [_bar(i, high=101.0, low=99.0, close=100.0) for i in range(lt.MAX_HOLD_BARS + 2)]
     funding = [{"fundingTime": ENTRY_TS + 10_000_000, "fundingRate": 0.001}]
-    rec = _run(monkeypatch, _pos(side="LONG", entry=100.0, lev=5, sl=50.0, tp=200.0),
+    rec = _run(monkeypatch, _pos(side="LONG", entry=100.0, lev=5, sl=50.0, tp=200.0, mech=True),
                bars=bars, funding=funding)
     assert rec["reason"] == "timeout"
     assert rec["funding"] == pytest.approx(0.001 * qty * 100.0)  # 0.05, positive = cost
