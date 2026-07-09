@@ -839,8 +839,11 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
                 continue
         except Exception:
             pass
+        _tfb = str(dec.get("tf_basis", "15m")).lower()    # which TF the model based the setup on
+        if _tfb not in ("15m", "1h", "4h"):
+            _tfb = "15m"
         out.append({**ctx, "action": action, "leverage": lev, "size_pct": size_pct,
-                    "sl_pct": sl_pct, "tp_pct": tp_pct, "entry_px": entry_px,
+                    "sl_pct": sl_pct, "tp_pct": tp_pct, "entry_px": entry_px, "tf_basis": _tfb,
                     "rationale": str(dec.get("rationale", ""))[:240]})
     return out
 
@@ -871,7 +874,7 @@ _DECISION_SCHEMA = (
     "===DECISIONS===\nThen a JSON ARRAY (may be empty) of ONLY coins that PASSED the gate: "
     "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\",\"leverage\":5|10,\"size_pct\":5-10,"
     "\"entry_px\":<limit price, or omit for market>,\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,"
-    "\"rationale\":\"cite levels + how many confluences\"}]")
+    "\"tf_basis\":\"15m|1h|4h\",\"rationale\":\"cite levels + how many confluences\"}]")
 
 
 _THINK_PATH = LT_DIR / "thinking_latest.json"
@@ -923,7 +926,8 @@ def _activity_score(c: dict[str, Any]) -> float:
 
 
 def decide(context: list[dict[str, Any]], equity: float,
-           status: dict[str, Any] | None = None, *, max_charts: int = 5) -> list[dict[str, Any]]:
+           status: dict[str, Any] | None = None, *, max_charts: int = 4,
+           client: Any = None, now_ms: int | None = None) -> list[dict[str, Any]]:
     """CHART-BASED decision (owner request A+B): scan all coins numerically, pick
     the most active ones, RENDER their candlestick+EMA+volume charts and let
     gpt-5.5 SEE them (vision) before deciding — the way a discretionary trader
@@ -944,6 +948,8 @@ def decide(context: list[dict[str, Any]], equity: float,
             shortlist = [c] + shortlist[:max_charts - 1]
             c["a_plus_pure"] = True   # flagged in coins_txt so the model sees it
     by_sym = {c["symbol"]: c for c in shortlist}
+    import time as _t2
+    _nowms = int(now_ms if now_ms is not None else _t2.time() * 1000)
     images, charted = [], []
     for c in shortlist:
         bars = c.get("_bars")
@@ -955,7 +961,22 @@ def decide(context: list[dict[str, Any]], equity: float,
         b64 = ltc.render_chart(c["symbol"], bars, tf=TF, hlines=(sm.get("hlines") or None))
         if b64:
             c["_chart_b64"] = b64   # carry to open_positions so the EXACT chart the
-            images.append((c["symbol"], b64)); charted.append(c)  # LLM saw is persisted
+            images.append((c["symbol"] + " 15m", b64)); charted.append(c)  # LLM saw is persisted
+            # MULTI-TF (owner 2026-07-09: "đánh cả ba khung, khung nào đánh thì nhìn chart khung đó lại"):
+            # render the SAME coin on REAL 1h and 4h bars so the model confirms the setup on the actual
+            # higher-TF chart, not a resampled number. Best-effort — skip a TF if fetch/render fails.
+            if client is not None:
+                for _tf, _mo in (("1h", 0.5), ("4h", 2.0)):
+                    try:
+                        _tfb = of.fetch_klines_with_flow(c["symbol"], _tf, months=_mo, end_ms=_nowms,
+                                                         client=client, sleep_between=0.02, with_deriv=False)
+                        _tfb = [b for b in _tfb if int(b["ts_ms"]) + of._TF_MS[_tf] <= _nowms]
+                        if len(_tfb) >= 30:
+                            _b64tf = ltc.render_chart(c["symbol"], _tfb[-160:], tf=_tf)
+                            if _b64tf:
+                                images.append((c["symbol"] + " " + _tf, _b64tf))
+                    except Exception:
+                        pass
     if not images:
         return _decide_numeric(shortlist, equity, status)   # nothing rendered -> numeric
     # compact numeric + SMC read to accompany each chart (no raw bars in text)
@@ -979,6 +1000,14 @@ def decide(context: list[dict[str, Any]], equity: float,
            "flow: pressure_side LONG/SHORT + score, and long/short liquidation $). Treat it as a LAGGING, NOISY "
            "confluence hint ONLY — whale pressure agreeing with your chart setup adds a little confidence; a big "
            "opposite-side liquidation can mark a flush/reversal; NEVER trade on whale flow alone or chase it.\n\n"
+           "MULTI-TIMEFRAME (owner rule): each coin is shown on THREE real charts — labeled '<SYM> 15m', "
+           "'<SYM> 1h', '<SYM> 4h'. READ ALL THREE before deciding: the 4h and 1h define the DOMINANT trend "
+           "and the major support/resistance; the 15m is the entry trigger/timing. Trade the timeframe where "
+           "the setup is CLEANEST, and base your SL/TP on THAT timeframe's structure — a 4h-based trade has a "
+           "WIDER 4h-structure stop (it must not sit inside 15m noise), a 15m scalp a tight one. A setup that "
+           "looks good on 15m but fights the 1h/4h trend is a TRAP (this is your 75%-noise-stop leak) — require "
+           "the higher timeframe to at least NOT oppose you. Report the timeframe you based the trade on as "
+           "\"tf_basis\": one of \"15m\"|\"1h\"|\"4h\".\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
            + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
@@ -1137,6 +1166,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                                   "atr": float(d.get("atr") or 0), "quote_vol_24h": float(d.get("_quote_vol_24h", 0) or 0),
                                   "vol": d.get("vol_ratio"), "regime": d.get("regime"), "chart_b64": d.get("_chart_b64"),
                                   "price0": float(d["price"]), "placed_ms": now_ms, "ts": d.get("_ts"),
+                                  "tf_basis": d.get("tf_basis", "15m"),
                                   "rationale": d.get("rationale", "")})
                 pend_syms.add(d["symbol"])
             else:
@@ -1189,6 +1219,7 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "margin": round(margin, 4), "leverage": lev, "sl": sl, "tp": tp,
                          "liq_px": liq_px, "mmr": mmr, "quote_vol_24h": quote_vol, "tier": tier,
                          "entry_ts": d["_ts"], "opened_at": now_iso, "regime": d["regime"],
+                         "tf_basis": d.get("tf_basis", "15m"),   # which TF the model based the trade on
                          "fill_bar_ts": d.get("_fill_bar_ts"),
                          "mech": bool(d.get("_mech")), "max_hold": (int(d.get("_max_hold") or 16) if d.get("_mech") else None),
                          "mech_method": d.get("_mech_method"), "entry_feats": d.get("_entry_feats"),
@@ -1245,6 +1276,7 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
                  "vol_ratio": po.get("vol"), "_maker": True,
                  "regime": po.get("regime"), "_chart_b64": po.get("chart_b64"),
                  "_ts": fill_ts - 1, "_fill_bar_ts": fill_ts,
+                 "tf_basis": po.get("tf_basis", "15m"),
                  "rationale": (po.get("rationale") or "") + " [limit filled]"}
             got = open_positions([d], equity, now_iso, now_ms=now_ms)
             if got:
@@ -1577,7 +1609,7 @@ def run_once() -> dict[str, Any]:
         # DISCRETIONARY: gpt-5.5 vision reads the charts and decides. Loosened from PROVEN_ONLY so the
         # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),
         # because "don't get liquidated on a gap" is safety, not rigidity.
-        decisions = _apply_gap_veto(decide(ctx, equity, status=status), ctx)
+        decisions = _apply_gap_veto(decide(ctx, equity, status=status, client=client, now_ms=now_ms), ctx)
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
     wr = round(acct["wins"] / acct["trades"], 3) if acct["trades"] else None
     return {"equity": acct["equity"], "trades": acct["trades"], "win_rate": wr,
