@@ -125,7 +125,11 @@ MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "95"))
 # down-day can compound past -15% with nothing halting new entries. The per-position
 # sizing (mech_sizing), $50M liquidity floor and 95% total-margin cap are the only
 # remaining guards. Live orders stay LOCKED regardless.
-DAILY_BREAKER_ON = os.environ.get("LLM_TRADER_DAILY_BREAKER", "0") != "0"
+# 2026-07-09 (Codex review of the unshackle): default ON. Now that the discretionary model trades
+# freely (choppy/wick gates removed), a -15%/day circuit-breaker is the SURVIVAL backstop that stops a
+# bad day cascading into a blow-up — it never caps a single trade, so it is not the per-trade rigidity
+# the owner objected to. Env can still disable (LLM_TRADER_DAILY_BREAKER=0).
+DAILY_BREAKER_ON = os.environ.get("LLM_TRADER_DAILY_BREAKER", "1") != "0"
 # DATA-ACCUMULATION mode (owner): trade B+ setups to build a measured track record
 # fast, instead of sitting idle waiting for the rare A+. Lower confluence gate +
 # an explicit "act, don't over-skip" directive. Honest tradeoff: more trades on a
