@@ -1008,6 +1008,12 @@ def decide(context: list[dict[str, Any]], equity: float,
            "looks good on 15m but fights the 1h/4h trend is a TRAP (this is your 75%-noise-stop leak) — require "
            "the higher timeframe to at least NOT oppose you. Report the timeframe you based the trade on as "
            "\"tf_basis\": one of \"15m\"|\"1h\"|\"4h\".\n\n"
+           "wick_intensity (0.0-1.0) = fraction of the last 12 bars dominated by WICK (long tails, small "
+           "body) = a stop-hunt 'rút râu' chop where tight stops get clipped by noise (your measured 75%-"
+           "SL leak). It is NOT a hard block anymore — YOU judge it: when it's high (~0.5+), either stand "
+           "aside or take only a high-conviction setup with a WIDE structure stop that clears the wicks. "
+           "Likewise 'regime':'choppy' has been your worst zone (7% win) — trade it only with a genuine "
+           "edge, not a marginal one. These are YOUR calls now, not code gates.\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
            + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
@@ -1090,36 +1096,19 @@ def _structure_sl_tp(side: str, entry: float, d: dict[str, Any]) -> tuple[float 
 
 
 def _apply_gap_veto(decisions: list[dict[str, Any]], ctx: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Apply the gap-tail RUIN veto to DISCRETIONARY (LLM) decisions too. The mechanical path enforces
-    it internally, but the LLM path bypassed it (bughunt LLM#1). An entry on a high-gap coin — the worst
-    recent single bar reaching the liquidation distance — can gap THROUGH the stop straight to
-    liquidation (the -$14 HMSTR ruin). Keep this even when loosening: it's ruin protection, NOT
-    conservatism. Same fail-CLOSED logic (None/NaN/degenerate -> block) as _mechanical_decisions."""
+    """The ONLY hard filter on the DISCRETIONARY (LLM) path — the gap-tail RUIN veto. 2026-07-09 (owner:
+    "rules too rigid / conservative"): the choppy-regime and rút-râu/wick quality gates were REMOVED.
+    Stacking quality gates on a -EV base doesn't create edge — it just stops the strong model trading and
+    cages its own judgment, so we can never learn whether the MODEL has an edge. The model still SEES
+    regime + wick_intensity + the real 15m/1h/4h charts + its measured mistake-lessons in context and
+    decides for itself. What survives here is SURVIVAL, not conservatism: a high-gap coin can gap THROUGH
+    the stop straight to liquidation (the -$14 HMSTR ruin). Fail-CLOSED (None/NaN/degenerate -> block)."""
     by_sym = {c.get("symbol"): c for c in ctx}
     import time as _t
     now_ms = int(_t.time() * 1000)
     out = []
     for d in decisions:
         row = by_sym.get(d.get("symbol")) or {}
-        # ENFORCED LESSON (2026-07-09, owner: "is the learning effective?"): the mistakes-block TELLS the
-        # LLM to stand aside in 'choppy' (a measured 7%-win / -EV death zone, 42 trades) but it keeps
-        # trading anyway. Feeding a lesson as prompt text = ignorable; code-enforcing it = learning that
-        # actually changes behavior. Block the single strongest measured -EV regime.
-        if row.get("regime") == "choppy":
-            _append(LT_DIR / "governance.jsonl",
-                    {"ts_ms": now_ms, "event": "gate_block_choppy_llm", "symbol": d.get("symbol")})
-            continue
-        # "rút râu" CHOP gate (owner 2026-07-09): in a stop-hunt chop (>= WICK_CHOP_MIN of recent bars
-        # wick-dominated), a low-R:R trade just feeds the 75%-SL noise. Only a high-conviction R:R
-        # ("chắc ăn") setup earns the window; otherwise skip it ("né những khung giờ đó").
-        _wick = row.get("wick_intensity")
-        if _wick is not None and _wick >= WICK_CHOP_MIN:
-            _rr = float(d.get("tp_pct") or 0) / max(0.1, float(d.get("sl_pct") or 1))
-            if _rr < WICK_CHOP_MIN_RR:
-                _append(LT_DIR / "governance.jsonl",
-                        {"ts_ms": now_ms, "event": "gate_block_wick_chop", "symbol": d.get("symbol"),
-                         "wick": _wick, "rr": round(_rr, 2)})
-                continue
         _atr = row.get("atr_pct"); _gr = row.get("gap_risk_pct")
         _liq = 100.0 / max(1, int(d.get("leverage") or MECH_LEV))
         if (_atr is None or _atr != _atr or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq
