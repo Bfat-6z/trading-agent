@@ -89,6 +89,12 @@ contract), reflection→playbook loop (research: theater), any live-order path (
 - **R2:** flip `LLM_TRADER_REDESIGN=1`: triggers gate candidates; two-pass on; measure.
 - **R3 (n≥30):** read per-path verdicts → owner prunes/keeps; iterate thresholds.
 - Every step: Opus-xhigh adversarial review before flip (Codex out of tokens). Rollback = env flag, instant.
+- **Flip mechanics (verified 2026-07-10):** llm_trader does NOT load .env and supervisor children inherit the
+  supervisor's env → env-only flag would need a full fleet restart. Solution shipped: flag = env OR marker file.
+  **FLIP = `touch state/llm_trader/redesign.flag` + kill the mission's launcher pair (supervisor respawns) —
+  no fleet restart. ROLLBACK = delete the file + respawn.** Tuned thresholds at tune-time are delivered by
+  committing them as the new defaults in `llm_trader_triggers.py` (reviewed code change — frozen + documented),
+  NOT via env (same delivery problem).
 
 **R2 CODE STATUS (2026-07-10): BUILT behind `LLM_TRADER_REDESIGN=0` + REVIEWED (Opus xhigh: SHIP — flag-off
 bit-for-bit identical, LAW un-weakenable by stage-2, tag flow verified).** Gate + `_stage2_confirm` (second

@@ -31,6 +31,15 @@ def _decision(**kw):
     return d
 
 
+def test_redesign_flag_defaults_off():
+    # the file-flag flip mechanism: with no env and no state/llm_trader/redesign.flag,
+    # REDESIGN must be False (dark). This pins the CURRENT deployed state.
+    import os
+    assert os.environ.get("LLM_TRADER_REDESIGN", "0") != "1"
+    assert not (lt.LT_DIR / "redesign.flag").exists()
+    assert lt.REDESIGN is False
+
+
 def test_stage2_is_passthrough_when_redesign_off(monkeypatch):
     monkeypatch.setattr(lt, "REDESIGN", False)
     ds = [_decision()]

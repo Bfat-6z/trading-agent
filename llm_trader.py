@@ -81,7 +81,11 @@ PROVEN_ONLY = os.environ.get("LLM_TRADER_PROVEN_ONLY", "0") == "1"
 # requires (a) trigger thresholds tuned on trigger_log data, (b) Opus adversarial review of the flip.
 # When ON: discretionary candidates are GATED to trigger-hit coins, and every actionable decision must
 # survive a STAGE-2 second look (fresh focused chart of the chosen TF) before it executes.
-REDESIGN = os.environ.get("LLM_TRADER_REDESIGN", "0") == "1"
+# Delivery mechanism: llm_trader does NOT load .env, and supervisor children inherit the SUPERVISOR's
+# environment — an env-only flag would need a full fleet restart to flip. So the flag is env OR a
+# marker file: flip = create state/llm_trader/redesign.flag + respawn just the mission (kill its
+# launcher pair; supervisor respawns). Rollback = delete the file + respawn. Read ONCE at startup.
+REDESIGN = (os.environ.get("LLM_TRADER_REDESIGN", "0") == "1") or (LT_DIR / "redesign.flag").exists()
 STAGE2_MAX = int(os.environ.get("LLM_TRADER_STAGE2_MAX", "4"))   # focused re-look calls per cycle; =max_charts
                                                                  # so no actionable decision skips the look (review #2)
 # MISSION (boss's boss, 2026-07-05): grow \$100 -> \$1000, sizing at the bot's
