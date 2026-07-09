@@ -305,6 +305,35 @@ def build() -> dict:
         lt["start_equity"] = START
     except Exception:
         pass
+    # R1/R2 measurement telemetry (redesign_tin_va_chart_v1) — the owner WATCHES the UI, so the
+    # new measurement system must be visible there: trigger paths firing now, P0 data accrual,
+    # and the redesign flag state. Own try/except: telemetry must never break the main feed.
+    try:
+        import os as _os
+        from collections import Counter as _Counter
+        tl = _load_jsonl(st / "llm_trader" / "trigger_log.jsonl")
+        fires = _Counter(); last_hits = {}
+        cutoff = (int(tl[-1]["ts_ms"]) - 8 * 3_600_000) if tl else 0
+        for r in tl:
+            if int(r.get("ts_ms") or 0) < cutoff:
+                continue
+            for s, h in (r.get("hits") or {}).items():
+                for p in (h.get("paths") or []):
+                    fires[p] += 1
+        if tl:
+            last_hits = {s: (h.get("paths") or []) for s, h in (tl[-1].get("hits") or {}).items()}
+        p0_n = sum(1 for c in closed_rows if c.get("actual_R") is not None)
+        span_h = round((int(tl[-1]["ts_ms"]) - int(tl[0]["ts_ms"])) / 3_600_000, 1) if len(tl) > 1 else 0.0
+        lt["rd"] = {"flag": ("ON" if _os.environ.get("LLM_TRADER_REDESIGN") == "1" else "DARK (đo ngầm)"),
+                    "cycles": len(tl), "span_h": span_h,
+                    "path_fires_8h": dict(fires.most_common()),
+                    "last_cycle_hits": len(last_hits),
+                    "p0_closes": p0_n, "p0_target": 15,
+                    "open_tags": [{"sym": p.get("symbol"), "tf": p.get("tf_basis"),
+                                   "paths": p.get("trigger_paths"), "stage2": p.get("stage2")}
+                                  for p in open_rows]}
+    except Exception:
+        pass
 
     # MANUAL test trades (manual_trader.py) — separate account, shown distinctly.
     manual = {"equity": None, "realized": 0.0, "pending": [], "open": [], "closed_recent": []}
