@@ -52,9 +52,14 @@ def main() -> None:
                 if p == "funding_extreme":
                     vals[p].append(abs(v.get("rate") or 0))
                 elif p == "whale":
-                    vals[p].append(v.get("score") or 0)
-                elif p == "flush_no_oi":
+                    vals[p].append(v.get("events") if v.get("events") is not None else (v.get("score") or 0))
+                elif p in ("flush_no_oi", "flush_oi_dn"):
                     vals[p].append(v.get("ret5_pct") or 0)
+                elif p == "chart_align":
+                    for dk in ("adx", "eff", "px_e20"):
+                        dv = v.get(dk)
+                        if dv is not None:
+                            vals[f"chart_align.{dk}"].append(dv)
 
     n = len(cycles)
     print(f"hits/cycle: mean={statistics.mean(per_cycle_hits):.1f} "
@@ -65,6 +70,14 @@ def main() -> None:
         extra = (f"  vals: min={min(vv):.4g} med={statistics.median(vv):.4g} max={max(vv):.4g}"
                  if vv else "")
         print(f"  {p:16} fires={cnt:5d} ({cnt / n:.1f}/cycle)  unique_syms={len(syms[p]):3d}{extra}")
+    disc = {k: v for k, v in vals.items() if k.startswith("chart_align.") and v}
+    if disc:
+        print("\n-- chart_align tune discriminators (where would a stricter cut land?) --")
+        for k, vv in disc.items():
+            vv = sorted(vv)
+            p25, p75 = vv[len(vv) // 4], vv[3 * len(vv) // 4]
+            print(f"  {k:22} min={vv[0]:.2f} p25={p25:.2f} med={statistics.median(vv):.2f} "
+                  f"p75={p75:.2f} max={vv[-1]:.2f}  (n={len(vv)})")
     print("\n-- path combos per sym-cycle --")
     for c, cnt in combo.most_common(12):
         print(f"  {c:40} {cnt}")

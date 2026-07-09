@@ -143,7 +143,9 @@ def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any],
             wside = str(w.get("side") or "")
             if wside in ("LONG", "SHORT") and wscore >= T_WHALE_SCORE:
                 paths.append("whale")
-                vals["whale"] = {"side": wside, "score": wscore}
+                vals["whale"] = {"side": wside, "score": wscore,
+                                 "events": _num(w.get("events"))}   # score is ~binary; event count is
+                                                                    # the real tune discriminator
 
             # -- funding/flush: TWO separately-measured sub-paths (Opus review L1 — they are two
             # different hypotheses: fading crowded funding != buying a capitulation flush; pooling
@@ -176,12 +178,18 @@ def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any],
             t1h = str(c.get("htf_1h_trend") or "")
             t4h = str(c.get("htf_4h_trend") or "")
             stack = str(c.get("ema_stack") or "")
-            if t15 == t1h == t4h == "up" and stack == "bull_stack":
+            _dir = ("up" if (t15 == t1h == t4h == "up" and stack == "bull_stack") else
+                    "down" if (t15 == t1h == t4h == "down" and stack == "bear_stack") else None)
+            if _dir:
                 paths.append("chart_align")
-                vals["chart_align"] = {"dir": "up"}
-            elif t15 == t1h == t4h == "down" and stack == "bear_stack":
-                paths.append("chart_align")
-                vals["chart_align"] = {"dir": "down"}
+                # log the candidate DISCRIMINATORS (adx/efficiency/overextension) alongside the hit —
+                # the R2 tune must tighten this path (it admits ~half the universe) and can only do so
+                # with evidence if the dark window RECORDED what a stricter gate would have keyed on.
+                vals["chart_align"] = {"dir": _dir,
+                                       "adx": _num(c.get("adx")),
+                                       "eff": _num(c.get("efficiency")),
+                                       "px_e20": _num(c.get("px_vs_ema20_pct")),
+                                       "ret20": _num(c.get("ret20_pct"))}
 
             if paths:
                 out[sym] = {"paths": paths, "vals": vals}
