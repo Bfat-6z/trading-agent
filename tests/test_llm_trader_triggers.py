@@ -108,6 +108,31 @@ def test_funding_and_flush_are_independent_hypotheses():
     assert set(hit["AAAUSDT"]["paths"]) == {"funding_extreme", "flush_no_oi"}
 
 
+def test_flush_with_oi_declining_upgrades_to_the_ev_setup():
+    hit = ltt.evaluate([_ctx(ret5_pct=-4.0, vol_ratio=3.0)], {}, oi_probe=lambda s: -2.5)
+    assert hit["AAAUSDT"]["paths"] == ["flush_oi_dn"]
+    assert hit["AAAUSDT"]["vals"]["flush_oi_dn"]["oi_slope_pct"] == -2.5
+
+
+def test_flush_with_oi_rising_or_unavailable_stays_no_oi():
+    hit = ltt.evaluate([_ctx(ret5_pct=-4.0, vol_ratio=3.0)], {}, oi_probe=lambda s: +1.2)
+    assert hit["AAAUSDT"]["paths"] == ["flush_no_oi"]
+    assert hit["AAAUSDT"]["vals"]["flush_no_oi"]["oi_slope_pct"] == 1.2
+    hit = ltt.evaluate([_ctx(ret5_pct=-4.0, vol_ratio=3.0)], {}, oi_probe=lambda s: None)
+    assert hit["AAAUSDT"]["paths"] == ["flush_no_oi"]
+
+
+def test_oi_probe_budget_and_errors_are_contained():
+    calls = []
+    def probe(s):
+        calls.append(s)
+        raise RuntimeError("api down")
+    rows = [_ctx(sym=f"C{i}USDT", ret5_pct=-4.0, vol_ratio=3.0) for i in range(5)]
+    hit = ltt.evaluate(rows, {}, oi_probe=probe)
+    assert len(calls) == ltt.OI_PROBE_MAX          # bounded lookups per cycle
+    assert all(h["paths"] == ["flush_no_oi"] for h in hit.values())   # error -> fail-soft no_oi
+
+
 def test_num_rejects_inf():
     hit = ltt.evaluate([_ctx(funding_rate=float("inf"))], {})
     assert hit == {}   # inf must not fire funding_extreme (and never reaches trigger_log)

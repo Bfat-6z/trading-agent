@@ -5,9 +5,11 @@ Evaluates, per cycle, which candidate-selection paths each coin hits:
     whale       — Telegram whale/liquidation pressure on the coin (data-trust contract is
                   `shadow_only`, so this path is measurement/context, never a sole gate)
     funding_extreme — |8h funding| at an extreme (crowded positioning to fade)
-    flush_no_oi — capitulation-flush proxy (OI-declining leg DEFERRED until the deriv fetch
-                  is re-enabled hang-proof; renamed from the spec's umbrella `funding_oi` so the
-                  two hypotheses are measured separately — Opus review L1)
+    flush_oi_dn — capitulation-flush WITH open interest declining (the ONE +EV lab setup,
+                  clf_oi_dn lineage). OI probed hang-proof (orderflow_data._bounded_get daemon
+                  thread) ONLY on flush hits, bounded OI_PROBE_MAX/cycle.
+    flush_no_oi — flush without OI confirmation (OI rising/unavailable). Split kept separate
+                  from flush_oi_dn AND funding_extreme (Opus review L1: one hypothesis per bucket)
     chart_align — the owner's "3 khung cùng hướng": 15m trend + 1h trend + 4h trend agree
                   AND the EMA stack confirms the same direction
 
@@ -35,6 +37,8 @@ T_WHALE_SCORE = float(os.environ.get("LLM_TRADER_TRIG_WHALE", "0.5"))
 T_FUND = float(os.environ.get("LLM_TRADER_TRIG_FUND", "0.0005"))          # |8h funding| >= 0.05%
 T_FLUSH_RET5 = float(os.environ.get("LLM_TRADER_TRIG_FLUSH_RET5", "-3.0"))  # 5-bar return <= -3%
 T_FLUSH_VOL = float(os.environ.get("LLM_TRADER_TRIG_FLUSH_VOL", "2.0"))     # volume surge >= 2x
+T_OI_DECL = float(os.environ.get("LLM_TRADER_TRIG_OI_DECL", "-1.0"))        # OI slope <= -1% over ~4-8h
+OI_PROBE_MAX = int(os.environ.get("LLM_TRADER_TRIG_OI_MAX", "3"))           # OI lookups per cycle (bound)
 NEWS_MAX_AGE_MIN = float(os.environ.get("LLM_TRADER_TRIG_NEWS_AGE", "90"))
 MAJORS = ("BTCUSDT", "ETHUSDT")
 
@@ -85,11 +89,31 @@ def _base(sym: str) -> str:
     return s[:-4] if s.endswith("USDT") else s
 
 
-def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """{symbol: {"paths": [...], "vals": {...}}} for coins hitting >=1 path. Never raises."""
+def probe_oi_slope(sym: str, now_ms: int) -> float | None:
+    """% change of open interest over the last ~8h (1h points). Negative = OI declining
+    (longs being flushed OUT, not added — the +EV clf_oi_dn precondition). Hang-proof by
+    construction: orderflow_data._bounded_get runs each HTTP call in a daemon thread with a
+    hard deadline, so this can never freeze the cycle. Fail-soft None on any problem."""
+    try:
+        import orderflow_data as of   # lazy: keep this module import-light for tests
+        series = of.fetch_deriv_series(sym, "1h", start_ms=now_ms - 8 * 3_600_000, end_ms=now_ms)
+        ois = [v["oi"] for _, v in sorted(series.items()) if isinstance(v, dict) and _num(v.get("oi"))]
+        if len(ois) < 3 or ois[0] <= 0:
+            return None
+        return round((ois[-1] - ois[0]) / ois[0] * 100, 2)
+    except Exception:
+        return None
+
+
+def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any],
+             oi_probe: Any = None) -> dict[str, dict[str, Any]]:
+    """{symbol: {"paths": [...], "vals": {...}}} for coins hitting >=1 path. Never raises.
+    `oi_probe`: optional callable(sym) -> oi_slope_pct|None, consulted ONLY on flush hits
+    (bounded OI_PROBE_MAX/cycle) to split flush_oi_dn (the +EV lab setup) from flush_no_oi."""
     out: dict[str, dict[str, Any]] = {}
     news = news if isinstance(news, dict) else {}
     events = news.get("events") or []
+    oi_probed = 0
     for c in ctx_rows if isinstance(ctx_rows, list) else []:
         try:
             sym = str(c.get("symbol") or "")
@@ -131,8 +155,21 @@ def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any]) -> dict[str, 
                 paths.append("funding_extreme")
                 vals["funding_extreme"] = {"rate": fr}
             if ret5 is not None and ret5 <= T_FLUSH_RET5 and volr >= T_FLUSH_VOL:
-                paths.append("flush_no_oi")
-                vals["flush_no_oi"] = {"ret5_pct": ret5, "vol_ratio": volr}
+                # flush hit -> probe OI (bounded) to split the +EV setup (capitulation WITH
+                # open interest declining = longs flushed out) from the plain flush proxy.
+                slope = None
+                if callable(oi_probe) and oi_probed < OI_PROBE_MAX:
+                    oi_probed += 1
+                    try:
+                        slope = _num(oi_probe(sym))
+                    except Exception:
+                        slope = None
+                if slope is not None and slope <= T_OI_DECL:
+                    paths.append("flush_oi_dn")
+                    vals["flush_oi_dn"] = {"ret5_pct": ret5, "vol_ratio": volr, "oi_slope_pct": slope}
+                else:
+                    paths.append("flush_no_oi")
+                    vals["flush_no_oi"] = {"ret5_pct": ret5, "vol_ratio": volr, "oi_slope_pct": slope}
 
             # -- chart_align: 15m + 1h + 4h all agree AND the EMA stack confirms
             t15 = str(c.get("trend") or "")            # up/down (EMA fast vs slow, 15m)

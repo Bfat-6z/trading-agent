@@ -1727,7 +1727,8 @@ def run_once() -> dict[str, Any]:
     trig_map: dict[str, Any] = {}
     try:
         import llm_trader_triggers as ltt
-        trig_map = ltt.evaluate(ctx, ltt.read_news(_NEWS_PATH, now_ms))
+        trig_map = ltt.evaluate(ctx, ltt.read_news(_NEWS_PATH, now_ms),
+                                oi_probe=lambda _s: ltt.probe_oi_slope(_s, now_ms))
         ltt.log_cycle(LT_DIR / "trigger_log.jsonl", now_ms, trig_map, len(ctx))
     except Exception as _te:
         _append(LT_DIR / "governance.jsonl",
