@@ -100,6 +100,13 @@ Review fixes applied pre-commit: mid-cycle heartbeat per stage-2 look (#1 — ca
 **FIX/VERIFY-BEFORE-FLIP checklist (blocking `LLM_TRADER_REDESIGN=1`, NOT the commit):**
 1. Tune trigger thresholds on ≥1 day of trigger_log via `trigger_stats.py` (whale over-fires: score=1.0 from
    1 Telegram event; chart_align fired 24/60 on cycle 1 — too loose as a gate).
+   **Early evidence (0.7h window, 13 cycles — PRELIMINARY, not the tune):** chart_align 23.4 fires/cycle
+   (31 unique syms), pooled gate preview ~1237 candidate-syms/day → the gate admits ~half the universe, i.e.
+   not a gate. Candidate refinements to EVALUATE at tune time (design candidates, not fitted): (a) chart_align
+   additionally requires trend STRENGTH (adx≥25 or efficiency≥0.35 — already in ctx as `adx`/`efficiency`) and/or
+   NOT overextended (px_vs_ema20_pct below a band); (b) chart_align requires FRESH alignment (began within last
+   N bars) rather than persistent-state; (c) whale needs score de-binarization or event_count≥2/quorum;
+   (d) funding_extreme percentile-based rather than absolute. Tune ONCE on the full window, freeze, document here.
 2. Empirically verify a 3-4-look cycle keeps heartbeat gap < 1200s (mid-cycle hb shipped; confirm in logs).
 3. Final Opus review of the flip config (thresholds + any wiring delta).
 4. Acknowledged (review, no code change): pending-limit fills do NOT re-run stage-2 (gap-tail re-veto at fill

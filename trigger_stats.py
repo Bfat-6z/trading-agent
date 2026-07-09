@@ -68,8 +68,9 @@ def main() -> None:
     print("\n-- path combos per sym-cycle --")
     for c, cnt in combo.most_common(12):
         print(f"  {c:40} {cnt}")
-    if span_h > 0:
-        print(f"\n-- R2 gate preview: unique candidate syms/day ≈ "
+    if span_h > 0 and syms:
+        # ascii-only output: the Windows console is cp1252 and chokes on unicode approx signs
+        print(f"\n-- R2 gate preview: unique candidate syms/day ~= "
               f"{len(set().union(*syms.values())) / (span_h / 24):.0f} "
               f"(all paths pooled, {span_h:.1f}h window)")
 
