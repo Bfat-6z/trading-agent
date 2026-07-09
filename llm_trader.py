@@ -891,7 +891,10 @@ def _decide_numeric(context: list[dict[str, Any]], equity: float,
     payload = [{"symbol": c["symbol"], **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                for c in context]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money reading numeric context per coin. "
-           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _proven_methods_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)   # _mistakes_block removed
+           # (P1 2026-07-09): at 17% WR it tripped OVER-TRADING+AVOID-LONG+AVOID-SHORT+STAND-ASIDE
+           # simultaneously = self-cancelling "don't trade at all", and authorized ignoring all memory.
+           # The honest feedback channel is the calibration report (llm_trader_learning.py), not this.
     usr = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                       "memory": memory_context(), "coins": payload}, default=str)
     return _validate_decisions(_split_thinking(_llm(sys, usr)), by_sym)
@@ -995,7 +998,10 @@ def decide(context: list[dict[str, Any]], equity: float,
            "Likewise 'regime':'choppy' has been your worst zone (7% win) — trade it only with a genuine "
            "edge, not a marginal one. These are YOUR calls now, not code gates.\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
-           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           + _proven_methods_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)   # _mistakes_block removed
+           # (P1 2026-07-09): at 17% WR it tripped OVER-TRADING+AVOID-LONG+AVOID-SHORT+STAND-ASIDE
+           # simultaneously = self-cancelling "don't trade at all", and authorized ignoring all memory.
+           # The honest feedback channel is the calibration report (llm_trader_learning.py), not this.
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "memory": mem, "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
@@ -1555,6 +1561,29 @@ def _hot_universe(client: Any, now_ms: int) -> list[str]:
     return selected
 
 
+def _write_daily_progress(now_ms: int) -> None:
+    """P1: once per UTC day, snapshot the calibration KPIs to progress.jsonl. The TREND across these rows
+    is the 'is the model actually learning' success metric. Best-effort — must NEVER affect trading."""
+    import datetime
+    prog = LT_DIR / "progress.jsonl"
+    today = datetime.datetime.fromtimestamp(now_ms / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+    try:
+        rows = _load(prog)
+        if rows and rows[-1].get("date") == today:
+            return                                  # already snapshotted today
+    except Exception:
+        pass
+    try:
+        import llm_trader_learning as ltl
+        rep = ltl.calibration_report(_dedupe_closed(_load(CLOSED)))
+        _append(prog, {"date": today, "ts": now_ms, "n": rep.get("n"), "win_rate": rep.get("win_rate"),
+                       "mean_actual_R": rep.get("mean_actual_R"), "noise_stop_rate": rep.get("noise_stop_rate"),
+                       "thesis_wrong_rate": rep.get("thesis_wrong_rate"), "over_optimism_R": rep.get("over_optimism_R"),
+                       "verdict_hint": rep.get("verdict_hint")})
+    except Exception as _pe:
+        _append(LT_DIR / "governance.jsonl", {"event": "daily_progress_error", "error": repr(_pe)[:150]})
+
+
 def run_once() -> dict[str, Any]:
     import time as _t
     from timebase import utc_now
@@ -1602,6 +1631,10 @@ def run_once() -> dict[str, Any]:
         # because "don't get liquidated on a gap" is safety, not rigidity.
         decisions = _apply_gap_veto(decide(ctx, equity, status=status, client=client, now_ms=now_ms), ctx)
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
+    try:
+        _write_daily_progress(now_ms)   # P1 KPI snapshot; best-effort, never blocks the cycle
+    except Exception:
+        pass
     wr = round(acct["wins"] / acct["trades"], 3) if acct["trades"] else None
     return {"equity": acct["equity"], "trades": acct["trades"], "win_rate": wr,
             "opened": opened, "resolved": resolved, "open": len(_load(POSITIONS)),
