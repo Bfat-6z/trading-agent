@@ -8,10 +8,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pytest
+
 import llm_trader as lt
 import llm_trader_triggers as ltt
 
 NOW_MS = 1_800_000_000_000
+
+
+@pytest.fixture(autouse=True)
+def _isolate_heartbeat(monkeypatch, tmp_path):
+    """_stage2_confirm writes a mid-cycle heartbeat — redirect it for EVERY test in this module,
+    or a pytest run CLOBBERS the production heartbeat file (caught live 2026-07-10: prod hb showed
+    'AAAUSDT / phase stage2' test data — a false-fresh heartbeat can mask a dead mission from the
+    supervisor). Test isolation from prod state is non-negotiable."""
+    monkeypatch.setattr(lt, "HEARTBEAT", tmp_path / "hb_test_isolated.json")
 
 
 def _bars(n=60, px=100.0):
