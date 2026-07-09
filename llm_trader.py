@@ -1058,6 +1058,14 @@ def _apply_gap_veto(decisions: list[dict[str, Any]], ctx: list[dict[str, Any]]) 
     out = []
     for d in decisions:
         row = by_sym.get(d.get("symbol")) or {}
+        # ENFORCED LESSON (2026-07-09, owner: "is the learning effective?"): the mistakes-block TELLS the
+        # LLM to stand aside in 'choppy' (a measured 7%-win / -EV death zone, 42 trades) but it keeps
+        # trading anyway. Feeding a lesson as prompt text = ignorable; code-enforcing it = learning that
+        # actually changes behavior. Block the single strongest measured -EV regime.
+        if row.get("regime") == "choppy":
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "gate_block_choppy_llm", "symbol": d.get("symbol")})
+            continue
         _atr = row.get("atr_pct"); _gr = row.get("gap_risk_pct")
         _liq = 100.0 / max(1, int(d.get("leverage") or MECH_LEV))
         if (_atr is None or _atr != _atr or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq
@@ -1323,7 +1331,11 @@ def resolve(client: Any, now_ms: int) -> int:
                                         or (side == "SHORT" and sl <= entry * (1 - BE_BUF))):
                     reason = "trail"
                 exit_ts = int(b["ts_ms"]); break
-            if k + 1 >= hold_cap:
+            if is_mech and k + 1 >= hold_cap:
+                # ONLY proven/mechanical methods time out — they were BACKTESTED to exit at N bars, so the
+                # hold is part of their measured edge. A DISCRETIONARY trade must NOT close on a timer
+                # (owner, repeatedly): a live futures trade rides to its SL or TP, it is not killed mid-move
+                # by a clock. Non-mech positions simply stay open and are re-checked next cycle until SL/TP.
                 exit_px, reason = float(b["close"]), "timeout"
                 exit_ts = int(b["ts_ms"]); break
             if int(b["ts_ms"]) == fb_ts:
