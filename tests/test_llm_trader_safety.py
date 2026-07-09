@@ -80,12 +80,10 @@ def test_structure_sl_and_limit_entry():
     drop = l._validate_decisions([{"symbol": "X", "action": "LONG", "entry_px": 103,
                                    "leverage": 10, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by)
     assert drop[0]["entry_px"] is None                     # above price for a long = FOMO -> market
-    # chase gate judges the EFFECTIVE entry: extended RSI68 market = blocked,
-    # but the same coin with a pullback LIMIT at the EMA passes (audit fix)
+    # FULL TRUST (2026-07-09, owner "the brain is gpt-5.5"): the chase gate is removed. An extended
+    # RSI68 market LONG now PASSES validation — the model, not code, judges whether to chase (it sees
+    # rsi14 + px_vs_ema20_pct and is warned in the prompt). Owner-LAW clamps (x5/x10) still apply.
     by2 = {"C": {"symbol": "C", "price": 100.0, "rsi14": 68, "px_vs_ema20_pct": 1.6, "vol_ratio": 2.0}}
-    blocked = l._validate_decisions([{"symbol": "C", "action": "LONG",
+    allowed = l._validate_decisions([{"symbol": "C", "action": "LONG",
                                       "leverage": 5, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by2)
-    assert blocked == []
-    limit_ok = l._validate_decisions([{"symbol": "C", "action": "LONG", "entry_px": 98.4,
-                                       "leverage": 5, "size_pct": 5, "sl_pct": 2, "tp_pct": 3}], by2)
-    assert limit_ok and limit_ok[0]["entry_px"] == 98.4
+    assert len(allowed) == 1 and allowed[0]["leverage"] == 5

@@ -136,10 +136,7 @@ DAILY_BREAKER_ON = os.environ.get("LLM_TRADER_DAILY_BREAKER", "1") != "0"
 # not-yet-proven strategy = faster data AND faster bleed; the scorecard is the judge.
 MIN_CONFLUENCE = int(os.environ.get("LLM_TRADER_MIN_CONFLUENCE", "2"))
 EXPLORE_MODE = os.environ.get("LLM_TRADER_EXPLORE", "1") == "1"
-# "rút râu" chop filter (owner 2026-07-09): when >= WICK_CHOP_MIN of recent bars are wick-dominated
-# (stop-hunt chop), only let a high-conviction WICK_CHOP_MIN_RR reward:risk setup through; skip the rest.
-WICK_CHOP_MIN = float(os.environ.get("LLM_TRADER_WICK_CHOP", "0.5"))
-WICK_CHOP_MIN_RR = float(os.environ.get("LLM_TRADER_WICK_RR", "2.5"))
+# (wick/rút-râu is now an ADVISORY the model judges from wick_intensity in its context — no hard gate.)
 
 
 # ---------------------------------------------------------------------------
@@ -817,32 +814,10 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
                 entry_px = round(ep, 8)
         except Exception:
             entry_px = None
-        # HARD GATE (code-enforced; the model ignores prompt bans): block the
-        # measured chase — LONG at RSI>=65 while EXTENDED above EMA20. Judged at the
-        # EFFECTIVE entry: a pullback LIMIT at/below the EMA20 zone is exactly the
-        # disciplined behavior we want, so it passes (audit: the old order blocked it).
-        try:
-            rsi = float(ctx.get("rsi14") or 50)
-            ext = float(ctx.get("px_vs_ema20_pct") or 0)
-            px = float(ctx["price"])
-            eff_ext = ext if entry_px is None else ((entry_px / px) * (1 + ext / 100.0) - 1) * 100.0
-            if action == "LONG" and rsi >= 65 and eff_ext > 0.5:
-                _append(LT_DIR / "governance.jsonl",
-                        {"event": "gate_block_chase", "symbol": sym, "rsi": rsi, "ext_pct": ext,
-                         "entry_px": entry_px, "eff_ext_pct": round(eff_ext, 3),
-                         "note": "LONG RSI>=65 extended at effective entry — the measured noise-stop chase"})
-                continue
-            # VOL GATE (owner 'danh vol to len' + his EMA+VOL+price method): no
-            # entry without strong participation. The one recent TP win entered at
-            # vol 2.99x; the stopped-out losers mostly entered on quiet bars.
-            vr = float(ctx.get("vol_ratio") or 1.0)
-            if vr < MIN_ENTRY_VOL:
-                _append(LT_DIR / "governance.jsonl",
-                        {"event": "gate_block_low_vol", "symbol": sym, "vol_ratio": vr,
-                         "min": MIN_ENTRY_VOL})
-                continue
-        except Exception:
-            pass
+        # FULL TRUST (owner 2026-07-09: "the brain is gpt-5.5"): the chase gate (LONG RSI>=65 extended)
+        # and the vol gate (vol_ratio>=1.5) are NO LONGER hard code-blocks. The model SEES rsi14,
+        # px_vs_ema20_pct and vol_ratio in its context and is told in the prompt that chasing extended
+        # RSI is its #1 measured loss and that its method wants strong volume — it judges these itself now.
         _tfb = str(dec.get("tf_basis", "15m")).lower()    # which TF the model based the setup on
         if _tfb not in ("15m", "1h", "4h"):
             _tfb = "15m"
@@ -855,9 +830,10 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
 _MEMORY_RULE = ("Learn from your MEMORY block CONTEXTUALLY: the counts are evidence to weigh, not bans — a past "
                 "loss does NOT blanket-ban a setup; the same idea can win on another coin/regime/time (markets are "
                 "non-stationary). Pick only the BEST setups; SKIP is common and fine — no forced trades. "
-                "Owner rules: leverage EXACTLY 5 or 10; size 8-10% of equity (owner wants size at the TOP of his "
-                "5-10 law); entries REQUIRE vol_ratio>=1.5 (his EMA+VOLUME+price method — quiet-bar entries are "
-                "code-rejected, so don't propose them; wait for the volume bar or set a limit into it).")
+                "Owner LAW (hard, non-negotiable): leverage EXACTLY 5 or 10; size 8-10% of equity (top of the "
+                "5-10 band). Your EMA+VOLUME+price method strongly PREFERS strong participation — quiet-bar "
+                "entries (vol_ratio<1.5) are your measured losing pattern, so weigh volume heavily and prefer "
+                "vol_ratio>=1.5 — but that is now YOUR call, not a code block; a limit into the volume bar is ideal.")
 _DECISION_SCHEMA = (
     "THINK step-by-step FIRST, then decide. Output EXACTLY two sections separated by a line '===DECISIONS==='.\n"
     "THINKING:\nReason out loud. For EACH charted coin, in order: (1) TREND — EMA stack + slope + MTF agree? "
@@ -1192,17 +1168,12 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
             continue
         notional = margin * lev
         qty = notional / entry if entry > 0 else 0.0
-        if d.get("_mech"):
-            # PROVEN method: execute EXACTLY what was backtested — its own sl/tp %,
-            # no structure override (that machinery wasn't part of the proof).
-            sl = entry * (1 - d["sl_pct"] / 100) if side == "LONG" else entry * (1 + d["sl_pct"] / 100)
-            tp = entry * (1 + d["tp_pct"] / 100) if side == "LONG" else entry * (1 - d["tp_pct"] / 100)
-        else:
-            sl, tp = _structure_sl_tp(side, entry, d)   # SL beyond structure, not arbitrary %
-            if sl is None:                                # structurally bad R:R (TP would shoot through a real zone)
-                _append(LT_DIR / "governance.jsonl",
-                        {"ts_ms": now_ms, "event": "gate_block_tp_through_zone", "symbol": d["symbol"]})
-                continue
+        # FULL TRUST (owner 2026-07-09: "the brain is gpt-5.5, let it think on the indicators + balance").
+        # Use the model's OWN sl/tp % — it set them reading the multi-TF charts and structure itself. No
+        # code structure-override, and no R:R-skip that silently dropped the model's trades. (Proven/mech
+        # methods use the same math on their backtested sl/tp.)
+        sl = entry * (1 - d["sl_pct"] / 100) if side == "LONG" else entry * (1 + d["sl_pct"] / 100)
+        tp = entry * (1 + d["tp_pct"] / 100) if side == "LONG" else entry * (1 - d["tp_pct"] / 100)
         # Forced-liquidation price (plan item #1): stored at open so resolve()
         # can rank liq ahead of SL pessimistically on every bar.
         mmr = lr.mmr_for(d["symbol"])
