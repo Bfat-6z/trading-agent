@@ -268,7 +268,21 @@ the chosen TF before the final call (owner's two-pass idea). Full detailed spec:
 measurement with kill criteria; R0-R3 rollout; awaiting owner OK on the spec itself before R1 build).
 
 ---
-Status: **P0 + P1 SHIPPED & LIVE.** Top-level verdict already decisive from full ledger (n=81 discretionary =
-−EV everywhere, account −60%). P0 *mechanism* verdict (noise-stop vs thesis-wrong) ~1-2 days out (17 closes/day).
-Kill/pivot decision is the owner's (they enabled full-trust this session). §9 = redesign OPTIONS awaiting owner
-choice. Everything above §8 is the original design; §8 is verified ground truth as of 2026-07-09.
+## 10. P2 VERDICT — OFFICIAL (2026-07-10, n=15 P0-instrumented closes)
+
+`calibration_report` at the pre-registered n=15 threshold (last 2 closes owner-ordered flatten, booked through
+the standard resolve() path):
+- **thesis_wrong_rate = 77.8%** (7/9 losses; median loss mfe_R = 0.0 — typical loss NEVER went in favor)
+- **noise_stop_rate = 0.0%** — every trade that reached ≥1R was protected or won (2 TP +2/+2.2R, 1 trail +1.1R,
+  4 trail ~BE). Exit physics are NOT the problem.
+- **over_optimism_R = 3.75** — the model systematically predicts ~3.75R more than it achieves.
+- Window WR 40%, mean_actual_R −0.456 (BE-trail slashed the bleed vs the n=81 era, still −EV).
+- verdict_hint (machine-generated): *"THESIS-WRONG dominates → losses are bad entries, not bad stops →
+  fix = entry SELECTION."*
+
+**This formally validates the R2 redesign direction (trigger-gated entry selection + two-pass confirm) with
+pre-registered measurement BEFORE the flip.** Remaining to R2=ON: 24h trigger window (~7h collected) → tune
+thresholds from logged discriminators → final Opus review → owner OK → touch redesign.flag + respawn.
+Per-path table exists but every path is n≤6 — no per-path verdicts until n≥20 each (post-flip).
+
+Everything above §8 is the original design; §8-§10 are verified ground truth.
