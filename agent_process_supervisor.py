@@ -153,11 +153,16 @@ def specs() -> list[AgentSpec]:
         # methods that are OOS-significant (Šidák-corrected over ~100 lanes) into the
         # mission armed set. Paper-only; hand-armed methods always kept. Runs every 30m.
         AgentSpec("lane_promotion", "lane_promotion.py", ("--interval", "1800"), STATE_DIR / "lane_promotion.pid", STATE_DIR / "lane_promotion_heartbeat.json", 5400),
-        AgentSpec("counterfactual_replay_agent", "counterfactual_replay_agent.py", ("--interval-seconds", "300"), STATE_DIR / "counterfactual_replay_agent.pid", STATE_DIR / "counterfactual_replay_agent_heartbeat.json", 900),
-        AgentSpec("learning_exam_benchmark", "learning_exam_benchmark.py", ("--interval-seconds", "3600"), STATE_DIR / "learning_exam_benchmark.pid", STATE_DIR / "learning_exam_benchmark_heartbeat.json", 4500),
-        AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),
-        AgentSpec("shadow_trade_evaluator_loop", "shadow_trade_evaluator_loop.py", ("--interval-seconds", "600", "--max-age-hours", "24", "--max-trades", "100"), STATE_DIR / "shadow_trade_evaluator_loop.pid", STATE_DIR / "shadow_trade_evaluator_loop_heartbeat.json", 1800),
-        AgentSpec("promotion_evaluator_loop", "promotion_evaluator_loop.py", ("--interval-seconds", "300"), STATE_DIR / "promotion_evaluator_loop.pid", STATE_DIR / "promotion_evaluator_loop_heartbeat.json", 600),
+        # CUT 2026-07-11 (RAM incident post-reboot): counterfactual_replay LEAKS ~750-860MB within
+        # 30min of every spawn — on the 16GB laptop this starved NEW process creation (mission died
+        # at init, exit -1, zero output, circuit-breaker quarantine). The other four are NeuroCore
+        # exam/meta theater with 0 mission-path deps (same audit family as the 2026-07-06 cuts).
+        # Re-add individually if ever needed; fix the leak first.
+        # AgentSpec("counterfactual_replay_agent", "counterfactual_replay_agent.py", ("--interval-seconds", "300"), STATE_DIR / "counterfactual_replay_agent.pid", STATE_DIR / "counterfactual_replay_agent_heartbeat.json", 900),
+        # AgentSpec("learning_exam_benchmark", "learning_exam_benchmark.py", ("--interval-seconds", "3600"), STATE_DIR / "learning_exam_benchmark.pid", STATE_DIR / "learning_exam_benchmark_heartbeat.json", 4500),
+        # AgentSpec("test_result_memory_agent", "test_result_memory_agent.py", ("--interval-seconds", "1800"), STATE_DIR / "test_result_memory_agent.pid", STATE_DIR / "test_result_memory_agent_heartbeat.json", 2700),
+        # AgentSpec("shadow_trade_evaluator_loop", "shadow_trade_evaluator_loop.py", ("--interval-seconds", "600", "--max-age-hours", "24", "--max-trades", "100"), STATE_DIR / "shadow_trade_evaluator_loop.pid", STATE_DIR / "shadow_trade_evaluator_loop_heartbeat.json", 1800),
+        # AgentSpec("promotion_evaluator_loop", "promotion_evaluator_loop.py", ("--interval-seconds", "300"), STATE_DIR / "promotion_evaluator_loop.pid", STATE_DIR / "promotion_evaluator_loop_heartbeat.json", 600),
         # CUT (gpt-5.5 review 2026-07-05): no direct alpha value, 0 mission deps. Re-add to revive.
         # AgentSpec("self_model", "self_model.py", ("--interval-minutes", "10"), STATE_DIR / "self_model.pid", STATE_DIR / "self_model_heartbeat.json", 900),
         # CUT (second-brain P4): its durable-memory write role is superseded by the
