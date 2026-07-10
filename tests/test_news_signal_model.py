@@ -9,9 +9,18 @@ def test_stable_event_id_dedupes_same_headline_source_and_url():
     assert first == second
 
 def test_extract_symbols_finds_dollar_and_plain_mentions():
-    symbols = extract_symbols("BTC and $ETH rally while SUI pauses", [])
-
+    # 2026-07-11: ambiguous English-word tickers (SUI/NEAR/TON/HYPE/OP...) now require an
+    # explicit $ prefix — this feeds a TRADING trigger, so a false fire ("NEAR-term outlook",
+    # "a TON of") is worse than a miss. Full names still match via NAME_TO_SYMBOL.
+    symbols = extract_symbols("BTC and $ETH rally while $SUI pauses", [])
     assert symbols == ["BTC", "ETH", "SUI"]
+
+
+def test_extract_symbols_names_and_ambiguity_guard():
+    assert extract_symbols("Bitcoin ETF outflows as Ethereum holds", []) == ["BTC", "ETH"]
+    assert extract_symbols("Near-term outlook uncertain; a ton of hype around AI", []) == []
+    assert extract_symbols("SUI pauses while optimism grows", []) == []      # plain ambiguous -> no
+    assert extract_symbols("Toncoin rallies; Near Protocol upgrades", []) == ["NEAR", "TON"]
 
 def test_source_quality_weights_official_and_social_sources():
     assert source_quality("sec.gov", "news") > source_quality("reddit", "social")

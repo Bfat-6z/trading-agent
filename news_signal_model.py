@@ -25,9 +25,36 @@ LATEST_MD = MEMORY_DIR / "news_latest.md"
 MAJOR_SYMBOLS = {
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "TON",
     "SUI", "HYPE", "ENA", "PEPE", "WIF", "NEAR", "ARB", "OP", "TRX", "LTC",
+    # 2026-07-11: mở rộng theo universe liquid ($50M+) bot thật sự trade — thiếu chúng
+    # thì tin về các coin này không bao giờ thành per-symbol signal
+    "AAVE", "UNI", "APT", "SEI", "INJ", "TIA", "DOT", "ATOM", "FIL", "ICP",
+    "JUP", "WLD", "FET", "TAO", "ONDO", "SHIB", "BONK", "POL", "ETC", "BCH",
+    "HBAR", "XLM", "ALGO", "LDO", "MKR", "CRV", "GRT", "IMX", "RENDER", "ZEC",
 }
 
 STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "BUSD"}
+
+# Ticker trùng từ tiếng Anh thường — chỉ match khi có "$" đứng trước (chống "NEAR-term",
+# "a TON of", "the HYPE", "OP-ed"...). Phát hiện qua tên đầy đủ ở NAME_TO_SYMBOL.
+AMBIGUOUS_TICKERS = {"NEAR", "TON", "OP", "HYPE", "ENA", "SUI", "APT", "POL", "IMX",
+                     "GRT", "WIF", "JUP", "FET", "SEI", "ATOM", "MKR", "CRV"}
+
+# Headlines nói TÊN ("Bitcoin", "Solana"), không nói ticker ("BTC") — thiếu map này thì
+# extract_symbols gần như luôn rỗng và đường tín hiệu `news` của mission chết im
+# (0 fires suốt R1 window). Tên NHẬP NHẰNG với từ tiếng Anh thường (near, optimism, render,
+# jupiter...) cố tình BỎ hoặc đòi cụm đầy đủ — thà bỏ sót còn hơn nổ láo.
+NAME_TO_SYMBOL: dict[str, str] = {
+    "bitcoin": "BTC", "ethereum": "ETH", "ether": "ETH", "solana": "SOL",
+    "ripple": "XRP", "dogecoin": "DOGE", "cardano": "ADA", "avalanche": "AVAX",
+    "chainlink": "LINK", "toncoin": "TON", "hyperliquid": "HYPE",
+    "dogwifhat": "WIF", "near protocol": "NEAR", "arbitrum": "ARB",
+    "litecoin": "LTC", "tron": "TRX", "aave": "AAVE", "uniswap": "UNI",
+    "aptos": "APT", "injective": "INJ", "celestia": "TIA", "polkadot": "DOT",
+    "cosmos": "ATOM", "filecoin": "FIL", "worldcoin": "WLD", "bittensor": "TAO",
+    "shiba inu": "SHIB", "polygon": "POL", "hedera": "HBAR", "stellar": "XLM",
+    "algorand": "ALGO", "lido": "LDO", "maker": "MKR", "zcash": "ZEC",
+    "binance coin": "BNB", "pepe coin": "PEPE",
+}
 
 TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
     "macro_rates": ("fed", "fomc", "rate cut", "rate hike", "interest rate", "yields", "treasury", "cpi", "inflation", "jobs report", "nonfarm", "unemployment"),
@@ -141,8 +168,17 @@ def extract_symbols(text: str, explicit: Iterable[object] | None = None) -> list
     symbols = {str(item).upper().replace("USDT", "") for item in (explicit or []) if item}
     haystack = f" {str(text or '').upper()} "
     for symbol in MAJOR_SYMBOLS | STABLE_SYMBOLS:
-        if re.search(rf"(?<![A-Z0-9])\$?{re.escape(symbol)}(?![A-Z0-9])", haystack):
+        # ambiguous tickers that are also English words ("NEAR-term", "a TON of", "the HYPE",
+        # "OP-ed", "SUI generis") ONLY match with an explicit $ prefix — their proper names
+        # ("near protocol", "toncoin", "hyperliquid"...) are covered by NAME_TO_SYMBOL below.
+        prefix = r"\$" if symbol in AMBIGUOUS_TICKERS else r"\$?"
+        if re.search(rf"(?<![A-Z0-9]){prefix}{re.escape(symbol)}(?![A-Z0-9-])", haystack):
             symbols.add(symbol)
+    # full coin NAMES (headlines say "Bitcoin", not "BTC") — word-boundary, case-insensitive
+    low = f" {str(text or '').lower()} "
+    for name, sym in NAME_TO_SYMBOL.items():
+        if re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", low):
+            symbols.add(sym)
     return sorted(symbols)
 
 def event_topic_score(topics: list[str]) -> float:
