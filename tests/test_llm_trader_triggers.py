@@ -21,6 +21,9 @@ def _iso(ms: int) -> str:
 def _ctx(sym="AAAUSDT", **kw):
     base = {"symbol": sym, "trend": "up", "htf_1h_trend": "flat", "htf_4h_trend": "up",
             "ema_stack": "mixed", "funding_rate": 0.0001, "ret5_pct": 0.5, "vol_ratio": 1.0,
+            # strength discriminators default to PASSING the tuned chart_align gate so alignment
+            # tests exercise the alignment logic; strength tests override these explicitly
+            "adx": 30.0, "efficiency": 0.40, "px_vs_ema20_pct": 0.5,
             "whale": None}
     base.update(kw)
     return base
@@ -89,6 +92,18 @@ def test_chart_align_down_fires_with_bear_stack():
     assert ltt.evaluate([row], {})["AAAUSDT"]["vals"]["chart_align"]["dir"] == "down"
 
 
+def test_chart_align_tuned_gate_requires_strength_quality_and_no_extension():
+    aligned = dict(trend="up", htf_1h_trend="up", htf_4h_trend="up", ema_stack="bull_stack")
+    # weak trend (adx below cut) -> no fire even though 3 TFs align
+    assert ltt.evaluate([_ctx(**aligned, adx=20.0)], {}) == {}
+    # choppy path (low efficiency) -> no fire
+    assert ltt.evaluate([_ctx(**aligned, efficiency=0.20)], {}) == {}
+    # overextended above EMA20 -> no fire (no chasing)
+    assert ltt.evaluate([_ctx(**aligned, px_vs_ema20_pct=3.5)], {}) == {}
+    # missing discriminator -> fail-closed (a no-data coin is not a candidate)
+    assert ltt.evaluate([_ctx(**aligned, adx=None)], {}) == {}
+
+
 def test_funding_extreme_fires():
     hit = ltt.evaluate([_ctx(funding_rate=0.001)], {})
     assert hit["AAAUSDT"]["paths"] == ["funding_extreme"]
@@ -139,10 +154,12 @@ def test_num_rejects_inf():
 
 
 def test_whale_fires_on_strong_directional_pressure():
-    hit = ltt.evaluate([_ctx(whale={"side": "LONG", "score": 0.8})], {})
+    hit = ltt.evaluate([_ctx(whale={"side": "LONG", "score": 0.8, "events": 3})], {})
     assert hit["AAAUSDT"]["vals"]["whale"]["side"] == "LONG"
-    assert ltt.evaluate([_ctx(whale={"side": "MIXED", "score": 0.9})], {}) == {}
-    assert ltt.evaluate([_ctx(whale={"side": "LONG", "score": 0.1})], {}) == {}
+    assert ltt.evaluate([_ctx(whale={"side": "MIXED", "score": 0.9, "events": 3})], {}) == {}
+    assert ltt.evaluate([_ctx(whale={"side": "LONG", "score": 0.1, "events": 3})], {}) == {}
+    # tuned gate: a single Telegram event is noise — needs >=2 (score is ~binary)
+    assert ltt.evaluate([_ctx(whale={"side": "LONG", "score": 1.0, "events": 1})], {}) == {}
 
 
 def test_news_symbol_match_fires():

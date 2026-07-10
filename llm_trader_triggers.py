@@ -30,11 +30,19 @@ import os
 from pathlib import Path
 from typing import Any
 
-# --- thresholds (provisional defaults; tune from trigger_log before R2, then freeze) ---
+# --- thresholds (TUNED 2026-07-10 on the 7.1h/117-cycle dark window, owner-ordered early tune;
+# frozen here in code — see plans/redesign_tin_va_chart_v1.md §5. chart_align joint cut keeps
+# 391/2237 = 17% of observed fires (21 syms) — the pre-registered candidate values, confirmed
+# by the logged discriminator distributions, not fitted to outcomes) ---
 T_NEWS_SYM = float(os.environ.get("LLM_TRADER_TRIG_NEWS_SYM", "0.3"))     # per-event catalyst, symbol-matched
 T_NEWS_MACRO = float(os.environ.get("LLM_TRADER_TRIG_NEWS_MACRO", "0.7"))  # macro event -> majors only
 T_WHALE_SCORE = float(os.environ.get("LLM_TRADER_TRIG_WHALE", "0.5"))
-T_FUND = float(os.environ.get("LLM_TRADER_TRIG_FUND", "0.0005"))          # |8h funding| >= 0.05%
+T_WHALE_EVENTS = float(os.environ.get("LLM_TRADER_TRIG_WHALE_EVENTS", "2"))  # >=2 Telegram events (score is
+                                                                             # ~binary; 1-event fires are noise)
+T_FUND = float(os.environ.get("LLM_TRADER_TRIG_FUND", "0.0008"))          # |8h funding| >= 0.08% (was 0.05%)
+T_CA_ADX = float(os.environ.get("LLM_TRADER_TRIG_CA_ADX", "25"))          # chart_align: real trend strength
+T_CA_EFF = float(os.environ.get("LLM_TRADER_TRIG_CA_EFF", "0.35"))        # Kaufman efficiency (path quality)
+T_CA_EXT = float(os.environ.get("LLM_TRADER_TRIG_CA_EXT", "2.0"))         # |px vs EMA20| % — no chasing extension
 T_FLUSH_RET5 = float(os.environ.get("LLM_TRADER_TRIG_FLUSH_RET5", "-3.0"))  # 5-bar return <= -3%
 T_FLUSH_VOL = float(os.environ.get("LLM_TRADER_TRIG_FLUSH_VOL", "2.0"))     # volume surge >= 2x
 T_OI_DECL = float(os.environ.get("LLM_TRADER_TRIG_OI_DECL", "-1.0"))        # OI slope <= -1% over ~4-8h
@@ -42,8 +50,10 @@ OI_PROBE_MAX = int(os.environ.get("LLM_TRADER_TRIG_OI_MAX", "3"))           # OI
 NEWS_MAX_AGE_MIN = float(os.environ.get("LLM_TRADER_TRIG_NEWS_AGE", "90"))
 MAJORS = ("BTCUSDT", "ETHUSDT")
 
-_THRESHOLDS = {"news_sym": T_NEWS_SYM, "news_macro": T_NEWS_MACRO, "whale": T_WHALE_SCORE,
-               "fund": T_FUND, "flush_ret5": T_FLUSH_RET5, "flush_vol": T_FLUSH_VOL}
+_THRESHOLDS = {"news_sym": T_NEWS_SYM, "news_macro": T_NEWS_MACRO,
+               "whale": T_WHALE_SCORE, "whale_events": T_WHALE_EVENTS,
+               "fund": T_FUND, "flush_ret5": T_FLUSH_RET5, "flush_vol": T_FLUSH_VOL,
+               "ca_adx": T_CA_ADX, "ca_eff": T_CA_EFF, "ca_ext": T_CA_EXT}
 
 
 def _num(x: Any) -> float | None:
@@ -141,11 +151,10 @@ def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any],
             w = c.get("whale") or {}
             wscore = _num(w.get("score")) or 0.0
             wside = str(w.get("side") or "")
-            if wside in ("LONG", "SHORT") and wscore >= T_WHALE_SCORE:
+            wevents = _num(w.get("events")) or 0
+            if wside in ("LONG", "SHORT") and wscore >= T_WHALE_SCORE and wevents >= T_WHALE_EVENTS:
                 paths.append("whale")
-                vals["whale"] = {"side": wside, "score": wscore,
-                                 "events": _num(w.get("events"))}   # score is ~binary; event count is
-                                                                    # the real tune discriminator
+                vals["whale"] = {"side": wside, "score": wscore, "events": wevents}
 
             # -- funding/flush: TWO separately-measured sub-paths (Opus review L1 — they are two
             # different hypotheses: fading crowded funding != buying a capitulation flush; pooling
@@ -181,15 +190,15 @@ def evaluate(ctx_rows: list[dict[str, Any]], news: dict[str, Any],
             _dir = ("up" if (t15 == t1h == t4h == "up" and stack == "bull_stack") else
                     "down" if (t15 == t1h == t4h == "down" and stack == "bear_stack") else None)
             if _dir:
-                paths.append("chart_align")
-                # log the candidate DISCRIMINATORS (adx/efficiency/overextension) alongside the hit —
-                # the R2 tune must tighten this path (it admits ~half the universe) and can only do so
-                # with evidence if the dark window RECORDED what a stricter gate would have keyed on.
-                vals["chart_align"] = {"dir": _dir,
-                                       "adx": _num(c.get("adx")),
-                                       "eff": _num(c.get("efficiency")),
-                                       "px_e20": _num(c.get("px_vs_ema20_pct")),
-                                       "ret20": _num(c.get("ret20_pct"))}
+                # TUNED gate (2026-07-10): alignment alone admitted ~half the universe (22.8 fires/cycle).
+                # Require real trend STRENGTH + path QUALITY + not-overextended. Missing values fail the
+                # gate (fail-closed — this is candidate selection, a no-data coin is not a candidate).
+                _adx = _num(c.get("adx")); _eff = _num(c.get("efficiency")); _ext = _num(c.get("px_vs_ema20_pct"))
+                if (_adx is not None and _adx >= T_CA_ADX and _eff is not None and _eff >= T_CA_EFF
+                        and _ext is not None and abs(_ext) <= T_CA_EXT):
+                    paths.append("chart_align")
+                    vals["chart_align"] = {"dir": _dir, "adx": _adx, "eff": _eff, "px_e20": _ext,
+                                           "ret20": _num(c.get("ret20_pct"))}
 
             if paths:
                 out[sym] = {"paths": paths, "vals": vals}
