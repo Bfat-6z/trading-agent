@@ -216,7 +216,7 @@ def _simulate(bars: list[dict[str, Any]], entry_idx: int, side: str) -> dict[str
             "entry": round(entry, 8), "atr_pct": round(atr / entry * 100, 3)}
 
 
-def evaluate_once(client: Any, now_ms: int, limit: int = 60) -> dict[str, Any]:
+def evaluate_once(client: Any, now_ms: int, limit: int = 25) -> dict[str, Any]:
     # done = already-recorded outcomes UNION permanently-unfetchable keys (negative cache) — without
     # the latter, a dead/renamed alt in the oldest matured batch is retried every run and can stall
     # all newer episodes forever (Opus review MEDIUM-1).
