@@ -230,7 +230,7 @@ def evaluate_once(client: Any, now_ms: int, limit: int = 60) -> dict[str, Any]:
             bars = of.fetch_klines_with_flow(ep["sym"], TF, months=0.02, end_ms=end,
                                              client=client, sleep_between=0.02, with_deriv=False)
             if not bars:
-                _neg.add(ep["key"]); n_skip += 1; continue
+                n_skip += 1; continue     # empty could be a transient ban/outage -> retry, do NOT negcache
             # entry bar = last CLOSED bar at/just before the trigger ts. of.ts_ms is the bar's
             # CLOSE time (Opus review HIGH-1), so the condition is just close_time <= trigger_ts;
             # outcomes then start at entry_idx+1 (strictly future) = no lookahead.
@@ -253,9 +253,8 @@ def evaluate_once(client: Any, now_ms: int, limit: int = 60) -> dict[str, Any]:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
             n_ok += 1
         except Exception:
-            _neg.add(ep["key"])                              # fetch/parse error -> negative-cache
-            n_skip += 1
-            continue
+            n_skip += 1                                      # transient (rate-limit/ban/network) ->
+            continue                                         # retry next run; do NOT negcache (poison risk)
     _save_neg_keys(_neg)
     return {"evaluated": n_ok, "skipped": n_skip, "pending_pool": len(episodes), "neg_cached": len(_neg)}
 

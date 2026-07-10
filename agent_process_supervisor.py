@@ -134,7 +134,7 @@ def specs() -> list[AgentSpec]:
         AgentSpec("manual_trader", "manual_trader.py", ("--interval-seconds", "60"), STATE_DIR / "manual_trader" / "manual_trader.pid", STATE_DIR / "manual_trader" / "manual_trader_heartbeat.json", 600),
         # shadow trigger-edge evaluator (2026-07-11, owner opt C): paper, read-only, measures raw
         # per-path edge fast so per-path verdicts don't wait on the ultra-selective live mission.
-        AgentSpec("shadow_trigger_eval", "shadow_trigger_eval.py", ("--interval-seconds", "900"), STATE_DIR / "llm_trader" / "shadow_trigger_eval.pid", STATE_DIR / "llm_trader" / "shadow_trigger_eval_heartbeat.json", 2400),
+        AgentSpec("shadow_trigger_eval", "shadow_trigger_eval.py", ("--interval-seconds", "1800"), STATE_DIR / "llm_trader" / "shadow_trigger_eval.pid", STATE_DIR / "llm_trader" / "shadow_trigger_eval_heartbeat.json", 2400),
         # Method Lab (24/7 research->backtest->curate; rounds are heavy, 3h apart)
         AgentSpec("method_lab_runner", "method_lab_runner.py", ("--interval", "10800"), STATE_DIR / "method_lab_runner.pid", STATE_DIR / "method_lab_heartbeat.json", 14400),
         # Signal follower (paper-trades Telegram alerts, measures per-channel win rate)
