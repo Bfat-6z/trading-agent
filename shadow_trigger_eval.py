@@ -46,15 +46,8 @@ ATR_LOOKBACK = 14
 ATR_FLOOR = 0.003          # skip atr_pct < 0.3%: pegged/dead assets (gold, stables) where a
                            # 1.5xATR stop is dwarfed by fees -> nonsense R; not a real 15m setup
 # Tokenized stocks / commodities / leveraged ETFs on Binance futures — a 15m crypto scalper has no
-# business here (gaps, RTH-only moves, pegged). Same list the A+ scanner excludes, extended.
-NON_CRYPTO = {
-    "XAU", "XAG", "PAXG", "GLD", "SLV", "USO", "TLT", "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL",
-    "GOOG", "META", "AMZN", "NFLX", "INTC", "AMD", "INTU", "CRM", "ORCL", "DIS", "JPM", "BAC",
-    "V", "MA", "KO", "PEP", "WMT", "MCD", "HD", "NKE", "BA", "GE", "F", "GM", "SOXL", "SOXX",
-    "QQQ", "SPY", "IWM", "INX", "TQQQ", "SQQQ", "UVXY", "SNDK", "MSTR", "COIN", "HOOD",
-    "RIOT", "MARA", "SQ", "SKHYNIX", "SAMSUNG", "MRVL", "EWY", "SPCX",
-    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR",
-}
+# business here (gaps, RTH-only moves, pegged). Canonical shared list (one source of truth).
+from universe_filter import NON_CRYPTO
 
 
 def _base(sym: str) -> str:

@@ -71,19 +71,11 @@ MOMENTUM_ATR_MULT_CAP = 3.0     # block if 24h move > 3x daily ATR
 MAX_LONG_24H_GAIN_PCT = 12      # block LONG if 24h gain > +12%
 MAX_SHORT_24H_LOSS_PCT = -15    # block SHORT if 24h loss > -15%
 
-EXCLUDE_BASES = {
-    # Stablecoins / fiat
-    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR",
-    # TradFi-Perps (require separate Binance agreement, error -4411)
-    "XAU", "XAG",                                                       # metals
-    "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN",   # mega-caps
-    "NFLX", "INTC", "AMD", "INTU", "CRM", "ORCL", "DIS",                # tech/services
-    "JPM", "BAC", "V", "MA", "KO", "PEP", "WMT", "MCD", "HD", "NKE",    # consumer/finance
-    "BA", "GE", "F", "GM",                                              # industrial
-    "SOXL", "SOXX", "QQQ", "SPY", "IWM", "INX", "TQQQ", "SQQQ", "UVXY", # ETFs/index
-    "GLD", "SLV", "USO", "TLT",                                         # commodity ETFs
-    "SNDK", "VVV", "MSTR", "COIN", "HOOD", "RIOT", "MARA", "SQ",        # crypto-adjacent stocks
-}
+# Canonical shared list (one source of truth; drops the old wrong VVV=Venice.ai crypto exclusion,
+# adds MU/DRAM/CRCL — forensic 2026-07-11). TradFi perps also require a separate Binance agreement
+# (error -4411), so the runtime blacklist below can still grow it at runtime.
+from universe_filter import NON_CRYPTO
+EXCLUDE_BASES = set(NON_CRYPTO)
 
 # Runtime blacklist file — auto-populated when -4411 (TradFi agreement) hits
 import json as _json

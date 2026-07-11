@@ -22,6 +22,7 @@ os.environ.setdefault("INGEST_DECISION_CANDLES", "0")
 
 import method_lab as ml
 from method_seeds import SEED_METHODS
+from universe_filter import is_non_crypto      # exclude tokenized stock/commodity perps (forensic 2026-07-11)
 
 ROOT = Path(__file__).resolve().parent
 import sys as _sys                            # read --tf at import so LDIR/HB/lock are TF-scoped
@@ -152,6 +153,7 @@ def run_once(client):
     ticks = client.futures_ticker()
     uni = sorted([(t["symbol"], float(t.get("quoteVolume", 0) or 0)) for t in ticks
                   if t.get("symbol", "").endswith("USDT") and "_" not in t["symbol"]
+                  and not is_non_crypto(t["symbol"])          # no stock/commodity perps (mission parity)
                   and float(t.get("quoteVolume", 0) or 0) >= MIN_QVOL], key=lambda x: -x[1])
     syms = [s for s, _ in uni[:UNIV_N]]
     frames = {}

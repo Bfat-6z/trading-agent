@@ -20,6 +20,7 @@ updated: 2026-07-06
 - [[lessons/llm-khong-co-edge]] — vì sao PROVEN_ONLY tồn tại (p=0.9998)
 - [[lessons/overfit-va-lockbox]] — chuyện S_QUIET_BEAR_COIL + 3 lớp tự-lừa
 - [[lessons/universe-dao-roi]] — vì sao floor $50M (−$30 học phí)
+- [[lessons/lane-farm-vi-sao-thua]] — mổ 30 lane âm: trigger tại exhaustion + fixed stop + universe bẩn (7-agent forensic 07-11)
 - [[lessons/trade-thu-cong]] — 10 lỗi trade tay + nguyên tắc A+ (di sản 05/2026)
 
 ## Kho research (full-text)

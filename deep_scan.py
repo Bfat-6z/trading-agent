@@ -14,18 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tradingagents.binance.client import spot_client
 from tradingagents.crypto.tv_data import fetch_tv_multi_tf, tv_summary_text
 
-# Mirror EXCLUDE list from futures_watch.py
-EXCLUDE_BASES = {
-    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR",
-    "XAU", "XAG",
-    "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN",
-    "NFLX", "INTC", "AMD", "INTU", "CRM", "ORCL", "DIS",
-    "JPM", "BAC", "V", "MA", "KO", "PEP", "WMT", "MCD", "HD", "NKE",
-    "BA", "GE", "F", "GM",
-    "SOXL", "SOXX", "QQQ", "SPY", "IWM", "INX", "TQQQ", "SQQQ", "UVXY",
-    "GLD", "SLV", "USO", "TLT",
-    "SNDK", "VVV", "MSTR", "COIN", "HOOD", "RIOT", "MARA", "SQ",
-}
+# Canonical shared stock/commodity exclusion (was a drifting hand-copy of futures_watch's list)
+from universe_filter import NON_CRYPTO
+EXCLUDE_BASES = set(NON_CRYPTO)                      # mutable copy — merged with runtime blacklist below
 try:
     with open("state/tradfi_blacklist.json") as f:
         EXCLUDE_BASES |= set(json.load(f))

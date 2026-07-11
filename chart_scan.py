@@ -8,14 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tradingagents.binance.client import spot_client
 from tradingagents.crypto.tv_data import fetch_tv_multi_tf
 
-EXCLUDE = {
-    "USDC","FDUSD","TUSD","BUSD","DAI","USDP","EUR",
-    "XAU","XAG","NVDA","TSLA","AAPL","MSFT","GOOGL","GOOG","META","AMZN",
-    "NFLX","INTC","AMD","INTU","CRM","ORCL","DIS","JPM","BAC","V","MA","KO",
-    "PEP","WMT","MCD","HD","NKE","BA","GE","F","GM",
-    "SOXL","SOXX","QQQ","SPY","IWM","INX","TQQQ","SQQQ","UVXY",
-    "GLD","SLV","USO","TLT","SNDK","VVV","MSTR","COIN","HOOD","RIOT","MARA","SQ",
-}
+from universe_filter import NON_CRYPTO as EXCLUDE   # canonical shared stock/commodity exclusion
 
 
 def fetch_universe():

@@ -1,0 +1,891 @@
+{
+  "summary": "Diagnose why 30 losing lane-farm strategies fail (from brain.db trade autopsies) and distill durable lessons",
+  "agentCount": 7,
+  "logs": [],
+  "result": {
+    "n_lanes": 103,
+    "lessons": "# Bài học bền vững (durable lessons) — vì sao 30 lane này thua\n\n## Executive summary — lý do LỚN NHẤT\n\nCả 30 lane thua vì **một trigger đơn điều kiện (single-condition) được bắn NGAY tại nến exhaustion/extension, ghép với một stop cố định ~1R KHÔNG chuẩn hóa theo volatility** — nên win% chỉ 27–45% trong khi mỗi stop đã ăn phí thành −1.04 đến −1.10R. Cái các lane thiếu không phải \"signal tốt hơn\" mà là **regime filter**: winner vs loser tách nhau gần như hoàn toàn ở đúng 2 feature vào lệnh — `atr_pct` và `khoảng cách tới EMA200` — còn feature của chính trigger (rsi, ret) thì winner/loser gần như y hệt. Nói cách khác: trigger không mang thông tin hướng đi; nó chỉ chọn đúng điểm đảo chiều để bạn vào sai. Cộng thêm hai khoản thuế cấu trúc: (a) stop-drag −1.05R × tỷ lệ stop 40–73% = chảy máu ngay cả khi vào ngẫu nhiên (đó chính là sàn L00_random −0.41R), và (b) ~50–60% tổng lỗ đến từ **perp cổ phiếu/hàng hóa kém thanh khoản** (SNDK, MU, SOXL, SKHYNIX, SPCX, INTC, XAU/XAG, CL/BZ) vốn gap và mean-revert, không có continuation kiểu crypto. Muốn hết thua: chuẩn hóa stop theo ATR, thêm trần extension + sàn volume, vào lệnh ở **retest/hold** thay vì nến trigger, lọc universe về crypto thanh khoản, và **giết mọi lane không vượt rõ −0.41R**.\n\n---\n\n## 1. Fixed ~1R stop KHÔNG vol-normalized → noise-stop (explains ~15 lane, phần lớn loss)\n**Pattern:** Toàn bộ Cluster 1 và họ `mo_*` momentum (mo_roc_up, mo_persist_up, mo_roc_dn, mo_ema_stack_dn, mo_supertrend_dn, mo_breakout20). Trong gần như MỌI lane, LOSER có `atr_pct` gấp **1.3–2×** WINNER (vd mo_breakout20 loser 1.21 vs win 0.60; ema_stack_dn 1.15 vs 0.60).\n**Vì sao fail:** Stop cố định 1R nằm BÊN TRONG dải nhiễu của coin high-ATR → snapback wick quét stop trước khi thesis chạy. Bằng chứng đây là stop-width chứ không phải sai hướng: **timeout survivors DƯƠNG** (+0.07 đến +0.36R) và TP trả +1.5 đến +2.5R. Hướng đúng, stop sai.\n**Takeaway:** Stop theo **ATR/structure (~1.5–2× ATR hoặc dưới swing gần nhất)**, không phải fixed R. Riêng nhóm này KHÔNG được xóa signal — chỉ sửa bracket.\n\n## 2. Chase-extension trên momentum LONG (explains ~7 lane, gồm lane cứu được nhất)\n**Pattern:** ema_stack_long (n=113, lane tốt nhất −0.10R), mo_roc_up, mo_persist_up, mo_ema_stack_trend, mo_breakout20, momo_breakout_long, L_MOM_200_RECLAIM. LOSER luôn là entry **extended hơn**: `px_vs_ema200` 4–6.8% vs winner ~1–3%, rsi 64–72, ret20 +4.7–5.5%.\n**Vì sao fail:** Mua sau khi sóng đã chạy → mean-reversion kéo giá về, clip fixed stop ngay ở nến retest. mo_ema_stack_trend là bằng chứng sạch nhất: loser px_vs_ema200 6.83 vs win 3.28.\n**Takeaway:** Thêm **trần extension** — bỏ qua nếu `px_vs_ema200 > ~3–4%` hoặc `rsi > 68` hoặc `atr_pct > 1.1`. Chỉ mua stack khi giá còn SÁT EMA, hoặc vào ở first pullback. Đây là nhóm có salvage cao nhất.\n\n## 3. Short EXHAUSTION / vào muộn khi đã oversold (explains ~8 lane, nhiều lane dưới sàn random)\n**Pattern:** owner_4h_bear_state_short, mo_ema_stack_dn, mo_roc_dn, mo_breakdown20, SQZ_S_quiet_bear_push, M15_MOM_BEAR_PULLBACK, S_SQZ_FLAT_DROP_VOL. Vào khi `dd96 −5% đến −10%`, rsi 30–44, `px_vs_ema200 −3% đến −5.5%`.\n**Vì sao fail:** Short vào đáy của cú xả → bounce/squeeze là sự kiện xác suất cao kế tiếp. Stop **rất nhanh: median 2–3.5 bar, thường >50% stop trong 3 bar**. owner_4h stop median 2 bar / 76% trong ≤3 bar. Nhiều lane **0 TP trong 48** (ema_stack_dn) → target không bao giờ với tới.\n**Takeaway:** Cấm short continuation khi `rsi < 40` / `dd96 < −6%`. Chỉ short bear-state như **fade-the-bounce** sau khi giá hồi về resistance/lower-high. Vài lane (M15_MOM_BEAR −0.56, ema_stack_dn −0.45, breakdown20 −0.53) DƯỚI sàn random → giết, không tune.\n\n## 4. Vào trên chính nến trigger (ignition/reclaim/breakout) = false break (explains ~6 lane)\n**Pattern:** L_SQ_IGN, S_SQ_IGN, L_MOM_200_RECLAIM_BURST, mo_breakout20, momo_breakout. 58% stop tại −1.10R (slippage trên nến ignition), median 2.5–6 bar, chỉ 11–14% chạm TP.\n**Vì sao fail:** Nến ignition/reclaim/pop CHÍNH là local top/đáy giả. Feature không tách được winner/loser → trigger tự chọn điểm đảo chiều. L & S_SQ_IGN fail y hệt nhau → volume-expansion **không** predictive về hướng.\n**Takeaway:** Vào ở **retest/hold** của mức breakout (close giữ trên/dưới level qua 2–3 bar), không phải nến bùng nổ. Nếu không có xác nhận follow-through → retire cả họ SQ_IGN.\n\n## 5. Timeout-bleed trong tape low-vol / neutral (explains ~5 lane)\n**Pattern:** tiktok_triangle_brk (short & long_novol), L_NEUTRAL_VOL_BREAK, S_NEUTRAL_VOL_BREAK, ema20_pullback_long. 53–68% exit timeout ở ~0R, TP gần như bằng 0 (triangle 1/60). Bắn trong `atr_pct 0.5–0.9%`, `vol_ratio ≈ 1`, `ret20 ≈ 0`.\n**Vì sao fail:** Breakout không có nhiên liệu trend/volume → không đi đâu, drift phẳng-âm tới bar cap, chỉ trả phí. Trigger mang **zero directional info** (win/loss feats y hệt).\n**Takeaway:** Gate bắt buộc **volatility-expansion (vol_ratio > ~1.3) + directional regime (px > EMA200, ret20 cùng chiều)**. Triangle trên gold/silver/RWA low-ATR → kill thẳng.\n\n## 6. Payoff geometry gãy — TP quá xa so với horizon (explains ~5 lane)\n**Pattern:** mo_ema_stack_dn (0/48 TP), mo_roc_dn (2/61), mo_supertrend_dn (2/52), mo_breakout20 (2/40). Timeout survivors DƯƠNG nhưng TP +2.46R gần như không bao giờ chạm trong 15–24 bar.\n**Vì sao fail:** Short-gamma structure — drift thuận lợi nhỏ bị cap ở timeout, còn bounce ăn full −1.04R. 2 winner +2.46R không thể trả cho 33 full stop.\n**Takeaway:** Kéo TP về mức **reachable (~0.8–1R)** hoặc **trail** để bank survivor drift trước bar cap. Đây là lỗi bracket, sửa exit trước khi phán signal.\n\n## 7. Universe contamination — perp cổ phiếu/hàng hóa kém thanh khoản (explains ~50% tổng loss)\n**Pattern:** ~48–60% tổng lỗ dồn vào ~13 ticker: SKHYNIX, SNDK, SOXL, SAMSUNG, MU, INTC, DRAM, SPCX, EWY, XAU/XAG, CL/BZ, NVDA, CRCL. SKHYNIX một mình −0.128 trên mo_roc_dn.\n**Vì sao fail:** Tài sản này gap, mean-revert, spread rộng, up-drift cấu trúc — nên short bị drift ngược và mọi thesis momentum/breakout kiểu crypto structurally fail. 10/16 lane Cluster 6 là pure SHORT, đè lên đúng nhóm up-drift này.\n**Takeaway:** **Blacklist universe về crypto thanh khoản.** Một filter này xóa gần nửa lượng chảy máu, độc lập với chất lượng signal. (Ghi chú: `funding_z = 0.0` mọi row → feature chết, cần fix.)\n\n## 8. Fade strength KHÔNG có exhaustion trigger (explains ~4 lane)\n**Pattern:** rsi_overbought_fade (n=104, −0.063), MR_S_blowoff_fade (64% SL, median 2 bar), MR_L_cap_bounce (59% SL, median 2 bar), S_MR_DIV_01 (short vào ret20 +4.6%).\n**Vì sao fail:** RSI-overbought / divergence / capitulation **không phải** tín hiệu đảo chiều — uptrend chạy xuyên stop. Winner/loser feats y hệt (rsi 75/75) → không feature nào dự báo fade nào thắng. Stop nhanh nhất set.\n**Takeaway:** Không bao giờ fade strength chỉ bằng price/RSI. Yêu cầu **exhaustion trigger cụ thể**: bearish structure break / lower-high / CVD divergence / volume climax-and-fade trước khi vào.\n\n## 9. Short \"quiet\" low-volume drift (explains ~3 lane)\n**Pattern:** SQZ_S_quiet_bear_push (65% SL median 3 bar), S_SQZ_QUIET_ROLL, S_SQZ_FLAT_DROP. Đặc trưng: `vol_ratio 0.54–0.61` (dưới trung bình).\n**Vì sao fail:** \"Quiet\" = không có seller conviction → drift âm mean-revert lên, squeeze stop trong ~4 bar. Regime (không phải hướng) mới là vấn đề.\n**Takeaway:** Cấm short khi `vol_ratio < 0.7`. Breakdown short cần **volume EXPANSION xác nhận** — quiet ≠ bearish.\n\n---\n\n## Kill benchmark (dùng cho method lab)\n**L00_random = sàn alpha −0.41R / 73% stop.** Bất kỳ lane nào meanR không **rõ ràng vượt −0.41R** = không có edge, phải KILL chứ không tune. Đang nằm ở/dưới sàn: `M15_MOM_BEAR −0.564`, `mo_breakdown20 −0.529`, `mo_ema_stack_dn −0.453`, `owner_4h_bear −0.436`, `S_SQZ_FLAT_DROP −0.46`, `L_MOM_200_RECLAIM −0.420`. Lane đáng cứu (survivor drift dương + TP thực): **ema_stack_long (−0.10)**, **mo_roc_up (−0.16)**, **rsi_dip_in_uptrend (−0.029, gần BE)** — sửa bằng extension gate + ATR stop, không xóa.\n\n**Caveat độ tin cậy:** data chỉ **5 ngày (2026-07-06→07-11), một regime, n=25–113/lane**; `mfe/mae` NULL nên noise-stop vs thesis-wrong là suy luận từ exit-mix, không đo trực tiếp. Mọi verdict là low-confidence, dễ overfit một tuần — cần forward-test trước khi cấp vốn.",
+    "per_lane": [
+      {
+        "lane": "lane_mo_ema_stack_dn",
+        "n": 48,
+        "failure_mode": "mixed",
+        "lesson": "Fixed ~1R stop is not vol-normalized: losers fire at ~2x the ATR of winners. Add an atr_pct ceiling (~<0.9%) and stop shorting coins already >4% below EMA200 in deep drawdown (snap-back risk).",
+        "evidence": "win 29.2%, meanR -0.45 (worse than random -0.41). Exits sl26/timeout22; SL r -1.04, timeout r +0.24 (survivors fine). 13/26 stops hit within <=3 bars (med 4). LOSER atr 1.15 vs WIN 0.60, px_vs_ema200 -4.37 vs -1.76, dd96 -8.5 vs -4.26 -> losing shorts taken deeper/more volatile then bounce."
+      },
+      {
+        "lane": "lane_mo_roc_dn",
+        "n": 61,
+        "failure_mode": "thesis-wrong",
+        "lesson": "Do not short ROC-down when price is already >3% below EMA200 on a vol spike — that is capitulation, and it bounces. Winners short from AT the EMA200; losers short into the hole.",
+        "evidence": "win 34.4%, meanR -0.34. sl33/timeout26/tp2; SL r -1.04, timeout r +0.33 (positive). 15/33 stops <=3 bars (med 4). Cleanest split: LOSER px_vs_ema200 -3.12 vs WIN +0.05, LOSER vol_ratio 2.16 vs 1.14 -> shorting an extended, spiking flush."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_short",
+        "n": 60,
+        "failure_mode": "timeout-bleed",
+        "lesson": "Triangle breakouts in flat ~0.5% ATR have no energy and no follow-through — 68% just time out. The trigger carries zero directional info (win/loss feats identical); require vol_ratio expansion to confirm the break or drop the lane.",
+        "evidence": "win 26.7%, meanR -0.33. timeout 41/60 (68%) at r -0.064, sl18 r -1.05, only 1 tp. Stops are SLOW (med 8 bars, 1/18 fast) = no immediate thesis, just drift. LOSER vs WIN nearly identical: rsi 33.5 vs 32.9, atr 0.50 vs 0.54, ret20 -1.3 vs -1.3."
+      },
+      {
+        "lane": "lane_M15_MOM_BEAR_PULLBACK_REJECT_06",
+        "n": 32,
+        "failure_mode": "mixed",
+        "lesson": "Worst mean-R in the set and 15.6% win = anti-predictive: the bear-pullback 'rejection' is being bought back into a 3.4x vol spike. Kill or invert this trigger — both exit paths lose money.",
+        "evidence": "win 15.6%, meanR -0.56 (worst). timeout16 r -0.278 (real bleed) / sl15 r -1.05 / tp1. 6/15 stops fast. LOSER vol_ratio 3.43 (getting run over on the spike) vs WIN 2.42; LOSER ret20 -1.71 vs WIN -0.69."
+      },
+      {
+        "lane": "lane_owner_4h_bear_state_short",
+        "n": 28,
+        "failure_mode": "thesis-wrong",
+        "lesson": "The 4h bear is already priced in by the time this fires — entering after a -5.5% EMA200 stretch is late and gets bounced in 2 bars. Shorting exhaustion, not continuation.",
+        "evidence": "win 28.6%, meanR -0.44. sl17/timeout9/tp2; SL r -1.04. 13/17 stops (76%) within <=3 bars, MEDIAN 2 bars -> price reverses immediately. LOSER px_vs_ema200 -5.54 vs WIN -1.0, dd96 -9.77 vs -5.65, vol_ratio 1.27 vs 0.68."
+      },
+      {
+        "lane": "lane_L_SQ_IGN_01",
+        "n": 79,
+        "failure_mode": "thesis-wrong",
+        "lesson": "Squeeze-ignition long enters ON the pop candle, which is the local top — 54% reverse within 3 bars. Require a hold/close above the breakout level before entry rather than buying the ignition bar.",
+        "evidence": "win 27.8%, meanR -0.37. sl46/timeout22/tp11; SL r -1.10, timeout r +0.03. 25/46 stops <=3 bars, median 2.5. No regime separation (LOSER rsi 56.8 vs WIN 57.5) — the trigger itself picks the reversal point; LOSER atr 0.85 vs 0.63."
+      },
+      {
+        "lane": "lane_L_MOM_200_RECLAIM_BURST",
+        "n": 39,
+        "failure_mode": "thesis-wrong",
+        "lesson": "Buying the EMA200 reclaim burst catches the fakeout reclaim — 55% stop within 3 bars right at the line. Wait for a retest/hold above EMA200; winners had already cleared further above (2.08% vs losers 1.29%).",
+        "evidence": "win 23.1%, meanR -0.42 (~random). sl22/timeout13/tp4; SL r -1.06, timeout r -0.07. 12/22 stops <=3 bars, median 2.5. LOSER px_vs_ema200 1.29 vs WIN 2.08, LOSER ret20 1.24 vs WIN 0.67 (bought the spike edge)."
+      },
+      {
+        "lane": "lane_L_NEUTRAL_VOL_BREAK",
+        "n": 38,
+        "failure_mode": "timeout-bleed",
+        "lesson": "Volatility breakouts fired from a NEUTRAL regime have no trend fuel — 53% bleed to timeout. Gate on px>EMA200 and lower ATR: losers broke out while still 1.9% below EMA200 in a hotter tape.",
+        "evidence": "win 26.3%, meanR -0.37. timeout20 (53%) r -0.037 / sl16 r -1.05 / tp2. LOSER px_vs_ema200 -1.87 vs WIN +0.07, LOSER atr 0.75 vs WIN 0.52, dd96 -4.77 vs -2.72 -> false breaks below trend in high vol."
+      },
+      {
+        "lane": "lane_ema_stack_long",
+        "n": 113,
+        "failure_mode": "mixed",
+        "lesson": "Most salvageable lane — real trend edge (22 TP @ +1.46R, timeouts +0.074) eroded by chasing extension. Cap px_vs_ema200 (~<4%) and atr_pct: losers buy the ema-stack after it is already blown off; winners enter tighter.",
+        "evidence": "win 42.5%, meanR -0.10 (best of set). timeout46 (+0.074)/sl45 (-1.04)/tp22 (+1.46); loss = 45 stops > 22 wins. 16/45 stops fast. LOSER ret20 3.55 vs WIN 2.56, px_vs_ema200 5.66 vs 3.11, atr 1.23 vs 0.89."
+      },
+      {
+        "lane": "lane_mo_breakout20",
+        "n": 40,
+        "failure_mode": "noise-stop",
+        "lesson": "20-bar breakout longs only lose on stops (timeouts +0.27), and losers enter at ~2x winner ATR, more extended, with WEAKER volume confirmation. Require vol_ratio confirmation (winners 4.0x vs losers 3.4x) and reject entries already +4.8% over 20 bars.",
+        "evidence": "win 37.5%, meanR -0.27. sl20 (-1.04)/timeout18 (+0.27)/tp2. Stops slow (med 4.5, 5/20 fast). LOSER atr 1.21 vs WIN 0.60, ret20 4.81 vs 2.28, dd96 -2.44 vs -0.69, vol_ratio 3.39 vs 4.02 (winners had MORE vol)."
+      },
+      {
+        "lane": "lane_S_SQ_IGN_01",
+        "n": 83,
+        "failure_mode": "thesis-wrong",
+        "lesson": "Mirror of L_SQ_IGN on the short side: bearish ignition fired without strong volume reverses fast (50% stop within ~3.5 bars). Winners had 3.0x vol on the breakdown vs losers 2.2x — demand real seller conviction before entry.",
+        "evidence": "win 27.7%, meanR -0.33. sl48 (-1.10)/timeout21 (-0.04)/tp14. 24/48 stops <=3 bars, median 3.5. LOSER vol_ratio 2.16 vs WIN 3.04; rsi identical 43.1 vs 42.6 (no regime edge)."
+      },
+      {
+        "lane": "lane_SQZ_S_quiet_bear_push",
+        "n": 84,
+        "failure_mode": "thesis-wrong",
+        "lesson": "Shorting a QUIET (below-average volume) bear drift has no seller energy and mean-reverts up — 58% of stops hit within 3 bars. A 'quiet push' needs volume EXPANSION to be real; without it, do not short it.",
+        "evidence": "win 29.8%, meanR -0.31. sl55 (65%, r -1.10)/tp21/timeout8. 32/55 stops <=3 bars, MEDIAN 3. LOSER vol_ratio 0.61 (sub-1 = below avg) vs WIN 0.54; both quiet -> the regime, not direction, is the problem."
+      },
+      {
+        "lane": "lane_mo_roc_up",
+        "n": 72,
+        "failure_mode": "mixed",
+        "lesson": "Same chase problem as ema_stack_long — edge exists (timeouts +0.23, 12 TP @ +2.46R) but losers chase the MOST extended pumps. Winning ROC-up entries sit ~1.3% over EMA200; entries >4% over get reverted. Cap extension and RSI.",
+        "evidence": "win 29.2%, meanR -0.16. sl43 (-1.04)/timeout17 (+0.23)/tp12 (+2.46). 16/43 stops fast. LOSER px_vs_ema200 4.42 vs WIN 1.30, ret20 5.06 vs 3.92, rsi 67.7 vs 64.5, vol_ratio 1.93 vs 1.45."
+      },
+      {
+        "lane": "lane_S_SQZ_FLAT_DROP_VOL",
+        "n": 42,
+        "failure_mode": "mixed",
+        "lesson": "19% win with both exit paths losing = near anti-predictive; the vol-driven drop gets bought back. Losers short from BELOW EMA200 (-0.8%) while winners short from above (+0.34%). Kill candidate unless flipped to only short from above trend.",
+        "evidence": "win 19.0%, meanR -0.46 (worse than random). sl26 (62%, r -1.08)/timeout10 (r -0.27 bleed)/tp6. 13/26 stops <=3 bars, median 3.5. LOSER px_vs_ema200 -0.8 vs WIN +0.34."
+      },
+      {
+        "lane": "lane_L00_random",
+        "n": 52,
+        "failure_mode": "mixed",
+        "lesson": "This is the RANDOM control = the alpha floor at meanR -0.41 / 73% full-stop rate. Any strategy lane not beating -0.41R has NO edge. Note mo_ema_stack_dn (-0.45), M15_MOM_BEAR (-0.56), S_SQZ_FLAT_DROP (-0.46), owner_4h (-0.44), L_MOM_200 (-0.42) are AT OR BELOW random -> genuinely negative edge, kill them.",
+        "evidence": "win 23.1%, meanR -0.41, both sides (L27/S25). sl38 (73%, r -1.08)/timeout12 (+0.65)/tp2 (+5.92). Random entry + fixed 1R stop bleeds via full stops; longer horizon (bars mean 18.6) lets a few timeouts run positive."
+      },
+      {
+        "lane": "lane_mo_ema_stack_dn",
+        "n": 48,
+        "failure_mode": "noise-stop",
+        "evidence": "SHORT-only, win 29%, meanR -0.45. Split: 26 SL @ -1.04R (50% stopped within 3 bars) vs 22 timeout @ +0.24R. Survivors are net POSITIVE, so direction is right but the stop shakes half out first. Losers enter already-oversold/extended-down (rsi 36, dd96 -8.5%, ret20 -2.7%, ema_stack -1) — shorting into a hole that snaps back through a tight stop (atr only 1.15%).",
+        "lesson": "Direction has edge (timeouts +0.24R) but SL is too tight for a short entered at rsi36/-8.5% drawdown. Do not short a fresh breakdown into oversold; wait for a lower-high retest and place SL beyond the snapback wick (>1.5x atr), or the noise eats you."
+      },
+      {
+        "lane": "lane_mo_roc_dn",
+        "n": 61,
+        "failure_mode": "noise-stop",
+        "evidence": "SHORT-only, win 34%, meanR -0.34. 33 SL @ -1.04R (45% <=3 bars) vs 26 timeout @ +0.33R and 2 TP @ +2.46R. Survivors clearly positive — the thesis (negative ROC continuation) works when not stopped. Losers rsi 36, ret5 -2.2%, vol_ratio 2.2: chasing a high-volume flush down that bounces into the stop.",
+        "lesson": "Same shake-out as ema_stack_dn: negative-ROC shorts get whipsawed on the mean-revert bounce. Enter on the retest not the flush, and widen SL — a 3-bar stop at rsi36 throws away a +0.33R directional tail."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_short",
+        "n": 60,
+        "failure_mode": "timeout-bleed",
+        "evidence": "SHORT-only, win 27%, meanR -0.33. Modal exit is TIMEOUT: 41/60 (68%) @ -0.06R medBars16; only 18 SL (just 6% fast) and 1 TP. Ultra-low vol regime (atr 0.50%, the lowest in the cluster). Universe is XAU/XAG/ZEC/HYPE/SPCX. Triangle breakdown triggers but simply never travels — dribbles out flat-negative at the bar cap.",
+        "lesson": "A triangle 'breakout' short in a 0.5%-ATR regime has no follow-through — it is a coin-flip that bleeds fees. Require an expansion/volume filter (breakout bar vol >2x) and a minimum-ATR gate; kill this on gold/silver/RWA where breakouts don't trend."
+      },
+      {
+        "lane": "lane_mo_breakdown20",
+        "n": 25,
+        "failure_mode": "timeout-bleed",
+        "evidence": "SHORT-only, win 12% (worst in cluster), meanR -0.53. 15 timeout (60%) @ -0.19R medBars20, 10 SL @ -1.04R (only 10% fast), 0 TP. Losers rsi 30 (deep oversold), ret20 -2.8%, vol_ratio 3.4. Shorting the break of a 20-bar LOW: it's already the low, so no continuation — it churns sideways/up and times out negative.",
+        "lesson": "Selling fresh 20-bar lows at rsi30 is selling exhaustion — 0 TPs and 88% non-winners. Breakout-of-low shorts need momentum/OI confirmation of continuation; without it this is a structural bottom-picker in reverse."
+      },
+      {
+        "lane": "lane_owner_4h_bear_state_short",
+        "n": 28,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT-only, win 29%, meanR -0.44. 17 SL @ -1.04R with medBars=2 and 76% stopped within 3 bars — the most violent immediate reversal in the cluster. Only 9 timeouts (+0.17R). Entries are deep-in-hole shorts: dd96 -9.8%, px_vs_ema200 -5.5%, rsi 43. A 4h 'bear state' flag fires after the move is done; price rips up off the lows instantly.",
+        "lesson": "A 4h-bear-state short is a lagging label — by the time it fires, price is -10% and primed to squeeze. 76% stop in <=3 bars means the entry timing is simply wrong. Trade bear-state as a fade-the-bounce SHORT only after a rally back to resistance, never as a breakdown chase."
+      },
+      {
+        "lane": "lane_L_SQ_IGN_01",
+        "n": 79,
+        "failure_mode": "thesis-wrong",
+        "evidence": "LONG-only, win 28%, meanR -0.37. 46 SL @ -1.10R with medBars 2.5 (54% <=3 bars), 22 timeout @ +0.03R (flat), 11 TP @ +1.90R. Losers buy the pop: rsi 57, ret5 +1.16%, vol_ratio ~2. Squeeze-ignition longs that immediately fail = false breakouts; the flat timeouts show no residual drift, only the 11 fat-tail TPs carry any value.",
+        "lesson": "Buying the ignition candle gives a 54% instant-stop false-breakout rate. The edge lives only in the +1.9R tail (14% of trades). Either enter on the post-ignition pullback/hold of the breakout level, or accept this needs a much higher TP:SL to survive the false-breakout base rate."
+      },
+      {
+        "lane": "lane_L_MOM_200_RECLAIM_BURST",
+        "n": 39,
+        "failure_mode": "thesis-wrong",
+        "evidence": "LONG-only, win 23%, meanR -0.42. 22 SL @ -1.06R medBars 2.5 (55% <=3 bars), 13 timeout @ -0.07R (negative), 4 TP @ +1.94R. Entries: rsi 59, ret5 +1.93%, ret20 +1.24%, px_vs_ema200 +1.3% — buying the burst the moment price pokes back above the 200. Reclaim rejects immediately = classic bull trap.",
+        "lesson": "A first-touch reclaim of the ema200 in a burst is a trap 55% of the time, and even survivors bleed (timeouts -0.07R). Wait for a reclaim-and-hold (close above 200 confirmed over 2-3 bars) before entering; the 'burst' entry is buying the exact rejection point."
+      },
+      {
+        "lane": "lane_ema_stack_long",
+        "n": 113,
+        "failure_mode": "mixed",
+        "evidence": "LONG-only, largest sample; win 42.5% (best of the losers) but meanR -0.10 — a marginal setup bled negative by costs. Balanced exits: 46 timeout @ +0.07R, 45 SL @ -1.04R (36% fast), 22 TP @ +1.46R. Losers are EXTENDED: rsi 64, ret20 +3.55%, px_vs_ema200 +5.66%, vol_ratio 2.2. Buying stacked-up trend continuation but chasing price already +5.7% over the 200.",
+        "lesson": "This is a near-breakeven trend-continuation edge destroyed by (a) entering extended (px +5.7% over ema200 -> mean-revert stops) and (b) fee drag pushing SL to -1.04R. Add an extension filter (skip if px_vs_ema200 > +3% or rsi>65) and only buy pullbacks into the stack; that alone likely flips it positive."
+      },
+      {
+        "lane": "lane_L_NEUTRAL_VOL_BREAK",
+        "n": 38,
+        "failure_mode": "timeout-bleed",
+        "evidence": "LONG-only, win 26%, meanR -0.37. Modal exit timeout: 20/38 (53%) @ -0.04R medBars16; 16 SL @ -1.05R; only 2 TP. Regime is by-definition neutral: ret20 -0.16%, px_vs_ema200 -1.9%. A volatility breakout fired from a directionless base fails to establish trend and times out flat-negative.",
+        "lesson": "Volatility expansion without a directional regime is noise — 53% time out flat and only 2/38 reach TP. Gate breakouts on a trend/regime filter (need ema alignment or positive ret20 in the breakout direction); a 'neutral' breakout is a coin flip minus fees."
+      },
+      {
+        "lane": "lane_mo_breakout20",
+        "n": 40,
+        "failure_mode": "noise-stop",
+        "evidence": "LONG-only, win 38%, meanR -0.27. 20 SL @ -1.04R (medBars 4.5, 25% fast), 18 timeout @ +0.27R, 2 TP @ +2.46R. Survivors positive again. Losers overbought/extended: rsi 71, ret20 +4.8%, px_vs_ema200 +3.6%, vol_ratio 3.4. Breakout of 20-bar HIGH bought at rsi71 gets whipsawed on the retest before continuing.",
+        "lesson": "Buying 20-bar-high breakouts at rsi71 gives a retest-whipsaw stop rate that erases the +0.27R survivor drift. Enter on the breakout retest/hold rather than the extension candle, and add an overbought guard — the direction is fine, the entry point is inside the noise band."
+      },
+      {
+        "lane": "lane_S_SQ_IGN_01",
+        "n": 83,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT mirror of L_SQ_IGN. Win 28%, meanR -0.33. 48 SL @ -1.10R with medBars 3.5 (50% <=3 bars), 21 timeout @ -0.04R (flat), 14 TP @ +1.90R. Losers rsi 43, ret5 -1.24% — shorting the ignition-down candle, which reverses instantly 50% of the time. Value is only in the 14 fat-tail TPs.",
+        "lesson": "Symmetric false-breakdown problem: 50% of ignition-short entries stop in <=3 bars. The ignition candle is the worst entry; short the failed retest of the broken level instead. Base rate demands the tail (+1.9R) or nothing — flat timeouts add no drift to lean on."
+      },
+      {
+        "lane": "lane_mo_roc_up",
+        "n": 72,
+        "failure_mode": "noise-stop",
+        "evidence": "LONG-only, win 29%, meanR -0.16 (marginal). 43 SL @ -1.04R (37% fast), 17 timeout @ +0.23R, 12 TP @ +2.46R — both survivor buckets strongly positive. Losers extended: rsi 68, ret20 +5.1%, px_vs_ema200 +4.4%. Strong-ROC longs bought extended get shaken by the pullback then the move continues without them.",
+        "lesson": "Real momentum edge (12 TP @ +2.46R, timeouts +0.23R) sabotaged by chasing at rsi68/+5% over ema200 into a tight stop. Buy the first pullback in the ROC leg, not the extension; the fat right tail is there if the stop survives the retracement."
+      },
+      {
+        "lane": "lane_SQZ_S_quiet_bear_push",
+        "n": 84,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT-only, win 30%, meanR -0.31. Highest SL rate in cluster: 55/84 (65%) @ -1.10R, 58% within 3 bars; 21 TP @ +1.65R, 8 timeout ~flat. Tell-tale feature: vol_ratio 0.61 (LOW) with rsi 39, ema_stack -1 — shorting a quiet low-volume drift-down that reverses/squeezes up fast.",
+        "lesson": "Shorting a 'quiet' low-volume push (vol_ratio 0.6) is shorting illiquid drift that squeezes — 58% stop inside 3 bars. Require participation (breakdown vol >1x) before shorting; quiet down-drift mean-reverts, it does not continue."
+      },
+      {
+        "lane": "lane_S_SQZ_FLAT_DROP_VOL",
+        "n": 42,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT-only, win 19%, meanR -0.46. 26 SL @ -1.08R (62% of trades, 50% <=3 bars), 10 timeout @ -0.27R (also negative), 6 TP @ +1.92R. Losers rsi 44, ret5 -1.3%, vol_ratio 2.6. Both failure buckets lose: shorting the drop either reverses instantly (fast SL) or dies without follow-through (timeout -0.27R).",
+        "lesson": "Worst kind of -EV: entries both reverse AND fail to continue. Shorting a flat-then-drop-on-volume bar is late — the volume IS the capitulation. This needs to flip to fading the bounce, not chasing the drop; as-is it should be killed."
+      },
+      {
+        "lane": "lane_M15_MOM_BEAR_PULLBACK_REJECT_06",
+        "n": 32,
+        "failure_mode": "mixed",
+        "evidence": "SHORT-only, worst meanR in cluster -0.56, win 15.6%. 16 timeout @ -0.28R (50%, meaningful bleed), 15 SL @ -1.05R (40% fast), 1 TP. Losers rsi 33 (oversold), ret20 -1.7%, vol_ratio 3.4. Shorting a pullback-rejection in an already-oversold 15m downtrend: half reverse into stops, half bleed out with no continuation — broadly -EV in both directions.",
+        "lesson": "Shorting oversold (rsi33) bear pullbacks fails two ways at once (40% reverse, 50% timeout -0.28R). The downtrend is too mature to add shorts. Only short pullback-rejections while rsi is still mid-range (>45) and before dd96 exceeds ~-5%; late-stage continuation shorts are net-negative."
+      },
+      {
+        "lane": "lane_L00_random",
+        "n": 52,
+        "failure_mode": "mixed",
+        "evidence": "RANDOM control (mixed LONG/SHORT). Win 23%, meanR -0.41: 38 SL @ -1.08R (73% of trades), 12 timeout @ +0.65R, 2 TP @ +5.92R. Entry feats are regime-neutral by construction (rsi 49, ret20 +0.04, ema_stack 0). Different horizon config (timeout medBars 48). This is the alpha floor — pure fee+stop drag.",
+        "lesson": "This is the benchmark, not a strategy: -0.41R / 73%-stop is what NO edge looks like. Any lane clustering near it (owner_4h -0.44, S_SQZ_FLAT -0.46, ema_stack_dn -0.45) is statistically indistinguishable from random and must be killed unless it demonstrably beats this floor."
+      },
+      {
+        "lane": "lane_ema_stack_long",
+        "n": 113,
+        "failure_mode": "mixed",
+        "evidence": "win 42.5%, mean_r −0.10. Exits timeout 46(+0.07R), sl 45(−1.04R), tp 22(+1.46R) — R:R fine but 45 stops vs 22 targets. Losers are the MORE-EXTENDED entries: px_vs_ema200 5.66 vs 3.11 win, ret20 3.55 vs 2.56, atr_pct 1.23 vs 0.89, vol_ratio 2.22 vs 1.77. SL speed mixed (median 5.4 bars). Worst: BLUR/SPCX/HYPE/SAMSUNG.",
+        "lesson": "EMA-stack longs lose specifically when chasing already-run stacks — gate out entries with px_vs_ema200 > ~4 or ret20 > ~3% or atr_pct > 1.1; take the stack only when price is still near the EMAs, not extended."
+      },
+      {
+        "lane": "lane_rsi_overbought_fade",
+        "n": 104,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT-only, win 39.4%, mean_r −0.063 (near coin-flip). sl 49(−1.05R) vs tp 26(+1.61R) vs timeout 29(+0.11R). Winner/loser feats are identical (rsi 75/75, ret20 5.8/4.9) — no separator, so overbought alone gives no directional edge; the uptrend simply continues through the stop.",
+        "lesson": "RSI-overbought is not a short signal by itself (49 stops, no feat that predicts which fade works). Require an exhaustion/reversal trigger (bearish structure break, CVD divergence, failed new high) before fading strength."
+      },
+      {
+        "lane": "lane_ema20_pullback_long",
+        "n": 102,
+        "failure_mode": "timeout-bleed",
+        "evidence": "win 38.2%, mean_r −0.06. 57/102 (56%) exit timeout at +0.016R, only 15 TP. Winner/loser feats flat and identical: ret20 ~0.1, rsi ~51.7 — entering non-trending markets. No thrust → drifts to timeout, fees bleed it negative.",
+        "lesson": "EMA20-pullback only works inside a real uptrend — require ret20 > 0 and rising px_vs_ema200; in flat regime (ret20≈0) it just chops to timeout. Add a trend-strength precondition or skip."
+      },
+      {
+        "lane": "lane_rsi_dip_in_uptrend",
+        "n": 89,
+        "failure_mode": "mixed",
+        "evidence": "LONG, win 40.4%, mean_r −0.029 (near BE). sl 38(−1.05R), timeout 35(+0.18R), tp 16(+1.95R). The 'uptrend' label is broken: ret20 is −1.65 for BOTH winners and losers and px_vs_ema200 only +1.8 — it's buying dips in flat/falling names, not uptrends.",
+        "lesson": "The uptrend filter is mislabeled — ret20 is negative on entry. Fix the trend gate (require ret20 > 0 and px_vs_ema200 clearly positive) so it buys dips in things actually trending up; near-BE means a correct filter could flip it positive."
+      },
+      {
+        "lane": "lane_SQZ_S_quiet_bear_push",
+        "n": 84,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT, win 29.8%, mean_r −0.311. sl 55 (65% share) at −1.10R, and FAST: median 3 bars, 32/55 stops within 3 bars. Entries are low-volume (vol_ratio 0.54–0.61). Price reverses up immediately after the short.",
+        "lesson": "Shorting a 'quiet' low-volume squeeze has no edge — the quiet resolves UP as often as down and stops you within 3 bars (65% SL). Do not short low-vol_ratio (<0.7) squeezes; wait for a volume-confirmed breakdown."
+      },
+      {
+        "lane": "lane_S_SQ_IGN_01",
+        "n": 83,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT, win 27.7%, mean_r −0.326 (below random floor). sl 48 (58%) at −1.10R, fast (median 3.5 bars, 24/48 within 3). Only 14 TP. Feats don't separate winners from losers.",
+        "lesson": "The 'S ignition' trigger fires into immediate reversals (58% fast full-stop, below the −0.41R random control). No feature predicts success — the trigger itself is noise; kill or fully redesign it."
+      },
+      {
+        "lane": "lane_L_SQ_IGN_01",
+        "n": 79,
+        "failure_mode": "thesis-wrong",
+        "evidence": "LONG, win 27.8%, mean_r −0.367 (below random floor). sl 46 (58%) at −1.10R, fastest median 2.5 bars (25/46 within 3). Only 11 TP. Losers slightly extended (px_vs_ema200 0.49 vs −0.44 win).",
+        "lesson": "Both L and S 'SQ_IGN' variants fail identically — the ignition trigger has zero directional edge (58% instant stop, worse than random). This is a dead signal family; retire it rather than retune."
+      },
+      {
+        "lane": "lane_S_SQZ_QUIET_ROLL",
+        "n": 74,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT, win 32.4%, mean_r −0.155. sl 40 (54%) at −1.08R, timeout 19(+0.15R), tp 15(+1.92R). Low-vol entries (vol_ratio 0.54–0.59), same profile as the other 'quiet' shorts.",
+        "lesson": "Same lesson as quiet_bear_push: low-volume squeeze shorts get run over (54% SL). Require expanding volume and a confirmed lower-low before shorting the roll; quiet ≠ bearish."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_long_novol",
+        "n": 73,
+        "failure_mode": "timeout-bleed",
+        "evidence": "LONG, win 45.2%, mean_r −0.05 (near BE). 40/73 (55%) exit timeout at +0.10R, only 9 TP, 24 SL. Winners had more volume (vol_ratio 2.27 vs 1.71) and higher rsi (69 vs 63) than losers — the 'novol' entries lack thrust.",
+        "lesson": "Triangle breakouts WITHOUT volume don't follow through (55% timeout, 12% TP). The name says novol and that IS the defect — require a volume-expansion confirmation; the winners already show it (vol_ratio ~2.3)."
+      },
+      {
+        "lane": "lane_mo_roc_up",
+        "n": 72,
+        "failure_mode": "thesis-wrong",
+        "evidence": "LONG, win 29.2%, mean_r −0.159. sl 43 (60%) at −1.04R, tp 12(+2.46R). Losers markedly more extended: px_vs_ema200 4.42 vs 1.3 win, ret20 5.06 vs 3.92, vol_ratio 1.93 vs 1.45. Chasing ROC = buying the top.",
+        "lesson": "ROC-up chases momentum into extension and reverts (60% stop). Gate on px_vs_ema200 < ~2 and ret20 < ~4% — enter early ROC, not the blow-off; the 2.46R payoff only pays if hit-rate rises by avoiding extended entries."
+      },
+      {
+        "lane": "lane_MR_S_blowoff_fade",
+        "n": 66,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT, win 31.8%, mean_r −0.229. sl 42 (64%) at −1.08R and the FASTEST in the set: median 2 bars, 33/42 stops within 3 bars. Only 7 timeouts. rsi ~65 on entry.",
+        "lesson": "Fading a blow-off with no exhaustion signal = shorting a parabola that keeps going (64% stop, median 2 bars). Never fade strength on price/RSI alone; demand a reversal candle / lower-high / volume climax-and-fade before entry."
+      },
+      {
+        "lane": "lane_mo_roc_dn",
+        "n": 61,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT, win 34.4%, mean_r −0.344 (below random). sl 33 (54%) at −1.04R, but only 2 TP in 61 — wins come from 26 timeouts (+0.33R), not targets. Losers more extended down: px_vs_ema200 −3.12 vs 0.05, vol_ratio 2.16 vs 1.14. SKHYNIX alone −0.128.",
+        "lesson": "Shorting down-ROC chases lows: bounces stop you (54%) and targets almost never hit (2/61 TP). It only 'works' by timing out flat. Kill the far target, enter earlier in the down-move, and exclude illiquid stock-proxy names (SKHYNIX/SOXL/SNDK drove the loss)."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_short",
+        "n": 60,
+        "failure_mode": "timeout-bleed",
+        "evidence": "SHORT, win 26.7%, mean_r −0.327 (below random). PUREST bleed: 41/60 (68%) timeout at −0.06R, only 1 TP in 60 trades, 18 SL. Slow stops (median 8 bars). Zero follow-through.",
+        "lesson": "Triangle-breakdown shorts have essentially no follow-through (1 TP in 60, 68% timeout slightly negative). This is a structurally dead setup on this universe — retire it; do not attempt to retune a 1/60 target-hit rate."
+      },
+      {
+        "lane": "lane_L00_random",
+        "n": 52,
+        "failure_mode": "thesis-wrong",
+        "evidence": "RANDOM control (27 LONG/25 SHORT), win 23.1%, mean_r −0.412 — the alpha FLOOR. sl 38 (73%) at −1.08R; its 2 TP were 5.9R lottery outliers. bars_held 18.6 (no exit logic).",
+        "lesson": "This is the baseline, not a strategy: −0.41R / 23% win with random entries. Any real lane at/near this (L_SQ_IGN, S_SQ_IGN, mo_ema_stack_dn, mo_roc_dn, triangle_brk_short) has NO edge and must be killed, not tuned. Use −0.41R as the promotion cutoff."
+      },
+      {
+        "lane": "lane_mo_supertrend_dn",
+        "n": 52,
+        "failure_mode": "mixed",
+        "evidence": "SHORT, win 40.4%, mean_r −0.14. Dominant exit is timeout 31 (60%) at +0.21R, only 2 TP, sl 19(−1.04R). Holds very long (bars 17.9). Net drag is the 19 full stops; timeouts are actually profitable.",
+        "lesson": "Supertrend-dn's target (2/52 TP) is unreachable — wins come from timing out in profit. Shorten/relocate the target to where timeouts are landing (~+0.2R) and tighten the stop; the setup drifts favorably but the exit design wastes it."
+      },
+      {
+        "lane": "lane_mo_ema_stack_dn",
+        "n": 48,
+        "failure_mode": "thesis-wrong",
+        "evidence": "SHORT, win 29.2%, mean_r −0.453 (worst material lane, well below random). sl 26 (54%) at −1.04R and ZERO TP in 48. Losers deeply extended down: px_vs_ema200 −4.37 vs −1.76 win, ret20 −2.67 vs −1.28, atr_pct 1.15 vs 0.60. SNDK/MU −0.083 each.",
+        "lesson": "Shorting an already-stacked-down EMA on high ATR = chasing into a bounce (54% stop, 0/48 targets). Gate hard on extension (skip px_vs_ema200 < −2 and atr_pct > 1.0) and drop stock-proxy symbols; as-is it is strictly negative edge."
+      },
+      {
+        "lane": "lane_S_MOM_200_LOSS_BURST",
+        "n": 47,
+        "failure_mode": "mixed",
+        "evidence": "SHORT, win 34.0%, mean_r −0.10. sl 25 (53%) at −1.06R, tp 10(+1.94R), timeout 12(+0.19R). Weak winner/loser feat separation (rsi 44/43, vol_ratio 2.37/2.49). Near-marginal, no clear predictor.",
+        "lesson": "Marginal short with 53% stop and no distinguishing feature between wins and losses — not clearly broken, not clearly edged. Needs a secondary filter (e.g. confirmed momentum-200 reclaim failing on volume) or it stays a slow bleeder."
+      },
+      {
+        "lane": "lane_L_SQZ_FLAT_POP_VOL",
+        "n": 47,
+        "failure_mode": "mixed",
+        "evidence": "LONG, win 38.3%, mean_r −0.149. sl 22 (47%) at −1.08R, timeout 17(+0.08R), tp 8(+1.92R). Losers higher atr_pct (0.77 vs 0.50 win) — volatility on entry predicts failure more than direction.",
+        "lesson": "Flat-squeeze pop-on-volume longs fail on the higher-ATR entries (0.77 vs 0.50). Prefer pops out of genuinely LOW-volatility coils (atr_pct < ~0.6); a high-ATR 'flat' isn't flat and the pop has no clean base to hold."
+      },
+      {
+        "lane": "lane_momo_breakout_long",
+        "n": 52,
+        "failure_mode": "mixed",
+        "evidence": "LONG, win 40.4%, mean_r −0.05 (near BE). sl 22, timeout 21(+0.13R), tp 9(+1.96R). Losers more extended: ret20 5.43 vs 4.45 win, vol_ratio 2.53 vs 2.07, px_vs_ema200 4.22 vs 3.39 — the same chase pattern, milder.",
+        "lesson": "Near break-even momo breakout with a mild chase tilt. Trim the top-decile-extension entries (ret20 > ~5%, px_vs_ema200 > ~4) to push it positive; it's close and salvageable with an extension cap, unlike the dead lanes."
+      },
+      {
+        "lane": "lane_S_NEUTRAL_VOL_BREAK",
+        "n": 50,
+        "failure_mode": "mixed",
+        "evidence": "SHORT, win 42.0%, mean_r −0.106. Top exit timeout 22 (44%) at +0.05R, sl 20(−1.05R), tp 8(+1.83R). Entered in 'neutral' regime with weak feat separation — no directional conviction, half the trades drift to timeout.",
+        "lesson": "Breaking a NEUTRAL regime short has no trend backing (44% timeout, near-0R). Require a regime that is already leaning bearish (px_vs_ema200 < 0, ret20 < 0) before taking the vol-break; neutral = coin-flip drift."
+      },
+      {
+        "lane": "lane_MR_L_cap_bounce",
+        "n": 51,
+        "failure_mode": "thesis-wrong",
+        "evidence": "LONG, win 39.2%, mean_r −0.114. sl 30 (59%) at −1.08R, FAST: median 2 bars, 23/30 within 3. The 8 timeouts pay +0.53R (the survivors). rsi 34, ret20 −2.3 on entry — buying into active downside.",
+        "lesson": "Capitulation-bounce longs catch a falling knife (59% stop, median 2 bars). Oversold (rsi 34) is not a bottom — wait for a reversal confirmation (higher-low, reclaim of a level, volume climax); the trades that survive the first bounce pay well (+0.53R timeouts)."
+      },
+      {
+        "lane": "lane_mo_breakout20",
+        "n": 40,
+        "failure_mode": "thesis-wrong",
+        "evidence": "LONG, win 37.5%, mean_r −0.274. sl 20 (50%) at −1.04R, only 2 TP in 40. Losers strongly more extended/volatile: atr_pct 1.21 vs 0.60 win, ret20 4.81 vs 2.28, px_vs_ema200 3.56 vs 2.89. SNDK/SKHYNIX drove loss.",
+        "lesson": "20-bar breakout on high ATR is a chase (2/40 targets, 50% stop). Winners come from LOW-ATR breakouts (0.60 vs 1.21) — require atr_pct < ~0.8 and ret20 < ~3% so you break out of a base, not mid-parabola, and exclude stock-proxy names."
+      },
+      {
+        "lane": "lane_momo_breakdown_short",
+        "n": 46,
+        "failure_mode": "mixed",
+        "evidence": "SHORT, win 34.8%, mean_r −0.043 (near BE). sl 20 (43%) at −1.04R, timeout 17(+0.07R), tp 9(+1.96R). Losers slightly more extended down (ret20 −4.73 vs −4.05 win). Nearly the cleanest of the shorts.",
+        "lesson": "Near break-even breakdown short with a faint chase tilt. Small extension cap (skip ret20 < ~−4.5%) plus dropping the worst stock-proxy symbols likely flips it positive; keep and refine rather than kill."
+      },
+      {
+        "lane": "lane_mo_ema_stack_trend",
+        "n": 52,
+        "failure_mode": "mixed",
+        "evidence": "LONG, win 38.5%, mean_r −0.025 (nearly BE). sl 26 (50%), timeout 20 at +0.40R (strongly positive), tp 6(+2.96R). STRONGEST extension separator in the set: losers px_vs_ema200 6.83 vs 3.28 win, atr_pct 1.46 vs 0.78, ret20 4.83 vs 2.56.",
+        "lesson": "The cleanest fixable lane: losses cluster almost entirely on extended/high-ATR entries (px_vs_ema200 6.8, atr 1.5) while calm entries win and even timeouts pay +0.40R. Add a single gate — skip px_vs_ema200 > ~5 or atr_pct > ~1.2 — and this likely turns positive."
+      },
+      {
+        "lane": "lane_mo_ema_stack_dn",
+        "n": 48,
+        "failure_mode": "mixed",
+        "evidence": "100% SHORT. Exit mix: SL 54% @ r=-1.04, timeout 46% @ r=+0.24, TP 0% (ZERO winners ever reached target in 48 trades). meanR -0.453, win 29%, totnet -0.435 — WORSE than the L00_random floor (-0.412R). Shorts entered below 200EMA (px_vs_ema200 med -2.08) into already-soft RSI 36, ret20 -1.86. Downside never follows through to TP; timeouts drift mildly green then decay, and half gap up to a bounce-stop. bars_held med 20. Worst: SNDK/MU/SOXL/SAMSUNG (equity perps).",
+        "lesson": "Shorting an EMA-stack-down below the 200EMA into oversold RSI is anti-edge here: the target is never reached (0% TP) so all upside is capped at a timeout while bounces pay the full -1.04R stop. Do not short into RSI<40 continuation; require the move to still have room to TP (RSI mid-band) and skip illiquid equity perps."
+      },
+      {
+        "lane": "lane_mo_roc_dn",
+        "n": 61,
+        "failure_mode": "mixed",
+        "evidence": "100% SHORT. SL 54% @ r=-1.04, timeout 43% @ r=+0.33, TP 3% @ r=2.46. meanR -0.344, win 34%, totnet -0.378. Entry chases a down-impulse: ret5 med -1.84, ret20 -1.91, RSI 37, below 200EMA. bars_held med 15. Only 2 of 61 hit TP. Worst: SKHYNIX (-0.128 alone), SOXL, SNDK, XAG.",
+        "lesson": "Chasing negative ROC (selling the down-candle) mean-reverts: 97% of trades never reach TP, so the strategy is structurally short-gamma — small favorable drift capped by timeout, full stop on the bounce. Shorting momentum-exhaustion needs a pullback entry, not entry at ret5 -1.8%."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_short",
+        "n": 60,
+        "failure_mode": "timeout-bleed",
+        "evidence": "100% SHORT. Exit mix dominated by timeout 68% @ r=-0.06, SL only 30% @ r=-1.05, TP 2% @ r=1.95. meanR -0.327, win 27%, totnet -0.294. Entry is a high-vol breakdown candle (vol_ratio med 2.38) at RSI 33. bars_held med 16 = the timeout cap. Two-thirds of trades just decay flat-negative to the timeout.",
+        "lesson": "Triangle breakDOWN shorts have no follow-through — 68% time out near flat, only 1 in 50 reaches TP. The vol_ratio 2.38 means it enters ON the breakout candle (worst fill). Breakout-continuation setups need a follow-through filter (close beyond the level on the NEXT bar) or they are pure timeout-bleed."
+      },
+      {
+        "lane": "lane_M15_MOM_BEAR_PULLBACK_REJECT_06",
+        "n": 32,
+        "failure_mode": "mixed",
+        "evidence": "100% SHORT. SL 47% @ r=-1.05, timeout 50% @ r=-0.28, TP 3% @ r=2.21. meanR -0.564 (the WORST of all lanes, far below the -0.412 random floor), win 15.6%. Entry: bear pullback rejection at vol_ratio 2.45, RSI 34, below 200EMA. Half the book stops out, the other half bleeds negative to timeout — almost nothing wins. n=32 is thin (5-day window).",
+        "lesson": "This setup is actively harmful (meanR below random). A 'bear pullback reject' short at RSI 34 / vol 2.45 both stops AND bleeds — no configuration of the exit saves a 15% win rate. Kill it; if kept, it needs a completely different trigger (it is fading strength that isn't there)."
+      },
+      {
+        "lane": "lane_mo_breakdown20",
+        "n": 25,
+        "failure_mode": "mixed",
+        "evidence": "100% SHORT. timeout 60% @ r=-0.19, SL 40% @ r=-1.04, TP 0% (never), win 12%, meanR -0.529 (below random floor). Entry shorts a 20-bar low at RSI 30 (selling the bottom), ret20 -2.30, vol_ratio 2.60. bars_held med 20. Small n=25.",
+        "lesson": "Shorting a fresh 20-bar breakdown at RSI 30 sells directly into exhaustion: 0% ever reach TP, 60% bleed to timeout, 40% stop on the bounce. Momentum-breakdown shorts must be gated OUT when RSI<35 (already oversold) — you are shorting the low."
+      },
+      {
+        "lane": "lane_owner_4h_bear_state_short",
+        "n": 28,
+        "failure_mode": "mixed",
+        "evidence": "100% SHORT. SL 61% @ r=-1.04, timeout 32% @ r=+0.17, TP 7% @ r=1.96, win 29%, meanR -0.436 (below random). Deepest-below-trend entries (px_vs_ema200 med -3.12) in high vol (atr% 1.39). bars_held med 9 = fast stop-outs. Worst: DRAM/BZ/INTC/SKHYNIX. n=28 thin.",
+        "lesson": "A 4H 'bear-state' short entered 3%+ below the 200EMA in 1.4% ATR gets stopped fast (9 bars, 61% SL) on volatile snapbacks. High-ATR deep-below-trend shorts need a wider structural stop or a pullback entry; entering extended into high vol guarantees noise stop-outs."
+      },
+      {
+        "lane": "lane_L_SQ_IGN_01",
+        "n": 79,
+        "failure_mode": "mixed",
+        "evidence": "100% LONG. SL 58% @ r=-1.10 (note stop realizes 1.10R, not 1.0 = slippage on ignition candle), timeout 28% @ r=+0.03, TP 14% @ r=1.90, win 28%, meanR -0.367 (beats random floor slightly). Squeeze-ignition long at RSI 57, vol_ratio 1.74, price ~at 200EMA. bars_held med 6 = fast fails. n=79 (more trustworthy).",
+        "lesson": "Squeeze-ignition longs fail fast (median 6 bars) and their stops slip to -1.10R on the ignition candle. A 14% TP@1.9R cannot cover a 58% stop rate. Either the ignition trigger is a fakeout (needs volume/CVD confirmation) or the stop is inside the noise band — widen the stop and confirm the breakout, or the 58% stop rate kills it."
+      },
+      {
+        "lane": "lane_L_MOM_200_RECLAIM_BURST",
+        "n": 39,
+        "failure_mode": "mixed",
+        "evidence": "100% LONG. SL 56% @ r=-1.06, timeout 33% @ r=-0.07, TP 10% @ r=1.94, win 23%, meanR -0.420 (≈ random floor, i.e. no edge). Entry buys the burst candle reclaiming the 200EMA: ret5 med +1.46, RSI 60, px just above 200EMA. SOXL alone -0.074. n=39.",
+        "lesson": "Buying the 200EMA-reclaim BURST (ret5 +1.5% on entry bar) chases the candle and reverses — 56% stop out, expectancy sits ON the random floor. Reclaim setups must be bought on the pullback/retest of the reclaimed level, not on the impulse bar."
+      },
+      {
+        "lane": "lane_ema_stack_long",
+        "n": 113,
+        "failure_mode": "timeout-bleed",
+        "evidence": "100% LONG. Best/least-broken lane: win 42.5%, meanR -0.100, totnet -0.225 over the largest sample (n=113). Exit: SL 40% @ r=-1.04, timeout 41% @ r=+0.07 (flat), TP 19% @ r=1.46. Clean trend-follow context: px_vs_ema200 +2.66, RSI 64, ret20 +1.98. The killer is the small TP payoff (1.46R) plus 41% of trades dying flat at the timeout. Expectancy: 0.19*1.46 + 0.41*0.07 + 0.40*-1.04 = -0.11R.",
+        "lesson": "This is the closest thing to an edge (42% win in a real uptrend) but the R:R is upside-down: a 1.46R average winner cannot pay for a 40% stop rate + 41% flat timeouts + the -1.04R stop drag. Let winners run (trail instead of fixed 1.5R TP) and tighten the timeout so flat trades exit cheaper — the direction works, the exit math doesn't."
+      },
+      {
+        "lane": "lane_L00_random",
+        "n": 52,
+        "failure_mode": "mixed",
+        "evidence": "RANDOM control (mixed 27 LONG / 25 SHORT). meanR -0.412, win 23%, totnet -0.214. SL 73% @ r=-1.08, timeout 23% @ r=+0.65, TP 4% @ r=5.92 (a couple of lucky runners). This is the alpha FLOOR: with no signal, structural cost = ~-0.41R per trade, and stops realize -1.08R (fee+slippage). Timeout median 48 bars (no exit logic pulling it).",
+        "lesson": "This is the yardstick, not a strategy: any lane whose meanR is not clearly better than -0.41R has demonstrated NO edge. mo_ema_stack_dn (-0.453), M15_MOM_BEAR (-0.564), mo_breakdown20 (-0.529), owner_4h_bear (-0.436) all sit at or BELOW random = actively harmful and should be killed, not tuned."
+      },
+      {
+        "lane": "lane_mo_roc_up",
+        "n": 72,
+        "failure_mode": "noise-stop",
+        "evidence": "win29% meanr-0.159. Exits: SL60% @-1.04, timeout24% @+0.234, TP17% @+2.46R. Survivors (timeouts) drift clearly positive and winners pay +2.46R, but 60% get shaken out at the -1R stop first. LONG momentum (rsi66, ret20+4.7, atr1.38%, vol1.79). Worst: SKHYNIX -0.078/6, EDGE -0.050/6.",
+        "lesson": "The signal has edge (timeout r +0.23, TP +2.46R) but the -1R stop is too tight for atr1.38% momentum names. Widen to a structure/ATR stop (~1.5-2x) and the 60% SL rate collapses; do not kill this lane."
+      },
+      {
+        "lane": "lane_mo_persist_up",
+        "n": 57,
+        "failure_mode": "noise-stop",
+        "evidence": "win32% meanr-0.108. SL60% @-1.04, timeout23% @+0.355, TP18% @+2.46R (bars cap 20). Survivors strongly positive (+0.355) and TP big, yet 60% stop out. LONG persistence rsi68, ret20+5.55, atr1.41%. Worst: ARB -0.074/5, EDGE/MU/SOXL -0.062 each.",
+        "lesson": "Same defect as mo_roc_up: real momentum edge strangled by a stop tighter than the noise. The +0.355 survivor drift proves the thesis; fix is stop width/entry-on-pullback, not signal removal."
+      },
+      {
+        "lane": "lane_mo_roc_dn",
+        "n": 61,
+        "failure_mode": "noise-stop",
+        "evidence": "win34% meanr-0.344 (sumnet-0.378, biggest $ loss). SL54% @-1.04, timeout43% @+0.330, TP only 3% (2/61) @+2.46R. Survivors drift very favorably but the far TP is almost never reached inside 18 bars, so favorable drift never gets banked while 54% stop. SHORT rsi37, dd96-7.4%. Worst: SKHYNIX -0.128/7, SOXL -0.061/5.",
+        "lesson": "Payoff-geometry failure: target too far (2.46R hit 3% of time) + stop too tight (54% SL). Bring TP in to ~1R and/or trail so the +0.33 survivor edge is captured before the time cap expires."
+      },
+      {
+        "lane": "lane_mo_ema_stack_dn",
+        "n": 48,
+        "failure_mode": "noise-stop",
+        "evidence": "win29% meanr-0.453 (worst mean r here). SL54% @-1.04, timeout46% @+0.240, TP 0/48 — never once hit. SHORT ema_stack-1, rsi36, px_vs_ema200-3.6%, cap 24 bars. Survivors grind down (+0.24) but target is unreachable; 54% stop first. Worst: SNDK/MU -0.083 each.",
+        "lesson": "Textbook broken bracket: a TP that fills 0/48 is not a target, it is a guarantee of death-by-stop-and-timeout. This lane is a pure geometry bug — retune TP to something reachable (~0.8-1R) before judging the short-EMA signal."
+      },
+      {
+        "lane": "lane_mo_breakout20",
+        "n": 40,
+        "failure_mode": "noise-stop",
+        "evidence": "win38% meanr-0.274. SL50% @-1.04, timeout45% @+0.272, TP 5% (2/40). LONG 20-bar breakout bought at highs: rsi72, vol3.63, close_pos0.82. Half are false breakouts that revert to stop, the rest stall out positive but never reach the far target.",
+        "lesson": "Buying the breakout candle at close_pos0.82 hands you the false-breakout stop-hunt (50% SL). Enter on the retest not the break, and set a reachable TP — survivors' +0.27 drift shows continuation exists when you aren't stopped on the fakeout."
+      },
+      {
+        "lane": "lane_mo_supertrend_dn",
+        "n": 52,
+        "failure_mode": "noise-stop",
+        "evidence": "win40% meanr-0.140. timeout60% @+0.212, SL37% @-1.04, TP 4% (2/52), cap 24 bars. Majority time out favorably (+0.212) but the 37% stopped at -1R plus a near-unreachable TP net it negative. SHORT rsi39. Worst: SNDK -0.082/5, SOXL -0.062/3.",
+        "lesson": "Slow trend-follow whose favorable drift never reaches a distant TP within 24 bars while occasional -1R stops bleed it. Add a time-based partial/trail to bank the +0.21 survivor edge rather than round-tripping to timeout."
+      },
+      {
+        "lane": "lane_ema_stack_long",
+        "n": 113,
+        "failure_mode": "mixed",
+        "evidence": "largest sample. win42% meanr-0.100. SL40% @-1.04, timeout41% @+0.074 (~flat), TP19% @+1.46R. Buying strength (rsi64, vol2.03) chops: 40% stop, 41% go nowhere, only 19% reach target. Losses spread thin (BLUR -0.062/3, HYPE -0.042/4).",
+        "lesson": "Marginal-negative with no single dominant leak: half the trades whipsaw to stop, half die at ~breakeven timeout. Needs both a tighter entry filter (only fresh stacks, not extended rsi64) and a nearer TP; as-is it's a coin-flip minus fees."
+      },
+      {
+        "lane": "lane_rsi_dip_in_uptrend",
+        "n": 89,
+        "failure_mode": "noise-stop",
+        "evidence": "win40% meanr-0.029, sumnet-0.039 — closest to breakeven of all lanes. SL43% @-1.05, timeout39% @+0.179, TP18% @+1.95R. Buy rsi41 dip while px_vs_ema200+1.79 (genuine uptrend). Survivors positive; 43% stopped on the dip's overshoot.",
+        "lesson": "This is the least-broken lane and the best base to fix — dips in real uptrends work on survivors (+0.18). A slightly wider stop below the dip low likely flips it positive; treat as a near-edge, not a reject."
+      },
+      {
+        "lane": "lane_SQZ_S_quiet_bear_push",
+        "n": 84,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win30% meanr-0.311. SL65% @-1.10 (dominant), TP25%, timeout only10% @-0.033, fast bars_held6. SHORT fired at rsi39, ret20-1.8%, vol_ratio0.59 (quiet/low-vol), dd96-6.9% — i.e. already extended down. 65% stop on the mean-revert bounce. Worst: MU -0.053/6, HYPE -0.035/9.",
+        "lesson": "Shorting a quiet, already-oversold down-push is late — the bounce runs your stop 65% of the time in ~6 bars. Wider stops won't save a -EV entry; require a lower-high/rally first or flip to fading the bounce."
+      },
+      {
+        "lane": "lane_S_SQZ_QUIET_ROLL",
+        "n": 74,
+        "failure_mode": "noise-stop",
+        "evidence": "win32% meanr-0.155. SL54% @-1.08, timeout26% @+0.152, TP20% @+1.92R. SHORT rsi38.6, vol0.57, dd96-7.5% (oversold/quiet). Unlike its sister lane the timeout drift is clearly positive (+0.152), so survivors do roll over — but 54% get bounced to stop first.",
+        "lesson": "Borderline: the roll-down edge is real on survivors (+0.15) yet the -1R stop is too tight against oversold-bounce noise. Widen stop or enter on the failed retest; do not conflate with the truly -EV quiet_bear_push."
+      },
+      {
+        "lane": "lane_owner_4h_bear_state_short",
+        "n": 28,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win29% meanr-0.436. SL61% @-1.04, timeout32% @+0.174, TP 7%. SHORT into a deeply extended tape: dd96-8.59% (deepest of all lanes), px_vs_ema200-4.24%, ret5-1.73%. Chasing the 4h-bear breakdown after an 8.6% drop → 61% bounce-stopped. Worst: DRAM/BZ/INTC -0.042 each.",
+        "lesson": "'4h bear state' + dd96-8.6% = you are shorting the bottom of the move. The bounce is the highest-probability next event. Gate this lane OFF when dd96 < ~-6%; only short bear-state on retraces toward the mean."
+      },
+      {
+        "lane": "lane_S_SQ_IGN_01",
+        "n": 83,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win28% meanr-0.326. SL58% @-1.10, timeout25% @-0.039 (negative), TP17% @+1.90R, bars7.6. SHORT squeeze-ignition that reverses: even the non-stopped trades finish underwater (timeout -0.039). rsi43, vol2.41. Worst: ETH -0.027/6, HYPE -0.025/6.",
+        "lesson": "The 'ignition' fires the wrong way — negative survivor drift means it's not a stop-width problem, the directional call is wrong. Needs directional confirmation (CVD/close-through) before entry or the short side inverted."
+      },
+      {
+        "lane": "lane_L_SQ_IGN_01",
+        "n": 79,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win28% meanr-0.367. SL58% @-1.10, timeout28% @+0.031 (~flat), TP14% @+1.90R. LONG mirror of S_SQ_IGN: only 14% reach target, 58% stop, survivors flat. rsi57, vol2.06, ema_stack~0 (no real trend). Worst: BZ -0.035/4, DOGE -0.030/4.",
+        "lesson": "Squeeze 'ignition' with ema_stack≈0 fires in directionless tape → 58% SL / 14% TP. The squeeze-break trigger has no edge without a trend context filter; require ema_stack alignment before taking the break."
+      },
+      {
+        "lane": "lane_S_MR_DIV_01",
+        "n": 41,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win29% meanr-0.259. SL66% @-1.06 (dominant), TP24% @+1.80R, timeout10% @-0.019, fast bars5.7. SHORT bearish-divergence while ret20+4.6% (price still rising). 66% stop as the rally simply continues through the 'divergence'. Worst: DRAM/SAMSUNG -0.074 each.",
+        "lesson": "Divergence is not a reversal — shorting into a +4.6% ret20 rally gets run 66% of the time in <6 bars. Wait for structure to actually break (lower high + close-below) before trading the div short."
+      },
+      {
+        "lane": "lane_M15_MOM_BEAR_PULLBACK_REJECT_06",
+        "n": 32,
+        "failure_mode": "thesis-wrong",
+        "evidence": "WORST lane: win16% meanr-0.564. timeout50% @-0.278 (deeply negative), SL47% @-1.05, TP 3% (1/32). SHORT rsi33.8 (already oversold), vol3.27, close_pos0.21. Both stopped AND survived trades lose — even timeouts sit at -0.278.",
+        "lesson": "Everything loses because you're shorting an already-oversold pullback (rsi34) that keeps bouncing — negative survivor drift proves the direction is wrong, not the stop. This lane is worse than random; kill or invert it."
+      },
+      {
+        "lane": "lane_L_MOM_200_RECLAIM_BURST",
+        "n": 39,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win23% meanr-0.420. SL56% @-1.06, timeout33% @-0.070 (negative), TP10% @+1.94R. LONG on an ema200 reclaim that turns out false: survivors also bleed (-0.07). rsi59, ema_stack0. Worst: SOXL -0.074/5.",
+        "lesson": "The 'reclaim burst' is mostly a failed reclaim — price rejects back below ema200 (56% SL, negative timeout). Demand a confirmed hold/retest above ema200 with ema_stack>0, not the first burst through it."
+      },
+      {
+        "lane": "lane_rsi_overbought_fade",
+        "n": 104,
+        "failure_mode": "mixed",
+        "evidence": "win39% meanr-0.063 (small loss, big sample). SL47% @-1.05, timeout28% @+0.107, TP25% @+1.61R. SHORT fade of rsi74.9 (ret20+5.2, vol2.53). The fade pays 25% of the time and survivors drift +0.107, but 47% get run over as the strong uptrend extends. Worst: META -0.077/7, BZ -0.056/9.",
+        "lesson": "Counter-trend fade of strength: real reversion payoff (25% TP) offset by momentum continuation stops (47% SL). Only fade rsi>75 with an exhaustion trigger (bearish engulf/CVD roll); blind fade of ret20+5% is a coin-flip minus fees."
+      },
+      {
+        "lane": "lane_MR_S_blowoff_fade",
+        "n": 66,
+        "failure_mode": "noise-stop",
+        "evidence": "win32% meanr-0.229. SL64% @-1.08, TP26% @+1.72R, timeout11% @+0.147, fastest bars5.0. SHORT blowoff rsi66, vol2.92 (highest vol lane), ret5+2.8%. Survivors positive and 26% hit TP, but the -1R stop is tiny vs a vol2.92 blowoff so 64% get wicked out. Worst: SNDK -0.069/9.",
+        "lesson": "Fading a blowoff needs a stop sized to the blowoff's volatility — a fixed -1R on vol2.92 spikes gets wicked 64% of the time. Place the stop above the blowoff high (structure), not at fixed R, to keep the 26% reversion payoff."
+      },
+      {
+        "lane": "lane_ema20_pullback_long",
+        "n": 102,
+        "failure_mode": "timeout-bleed",
+        "evidence": "win38% meanr-0.060. timeout56% @+0.016 (dead flat, dominant), SL29%, TP15% @+1.62R. Fires in dead tape: atr0.80%, vol_ratio1.05 (no expansion), ret20+0.15%, ema_stack0.46. Over half the trades simply expire at ~breakeven having gone nowhere.",
+        "lesson": "The pullback-to-EMA20 triggers with zero volatility/volume behind it, so 56% drift to a flat timeout. Add an expansion gate (vol_ratio>1.3 or atr rising) so it only fires when the bounce has energy — otherwise it's fee-bleed."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_short",
+        "n": 60,
+        "failure_mode": "timeout-bleed",
+        "evidence": "win27% meanr-0.327. timeout68% @-0.064 (dominant), SL30%, TP just 1/60. SHORT triangle-break in atr0.51% (lowest-vol lane) at rsi33 (already oversold), vol2.95. The 'breakdown' never continues — 68% expire slightly negative, target essentially never hit.",
+        "lesson": "A triangle breakdown into atr0.51% chop at rsi33 has no room left to fall — 1 TP in 60 trades. This is a dead-tape / already-oversold combo; require atr expansion AND rsi>40 room before shorting the break, or skip low-ATR triangles entirely."
+      },
+      {
+        "lane": "lane_L_NEUTRAL_VOL_BREAK",
+        "n": 38,
+        "failure_mode": "mixed",
+        "evidence": "win26% meanr-0.365. timeout53% @-0.037 (slightly negative, dominant), SL42% @-1.05, TP 5% (2/38). LONG vol-break from a neutral base (ret20-0.05%, px_vs_ema200-1.36%) that fails to sustain: half die at negative timeout, 42% stop, target almost never reached.",
+        "lesson": "Breaking out of a neutral/below-ema200 base has no trend tailwind — the break stalls (53% timeout) or reverses (42% SL). Only take vol-breaks aligned with px_vs_ema200>0; a break from neutral is a low-conviction fade of your own signal."
+      },
+      {
+        "lane": "lane_L00_random",
+        "n": 52,
+        "failure_mode": "thesis-wrong",
+        "evidence": "RANDOM control (both sides, LONG27/SHORT25). win23% meanr-0.412. SL73% @-1.08, timeout23% @+0.648 (48-bar cap), TP 4%. No thesis by construction — with a -1R stop and long horizon, random entries just get stopped 73% of the time.",
+        "lesson": "This is the alpha floor / control: meanr-0.41 at random. Any real lane not beating -0.41 (e.g. mo_ema_stack_dn -0.45, M15_MOM_BEAR -0.56) has NEGATIVE edge, not just a bracket bug — use L00 as the kill-threshold benchmark."
+      },
+      {
+        "lane": "lane_mo_ema_stack_dn",
+        "n": 48,
+        "failure_mode": "noise-stop",
+        "evidence": "win 29%, meanR -0.45, medR -1.04. Exits: SL 54% @ -1.04R, timeout 46% @ +0.24R, TP 0%. Survivors drift favorable (timeout +0.24R) yet 0/48 ever reach target while 26 get stopped full -1R. Entry is a SHORT into an already-oversold/extended-down tape (mean rsi14 36, dd96 -7.3%, px_vs_ema200 -3.6%). Worst: SNDK/MU/SOXL (equity-proxy tickers with up-drift).",
+        "lesson": "Stop shorting continuation AFTER the drop is spent (rsi<40, dd96<-7%): snapback bounces hit the -1R stop before the far TP prints. Either enter shorts on a lower-high retrace (not into oversold), tighten TP to what a 15-20 bar hold can realistically reach, or drop this setup on up-drifting equity-proxy symbols entirely."
+      },
+      {
+        "lane": "lane_mo_roc_dn",
+        "n": 61,
+        "failure_mode": "noise-stop",
+        "evidence": "win 34%, meanR -0.34, medR -1.04. Exits: SL 54% @ -1.04R, timeout 43% @ +0.33R, TP only 3% (2) @ +2.46R. Non-stopped shorts drift the right way (+0.33R) but almost never reach TP; 33 stops at full -1R sink it. SHORT into ret5 -1.8%, rsi 37, vol_ratio 1.8. Worst: SKHYNIX -0.128 (7 trades), SOXL, SNDK.",
+        "lesson": "The down-ROC has real directional lean (favorable timeout drift) but the -1.04R stop is too tight for the noise and TP too far to catch. Move the stop beyond the last swing/1.5xATR and pull TP in, or the 2 winners at +2.46R can never pay for 33 full stops. Blacklist SKHYNIX/SOXL for shorts."
+      },
+      {
+        "lane": "lane_tiktok_triangle_brk_short",
+        "n": 60,
+        "failure_mode": "timeout-bleed",
+        "evidence": "win 27%, meanR -0.33. Exits dominated by timeout 68% @ -0.064R, SL 30% @ -1.05R, TP 2% (1). Very low ATR at entry (atr_pct 0.51) with vol_ratio 2.95 — a volume spike into a tight triangle that then goes nowhere. 41 of 60 just bleed to timeout at small loss.",
+        "lesson": "Triangle-breakout shorts have NO follow-through: the volume spike is exhaustion, not initiation. Two-thirds drift flat to timeout. Require a post-break momentum/close confirmation (e.g. close < break level after N bars) before entry, or kill the setup — as-is it only pays exchange fees."
+      },
+      {
+        "lane": "lane_M15_MOM_BEAR_PULLBACK_REJECT_06",
+        "n": 32,
+        "failure_mode": "mixed",
+        "evidence": "Worst risk-adj of the set: win 16%, meanR -0.56, medR -0.91. Loses BOTH ways: timeout 50% @ -0.278R AND SL 47% @ -1.05R, TP 3% (1). Entries in very high vol (vol_ratio 3.27) shorting a bearish pullback (rsi 34, ret5 -1.4%). No favorable drift anywhere.",
+        "lesson": "This has zero edge in either direction — non-stopped trades still bleed (-0.28R) and half stop full. Shorting a bear-pullback-rejection in vol_ratio>3 chop just gets chopped. Retire the setup or gate it hard to low-vol trending regimes; do not size it."
+      },
+      {
+        "lane": "lane_mo_breakdown20",
+        "n": 25,
+        "failure_mode": "timeout-bleed",
+        "evidence": "win 12% (lowest), meanR -0.53. Exits: timeout 60% @ -0.188R, SL 40% @ -1.04R, TP 0%. Shorting a 20-bar low breakdown (rsi 30, ret20 -2.8%, vol_ratio 3.36) — 0/25 reach target, 15 fizzle to timeout at small loss. Worst: SPCX/SAMSUNG/SNDK.",
+        "lesson": "Breakdown-to-new-lows shorts have no continuation here — the break is already the capitulation, so 60% chop out flat and none run. Fade-the-breakdown (mean-revert long the flush) would likely beat shorting it; at minimum require breakdown + a retest-rejection before entry."
+      },
+      {
+        "lane": "lane_owner_4h_bear_state_short",
+        "n": 28,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win 29%, meanR -0.44, medR -1.04. SL-dominant: SL 61% @ -1.04R vs timeout 32% @ +0.17R, TP 7%. 17 of 28 shorts get run over at full stop; median 9 bars. Entry in high ATR (1.55%) 4h-bear-state (rsi 44). Worst: DRAM/BZ/INTC/SKHYNIX.",
+        "lesson": "A 4h 'bear state' label does not mean the next 15m goes down — 61% of these shorts get stopped by bounces. The higher-timeframe bias is being used as a trigger, not a filter. Only take shorts when the LTF also confirms (lower-high, momentum roll); never short blind off the 4h regime tag."
+      },
+      {
+        "lane": "lane_L_SQ_IGN_01",
+        "n": 79,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win 28%, meanR -0.37, medR -1.1. SL 58% @ -1.1R, timeout 28% @ +0.03R (flat), TP 14% @ +1.9R. Fast median 6 bars → failed ignitions reverse quickly. Long squeeze-ignition (rsi 57, vol_ratio 2.06, close_pos 0.67). Broadly spread losses (BZ/DOGE/SOL/CL).",
+        "lesson": "The squeeze 'ignition' long is a false-break most of the time: 58% reverse to the -1.1R stop within ~6 bars and timeouts are dead flat. The volume expansion is not predictive of direction. Demand a follow-through bar (higher high + hold) post-ignition, or the 11 TPs can't cover 46 full stops."
+      },
+      {
+        "lane": "lane_L_MOM_200_RECLAIM_BURST",
+        "n": 39,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win 23%, meanR -0.42, medR -1.06. SL 56% @ -1.06R, timeout 33% @ -0.07R, TP 10% @ +1.94R. Long the reclaim of EMA200 on a burst (rsi 59, ret5 +1.9%, px_vs_ema200 +1.5%) — but 22/39 stop full; even survivors bleed slightly negative. Worst: SOXL -0.074 (5 trades).",
+        "lesson": "Buying the EMA200 'reclaim burst' is buying a bull trap here — the reclaim fails 56% of the time and non-stopped trades don't drift up either. Wait for a successful retest that HOLDS above EMA200 rather than chasing the reclaim candle. SOXL reclaims especially fail."
+      },
+      {
+        "lane": "lane_ema_stack_long",
+        "n": 113,
+        "failure_mode": "mixed",
+        "evidence": "Largest sample, closest to breakeven: win 43%, meanR -0.10, medR -0.18. Balanced exits: SL 40% @ -1.04R, timeout 41% @ +0.07R, TP 19% @ +1.46R. Entries are extended: mean rsi14 64, ret20 +3.1%, px_vs_ema200 +4.6%. Worst: BLUR/SPCX/HYPE.",
+        "lesson": "A near-miss, not a disaster: 43% win with +1.46R TPs is almost viable, but it's buying an already-extended stack (+4.6% over EMA200, rsi 64) so pullbacks clip 40% at full stop. Add an extension gate (skip when px_vs_ema200 > ~3% or rsi > 68) and let TP run past +1.46R — this lane is the one worth trying to fix, not kill."
+      },
+      {
+        "lane": "lane_S_SQ_IGN_01",
+        "n": 83,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win 28%, meanR -0.33, medR -1.1. SL 58% @ -1.1R, timeout 25% @ -0.04R, TP 17% @ +1.9R. Short mirror of L_SQ_IGN — 48/83 shorts stop full at -1.1R as the squeeze ignites UP against them; timeouts flat-negative. rsi 43, vol_ratio 2.41. Spread across ETH/SAMSUNG/UNI/HYPE.",
+        "lesson": "The short-side squeeze-ignition gets squeezed: 58% reverse up into the -1.1R stop and survivors don't drift down. Volume-ignition is directionally random; shorting it into a bid is worst-case. Same fix as long side — require confirmed lower-high follow-through, otherwise retire."
+      },
+      {
+        "lane": "lane_L00_random",
+        "n": 52,
+        "failure_mode": "mixed",
+        "evidence": "RANDOM control lane (both sides, 27L/25S). win 23%, meanR -0.41. SL 73% @ -1.08R, timeout 23% @ +0.65R (2 fluke TPs @ +5.92R), no repeatable structure. This is the no-edge baseline: random entries + asymmetric -1.08R stop + costs = -0.41R floor.",
+        "lesson": "This is the benchmark, not a strategy: any real lane whose meanR is not clearly better than ~-0.41R is statistically indistinguishable from coin-flip entries plus cost/stop drag. Use L00's -0.41R meanR and 73% stop rate as the bar every other lane must clear before it earns capital."
+      },
+      {
+        "lane": "lane_SQZ_S_quiet_bear_push",
+        "n": 84,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win 30%, meanR -0.31, medR -1.1. SL 65% @ -1.1R, TP 25% @ +1.65R, timeout only 10% @ -0.03R. Very fast median 3.5 bars — stops hit almost immediately. Entry shorts a 'quiet' low-volume drift (vol_ratio 0.59, rsi 39, ret20 -1.8%). Worst: MU -0.053 (6), HYPE -0.035 (9).",
+        "lesson": "Shorting a quiet low-volume bear drift gets squeezed within ~4 bars: vol_ratio 0.59 means no seller conviction, so bounces stop 65% almost instantly. 'Quiet' is the opposite of the momentum a breakdown short needs — require rising sell volume (vol_ratio > 1) to confirm the push before shorting."
+      },
+      {
+        "lane": "lane_mo_breakout20",
+        "n": 40,
+        "failure_mode": "noise-stop",
+        "evidence": "win 38%, meanR -0.27, medR -0.86. SL 50% @ -1.04R, timeout 45% @ +0.27R, TP 5% (2) @ +2.46R. Survivors drift favorable but 20/40 stopped; entries very extended (rsi 72, px_vs_ema200 +3.3%, vol_ratio 3.6, close_pos 0.82). Worst: SNDK -0.083, SKHYNIX -0.062.",
+        "lesson": "Buying the 20-bar-high breakout at rsi 72 / close_pos 0.82 is chasing the top candle — the initial pullback stops half the trades before the (rare) +2.46R runner. Favorable timeout drift says the breakouts do eventually work; enter on the first pullback-hold after the break instead of the extended breakout bar."
+      },
+      {
+        "lane": "lane_L_NEUTRAL_VOL_BREAK",
+        "n": 38,
+        "failure_mode": "timeout-bleed",
+        "evidence": "win 26%, meanR -0.37, medR -0.44. Timeout-plurality: timeout 53% @ -0.04R, SL 42% @ -1.05R, TP 5% (2). Vol-break long in a NEUTRAL regime (ret20 ~0, px_vs_ema200 -1.4%, close_pos 0.76) — 20/38 drift flat to timeout, no trend to ride. Worst: DRAM -0.05, ETH.",
+        "lesson": "A volume breakout with no trend context (neutral regime, price still below EMA200) has nothing to follow through into — half bleed to timeout flat. Gate vol-breaks to a confirmed trend (price above EMA200, ret20 > 0); a breakout in a neutral tape is just noise."
+      },
+      {
+        "lane": "lane_mo_roc_up",
+        "n": 72,
+        "failure_mode": "noise-stop",
+        "evidence": "win 29%, meanR -0.16 (2nd-best), medR -1.04. SL 60% @ -1.04R, timeout 24% @ +0.23R, TP 17% @ +2.46R. Clearest noise-stop signal: 12 TPs at +2.46R and positive survivor drift, yet 43/72 shaken out at full stop. Entries extended: rsi 67, ret20 +4.7%, px_vs_ema200 +3.5%. Worst: SKHYNIX -0.078 (6), EDGE -0.05 (6).",
+        "lesson": "Real upside edge (12x +2.46R winners + favorable timeout drift) is being bled out by a -1.04R stop that's too tight for momentum pullbacks and by chasing at rsi 67 / +4.7% ret20. Widen the stop to survive the first pullback (structure/ATR-based) and/or enter on the retrace — this lane has the best salvage potential after ema_stack_long."
+      },
+      {
+        "lane": "lane_S_SQZ_FLAT_DROP_VOL",
+        "n": 42,
+        "failure_mode": "thesis-wrong",
+        "evidence": "win 19%, meanR -0.46, medR -1.08. SL 62% @ -1.08R, timeout 24% @ -0.27R, TP 14% (6) @ +1.92R. Shorting a flat-to-drop on volume (vol_ratio 2.5, rsi 45, ret5 -1.3%) — 26/42 bounce straight into the stop and timeouts bleed negative too. Fast median 5 bars. Worst: WLD/SPCX/CL.",
+        "lesson": "The 'flat then volume drop' short is a bear trap: 62% reverse up to the -1.08R stop within ~5 bars and even survivors bleed. The volume on the drop is capitulation/absorption, not continuation. Fade it (long the flush) or require a failed retest of the drop level before shorting."
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Diagnose"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Synthesize"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "diagnose:1",
+      "phaseIndex": 1,
+      "phaseTitle": "Diagnose",
+      "agentId": "ad1b46610b29bfc12",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783772910327,
+      "queuedAt": 1783772909807,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All 15 are single-condition directional lanes with a fixed …",
+      "promptPreview": "You are a quant trade-forensics analyst. These losing lane-farm strategies (each a $100 paper account testing one setup) are DOWN. Diagnose WHY each fails, from its trade autopsies in SQLite brain.db.\n\nDB: E:/keo-moi-mail/trading-agent/state/memory/brain.db  (table trade_autopsy; columns: src, symbol, side, net, r, mae_pct, mfe_pct, bars_held, exit_reason, entry_feats(JSON), closed_ts_ms). Each la…",
+      "lastProgressAt": 1783773204346,
+      "tokens": 57776,
+      "toolCalls": 6,
+      "durationMs": 294007,
+      "resultPreview": "{\"lanes\":[{\"lane\":\"lane_mo_ema_stack_dn\",\"n\":48,\"failure_mode\":\"mixed\",\"lesson\":\"Fixed ~1R stop is not vol-normalized: losers fire at ~2x the ATR of winners. Add an atr_pct ceiling (~<0.9%) and stop shorting coins already >4% below EMA200 in deep drawdown (snap-back risk).\",\"evidence\":\"win 29.2%, meanR -0.45 (worse than random -0.41). Exits sl26/timeout22; SL r -1.04, timeout r +0.24 (survivors fi…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "diagnose:2",
+      "phaseIndex": 1,
+      "phaseTitle": "Diagnose",
+      "agentId": "ae1d775509ef7057c",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783772910409,
+      "queuedAt": 1783772909807,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Three shared root causes, all pointing the same way: these …",
+      "promptPreview": "You are a quant trade-forensics analyst. These losing lane-farm strategies (each a $100 paper account testing one setup) are DOWN. Diagnose WHY each fails, from its trade autopsies in SQLite brain.db.\n\nDB: E:/keo-moi-mail/trading-agent/state/memory/brain.db  (table trade_autopsy; columns: src, symbol, side, net, r, mae_pct, mfe_pct, bars_held, exit_reason, entry_feats(JSON), closed_ts_ms). Each la…",
+      "lastProgressAt": 1783773220752,
+      "tokens": 62309,
+      "toolCalls": 6,
+      "durationMs": 310343,
+      "resultPreview": "{\"lanes\":[{\"lane\":\"lane_mo_ema_stack_dn\",\"n\":48,\"failure_mode\":\"noise-stop\",\"evidence\":\"SHORT-only, win 29%, meanR -0.45. Split: 26 SL @ -1.04R (50% stopped within 3 bars) vs 22 timeout @ +0.24R. Survivors are net POSITIVE, so direction is right but the stop shakes half out first. Losers enter already-oversold/extended-down (rsi 36, dd96 -8.5%, ret20 -2.7%, ema_stack -1) — shorting into a hole tha…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "diagnose:3",
+      "phaseIndex": 1,
+      "phaseTitle": "Diagnose",
+      "agentId": "a47ab1fe5e5952a66",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783772910411,
+      "queuedAt": 1783772909807,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Payoff (R:R) is NOT the problem — winners pay 1.5–2.9R vs s…",
+      "promptPreview": "You are a quant trade-forensics analyst. These losing lane-farm strategies (each a $100 paper account testing one setup) are DOWN. Diagnose WHY each fails, from its trade autopsies in SQLite brain.db.\n\nDB: E:/keo-moi-mail/trading-agent/state/memory/brain.db  (table trade_autopsy; columns: src, symbol, side, net, r, mae_pct, mfe_pct, bars_held, exit_reason, entry_feats(JSON), closed_ts_ms). Each la…",
+      "lastProgressAt": 1783773274993,
+      "tokens": 68700,
+      "toolCalls": 7,
+      "durationMs": 364582,
+      "resultPreview": "{\"cluster_pattern\":\"Payoff (R:R) is NOT the problem — winners pay 1.5–2.9R vs stops at ~−1.05R across nearly every lane. The problem is HIT-RATE: win% sits at 27–45%, so expectancy is negative despite good R:R. mfe_pct/mae_pct are NULL (24/4387 rows) so failure mode was read from exit-mix + bars-to-stop + winner/loser feat separation. Three mechanisms recur: (1) CHASE-EXTENSION on momentum longs —…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "diagnose:4",
+      "phaseIndex": 1,
+      "phaseTitle": "Diagnose",
+      "agentId": "a72894efe26e95438",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783772910411,
+      "queuedAt": 1783772909808,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "n/a",
+      "promptPreview": "You are a quant trade-forensics analyst. These losing lane-farm strategies (each a $100 paper account testing one setup) are DOWN. Diagnose WHY each fails, from its trade autopsies in SQLite brain.db.\n\nDB: E:/keo-moi-mail/trading-agent/state/memory/brain.db  (table trade_autopsy; columns: src, symbol, side, net, r, mae_pct, mfe_pct, bars_held, exit_reason, entry_feats(JSON), closed_ts_ms). Each la…",
+      "lastProgressAt": 1783773192085,
+      "tokens": 55013,
+      "toolCalls": 7,
+      "durationMs": 281674,
+      "resultPreview": "{\"command\":\"n/a\",\"lanes\":[{\"lane\":\"lane_mo_ema_stack_dn\",\"n\":48,\"failure_mode\":\"mixed\",\"evidence\":\"100% SHORT. Exit mix: SL 54% @ r=-1.04, timeout 46% @ r=+0.24, TP 0% (ZERO winners ever reached target in 48 trades). meanR -0.453, win 29%, totnet -0.435 — WORSE than the L00_random floor (-0.412R). Shorts entered below 200EMA (px_vs_ema200 med -2.08) into already-soft RSI 36, ret20 -1.86. Downside …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "diagnose:5",
+      "phaseIndex": 1,
+      "phaseTitle": "Diagnose",
+      "agentId": "ae16eab91ba10d91e",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783772910412,
+      "queuedAt": 1783772909808,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All 23 lanes share one exit engine: a fixed ~-1R stop + a f…",
+      "promptPreview": "You are a quant trade-forensics analyst. These losing lane-farm strategies (each a $100 paper account testing one setup) are DOWN. Diagnose WHY each fails, from its trade autopsies in SQLite brain.db.\n\nDB: E:/keo-moi-mail/trading-agent/state/memory/brain.db  (table trade_autopsy; columns: src, symbol, side, net, r, mae_pct, mfe_pct, bars_held, exit_reason, entry_feats(JSON), closed_ts_ms). Each la…",
+      "lastProgressAt": 1783773267425,
+      "tokens": 63677,
+      "toolCalls": 6,
+      "durationMs": 357013,
+      "resultPreview": "{\"lanes\":[{\"lane\":\"lane_mo_roc_up\",\"n\":72,\"failure_mode\":\"noise-stop\",\"evidence\":\"win29% meanr-0.159. Exits: SL60% @-1.04, timeout24% @+0.234, TP17% @+2.46R. Survivors (timeouts) drift clearly positive and winners pay +2.46R, but 60% get shaken out at the -1R stop first. LONG momentum (rsi66, ret20+4.7, atr1.38%, vol1.79). Worst: SKHYNIX -0.078/6, EDGE -0.050/6.\",\"lesson\":\"The signal has edge (tim…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "diagnose:6",
+      "phaseIndex": 1,
+      "phaseTitle": "Diagnose",
+      "agentId": "a657478c3b4894898",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783772910413,
+      "queuedAt": 1783772909808,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All 16 losers share one structural flaw expressed through t…",
+      "promptPreview": "You are a quant trade-forensics analyst. These losing lane-farm strategies (each a $100 paper account testing one setup) are DOWN. Diagnose WHY each fails, from its trade autopsies in SQLite brain.db.\n\nDB: E:/keo-moi-mail/trading-agent/state/memory/brain.db  (table trade_autopsy; columns: src, symbol, side, net, r, mae_pct, mfe_pct, bars_held, exit_reason, entry_feats(JSON), closed_ts_ms). Each la…",
+      "lastProgressAt": 1783773208119,
+      "tokens": 50937,
+      "toolCalls": 5,
+      "durationMs": 297706,
+      "resultPreview": "{\"lanes\":[{\"lane\":\"lane_mo_ema_stack_dn\",\"n\":48,\"failure_mode\":\"noise-stop\",\"evidence\":\"win 29%, meanR -0.45, medR -1.04. Exits: SL 54% @ -1.04R, timeout 46% @ +0.24R, TP 0%. Survivors drift favorable (timeout +0.24R) yet 0/48 ever reach target while 26 get stopped full -1R. Entry is a SHORT into an already-oversold/extended-down tape (mean rsi14 36, dd96 -7.3%, px_vs_ema200 -3.6%). Worst: SNDK/MU…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "synthesize",
+      "phaseIndex": 2,
+      "phaseTitle": "Synthesize",
+      "agentId": "a057e42394e6022f6",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1783773274999,
+      "queuedAt": 1783773274997,
+      "attempt": 1,
+      "promptPreview": "You are the head quant. Below are per-lane failure diagnoses for 30 losing lane-farm strategies on a 15m crypto paper bot. Distill them into DURABLE, GENERAL lessons — the patterns that explain why these families of setups lose on this bot/universe/timeframe, so the method lab stops re-proposing them and the mission avoids them.\n\nPer-lane diagnoses:\n[\n {\n  \"lane\": \"lane_mo_ema_stack_dn\",\n  \"n\": 48…",
+      "lastProgressAt": 1783773369050,
+      "tokens": 66946,
+      "toolCalls": 0,
+      "durationMs": 94051,
+      "resultPreview": "# Bài học bền vững (durable lessons) — vì sao 30 lane này thua\n\n## Executive summary — lý do LỚN NHẤT\n\nCả 30 lane thua vì **một trigger đơn điều kiện (single-condition) được bắn NGAY tại nến exhaustion/extension, ghép với một stop cố định ~1R KHÔNG chuẩn hóa theo volatility** — nên win% chỉ 27–45% trong khi mỗi stop đã ăn phí thành −1.04 đến −1.10R. Cái các lane thiếu không phải \"signal tốt hơn\" m…"
+    }
+  ],
+  "totalTokens": 425358,
+  "totalToolCalls": 37
+}

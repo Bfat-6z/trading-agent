@@ -114,15 +114,9 @@ UNIVERSE_MAX = int(os.environ.get("LLM_TRADER_UNIVERSE_MAX", "220"))  # FULL val
 UNIVERSE_MIN_QVOL = float(os.environ.get("LLM_TRADER_MIN_QVOL", "50000000"))  # LIQUID established coins only: capitulation on $5-20M micro-caps = falling-knife (they dump straight, do not mean-revert). The edge is real only where liquidity is.
 # Binance lists TOKENIZED STOCKS / COMMODITIES / leveraged-ETFs as USDT futures (NVDAUSDT, QQQUSDT,
 # PAXGUSDT, XAUUSDT, MSTRUSDT...). A 15m crypto scalper has no business there (RTH-only moves, gaps,
-# near-zero ATR on pegged gold) — the shadow eval 2026-07-11 caught the bot trading them. Excluded.
-UNIVERSE_EXCLUDE_BASES = {
-    "XAU", "XAG", "PAXG", "GLD", "SLV", "USO", "TLT", "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL",
-    "GOOG", "META", "AMZN", "NFLX", "INTC", "AMD", "INTU", "CRM", "ORCL", "DIS", "JPM", "BAC",
-    "V", "MA", "KO", "PEP", "WMT", "MCD", "HD", "NKE", "BA", "GE", "F", "GM", "SOXL", "SOXX",
-    "QQQ", "SPY", "IWM", "INX", "TQQQ", "SQQQ", "UVXY", "SNDK", "MSTR", "COIN", "HOOD",
-    "RIOT", "MARA", "SQ", "SKHYNIX", "SAMSUNG", "MRVL", "EWY", "SPCX",
-    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR",
-}
+# near-zero ATR on pegged gold) — the shadow eval 2026-07-11 caught the bot trading them. The list is
+# now the shared canonical set in universe_filter.py (one source of truth; MU/DRAM/CRCL added 07-11).
+from universe_filter import NON_CRYPTO as UNIVERSE_EXCLUDE_BASES
 # Owner (2026-07-05): "danh may con vol 1h to thoi ... neu danh chart 1h thi quet
 # 1h, 15m thi quet 15m, 4h thi quet 4h". So the universe is ranked by RECENT money
 # flow on the timeframe we actually trade — not stale 24h volume (a coin can be big
