@@ -285,19 +285,31 @@ def report() -> dict[str, Any]:
         liq = [r for r in rs if r.get("tier") in ("mid", "major")]
         liq_net = [_num(r.get("actual_R")) for r in liq]
         gw = sum(1 for x in gross if x is not None and x > 0)
+        # split BACKFILL (historical = a backtest) from LIVE-forward (src != 'backfill') — the project's
+        # core discipline is "don't trust the backtest, confirm forward". The backfill gives a strong
+        # PRIOR; the LIVE gross is the real test. Verdict keys on LIVE, using backfill only as context.
+        live = [r for r in rs if r.get("src") != "backfill"]
+        lg = [_num(r.get("gross_R")) for r in live]
+        lgw = sum(1 for x in lg if x is not None and x > 0)
+        bf = [r for r in rs if r.get("src") == "backfill"]
+        bfg = _mean([_num(r.get("gross_R")) for r in bf])
         out["by_path"][path] = {
-            "n": len(rs), "n_liq": len(liq),
+            "n": len(rs), "n_liq": len(liq), "n_live": len(live), "n_backfill": len(bf),
             "gross_R": _mean(gross), "gross_win": round(gw / len(rs), 3) if rs else None,
             "net_R_all": _mean([_num(r.get("actual_R")) for r in rs]),
             "net_R_liq": _mean(liq_net),
+            "gross_R_backfill": bfg, "gross_R_live": _mean(lg),
+            "live_win": round(lgw / len(live), 3) if live else None,
             "tp": sum(1 for r in rs if r.get("reason") == "tp"),
             "sl": sum(1 for r in rs if r.get("reason") == "sl"),
             "timeout": sum(1 for r in rs if r.get("reason") == "timeout"),
-            # verdict keys on GROSS (direction) at n>=25: pessimistic, so we only KILL on clearly
-            # negative gross, and FLAG promising on positive gross.
-            "verdict": ("PROMISING" if len(rs) >= 25 and (_mean(gross) or -9) > 0.05 else
-                        "NO-EDGE (even gross)" if len(rs) >= 25 and (_mean(gross) or 9) < -0.10 else
-                        "need n>=25" if len(rs) < 25 else "flat"),
+            # CONFIRMED only when LIVE-forward (not backtest) has n>=25 AND positive gross. Backfill-
+            # positive but not-yet-live-confirmed = "backtest ok, chờ live". Pessimistic exit, so we
+            # KILL on clearly-negative live gross; PROMISING on positive backfill awaiting live.
+            "verdict": ("CONFIRMED (live+)" if len(live) >= 25 and (_mean(lg) or -9) > 0.05 else
+                        "NO-EDGE" if len(rs) >= 30 and (_mean(gross) or 9) < -0.10 else
+                        "backtest ok · chờ live" if (bfg or -9) > 0.05 and len(bf) >= 15 else
+                        "cần thêm mẫu"),
         }
     return out
 

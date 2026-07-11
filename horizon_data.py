@@ -326,23 +326,17 @@ def build() -> dict:
         span_h = round((int(tl[-1]["ts_ms"]) - int(tl[0]["ts_ms"])) / 3_600_000, 1) if len(tl) > 1 else 0.0
         _flag_on = (_os.environ.get("LLM_TRADER_REDESIGN") == "1"
                     or (st / "llm_trader" / "redesign.flag").exists())
-        # SHADOW per-path edge verdict (shadow_trigger_eval) — the fast "which path has edge" answer.
+        # SHADOW per-path edge verdict (shadow_trigger_eval) — reuse its report() so the UI always
+        # matches the disciplined live-vs-backfill verdict (DRY, one source of truth).
         shadow = {}
         try:
-            sr = _load_jsonl(st / "llm_trader" / "shadow_triggers.jsonl")
-            byp = {}
-            for r in sr:
-                byp.setdefault(r.get("path", "?"), []).append(r)
-            for path, rs in byp.items():
-                g = [float(r.get("gross_R")) for r in rs if r.get("gross_R") is not None]
-                w = sum(1 for x in g if x > 0)
-                mean_g = round(sum(g) / len(g), 2) if g else None
-                shadow[path] = {"n": len(rs), "target": 25, "gross_R": mean_g,
-                                "win": round(w / len(g), 2) if g else None,
-                                "verdict": ("NO-EDGE" if len(rs) >= 25 and (mean_g or 9) < -0.1 else
-                                            "PROMISING" if len(rs) >= 25 and (mean_g or -9) > 0.05 else
-                                            "đang đo")}
-            shadow = dict(sorted(shadow.items(), key=lambda kv: -kv[1]["n"]))
+            import shadow_trigger_eval as _ste
+            for path, s in (_ste.report().get("by_path") or {}).items():
+                shadow[path] = {"n": s.get("n"), "n_live": s.get("n_live"), "n_backfill": s.get("n_backfill"),
+                                "target": 25, "gross_R": s.get("gross_R"),
+                                "gross_live": s.get("gross_R_live"), "gross_bf": s.get("gross_R_backfill"),
+                                "win": s.get("gross_win"), "verdict": s.get("verdict")}
+            shadow = dict(sorted(shadow.items(), key=lambda kv: -(kv[1]["n"] or 0)))
         except Exception:
             shadow = {}
         lt["rd"] = {"flag": ("ON · tin+chart" if _flag_on else "DARK (đo ngầm)"),
