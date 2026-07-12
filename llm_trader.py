@@ -46,7 +46,7 @@ PID_FILE = LT_DIR / "llm_trader.pid"
 STOP_FILE = LT_DIR / "llm_trader.stop"
 HEARTBEAT = LT_DIR / "llm_trader_heartbeat.json"
 
-MODEL = os.environ.get("LLM_TRADER_MODEL", "cx/gpt-5.5")
+MODEL = os.environ.get("LLM_TRADER_MODEL", "cx/gpt-5.6-sol")   # owner 2026-07-13: switch to 5.6-sol (Tradebot X's model); verified text+vision OK on 9router
 BASE_URL = os.environ.get("LLM_TRADER_BASE", "http://localhost:20128/v1")
 # Squeeze the model: no artificial token ceiling + max reasoning effort. The
 # endpoint accepts reasoning_effort=high (verified: it engages deeper reasoning)
