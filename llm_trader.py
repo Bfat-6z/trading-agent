@@ -947,6 +947,15 @@ def decide(context: list[dict[str, Any]], equity: float,
         if c not in shortlist:
             shortlist = [c] + shortlist[:max_charts - 1]
             c["a_plus_pure"] = True   # flagged in coins_txt so the model sees it
+    # FLUSH OVERRIDE (shadow live-forward CONFIRMED 2026-07-12): flush_no_oi is the one path measured
+    # live-positive, but the activity re-sort above was silently dropping low-activity flush coins —
+    # the exact candidates the R2 flush-first gate exists to surface (Opus review finding). Same
+    # mechanics as the A+ override: a flush-triggered coin gets charted regardless of activity rank.
+    flush = [c for c in ranked if isinstance(c.get("trigger_info"), dict)
+             and any(p in (c["trigger_info"].get("_edge") or {}) for p in ("flush_no_oi", "flush_oi_dn"))]
+    for c in flush:
+        if c not in shortlist:
+            shortlist = [c] + shortlist[:max_charts - 1]
     by_sym = {c["symbol"]: c for c in shortlist}
     import time as _t2
     _nowms = int(now_ms if now_ms is not None else _t2.time() * 1000)
@@ -1752,9 +1761,32 @@ def run_once() -> dict[str, Any]:
         # model has proven it ignores prompt rules). trigger_info rides into the prompt so the model
         # knows WHY each coin is on the list. Then every actionable decision must survive the
         # STAGE-2 second look on its chosen TF. Mechanical/proven path is NOT gated (own governance).
-        ctx_gated = [c for c in ctx if c.get("symbol") in trig_map]
-        for c in ctx_gated:
-            c["trigger_info"] = (trig_map.get(c.get("symbol")) or {}).get("vals")
+        #
+        # FLUSH-FIRST (shadow live-forward verdict 2026-07-12): per-path measured edge ranks the gate.
+        #   flush_no_oi CONFIRMED live-positive (n_live>=30) > flush_oi_dn (positive, accruing) >
+        #   chart_align (flat, unproven) > news/whale (rare, unmeasured).
+        #   funding_extreme = NO-EDGE (n=50) -> DEAD path: no longer a reason to surface a coin.
+        # A coin whose ONLY hit is a dead path is not a candidate; ranking puts measured-edge coins
+        # first so the model and the STAGE2_MAX cap spend attention on them. Measurement is UNCUT:
+        # log_cycle above already logged every path (incl. funding) before this gate.
+        _PATH_RANK = {"flush_no_oi": 0, "flush_oi_dn": 1, "chart_align": 2, "news": 3, "whale": 3}
+        _DEAD_PATHS = {"funding_extreme"}
+        _EDGE_NOTE = {"flush_no_oi": "CONFIRMED live-positive edge: LONG the capitulation bounce (n_live>=30)",
+                      "flush_oi_dn": "positive so far, live sample still accruing (n<25)",
+                      "chart_align": "measured ~flat so far - no proven edge yet",
+                      "news": "unmeasured (rare)", "whale": "unmeasured (rare)"}
+        _ranked = []
+        for c in ctx:
+            _hit = trig_map.get(c.get("symbol")) or {}
+            _live = [p for p in (_hit.get("paths") or []) if p not in _DEAD_PATHS]
+            if not _live:
+                continue                    # untriggered, or funding-only (dead path) -> not a candidate
+            _info = dict(_hit.get("vals") or {})
+            _info["_edge"] = {p: _EDGE_NOTE.get(p, "") for p in _live}
+            c["trigger_info"] = _info
+            _ranked.append((min(_PATH_RANK.get(p, 9) for p in _live), c))
+        _ranked.sort(key=lambda rc: rc[0])          # stable: equal rank keeps ctx (hot-volume) order
+        ctx_gated = [c for _r, c in _ranked]
         if ctx_gated:
             decisions = _apply_gap_veto(
                 decide(ctx_gated, equity, status=status, client=client, now_ms=now_ms), ctx_gated)
