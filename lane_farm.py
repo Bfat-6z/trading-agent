@@ -147,6 +147,16 @@ def _save_acct(k, a):
     tmp.write_text(json.dumps(a), encoding="utf-8")   # account.json into an empty/corrupt state
     os.replace(tmp, p)
 
+def _load_closed() -> dict:
+    # Owner cull list (e.g. "win<20% đóng hết"): {lane_key: {"reason","win","n","ts"}}. Read FRESH
+    # every cycle so it's race-free vs the running loop and reversible (delete a key to reopen the lane).
+    # TF-scoped (lives in LDIR next to summary.json) so a 15m cull doesn't halt the same key on 1h.
+    try:
+        d = json.loads((LDIR / "closed_lanes.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
 def run_once(client):
     import orderflow_data as of
     now = int(time.time() * 1000)
@@ -173,9 +183,19 @@ def run_once(client):
             continue
     summary = {}
     rng = random.Random(now // bar_ms)              # deterministic per bar
-    for cfg in lane_configs():
+    culled = _load_closed()                          # owner-culled lanes (halt, no new trades) — fresh each cycle
+    for cfg in lane_configs():                        # NB: 'closed' is a per-cycle int counter below — do NOT reuse it here
         k = cfg["k"]; a = _acct(k)
         cur_bar = now // bar_ms
+        if k in culled:                              # owner cull: freeze like a bust but manual + reversible
+            info = culled[k] if isinstance(culled[k], dict) else {}
+            _t = int(a.get("trades", 0) or 0)
+            summary[k] = {"equity": a.get("equity"), "busted": True, "closed": True,
+                          "trades": _t, "win": round(a.get("wins", 0) / _t, 3) if _t else None,
+                          "reason": info.get("reason", "owner-closed"),
+                          "desc": cfg.get("desc", ""), "family": cfg.get("family", "?"),
+                          "side": cfg.get("side", "LONG"), "mid": cfg.get("mid", k)}
+            continue
         if a.get("busted"):
             summary[k] = {"equity": a["equity"], "busted": True}
             if a.get("_unreadable"):        # re-audit: distinguish a corrupt-frozen lane from a real bust
