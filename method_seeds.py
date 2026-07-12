@@ -12,6 +12,19 @@ DSL: when = list of {feat, op, val}; feats come from method_lab.feature_frame:
 from __future__ import annotations
 
 SEED_METHODS = [
+    # --- FLUSH BOUNCE — the ONE shadow-CONFIRMED live-positive edge (2026-07-13) ---
+    # Mirrors the R1 flush trigger exactly (ret5 <= -3% on >=2x volume -> LONG the bounce;
+    # llm_trader_triggers + backfill_flush use the same thresholds). Shadow live-forward:
+    # flush_no_oi n_live=30, CONFIRMED positive. Exits approximate the shadow ATR bracket
+    # (1.5x/2.5x ATR at the ~1.6% median flush atr_pct) in the lane's pct terms. Purpose:
+    # EXECUTABLE-edge evidence at machine speed — the mission's model-mediated path catches
+    # ~1 flush/day, this lane takes every one on the top-40 universe.
+    {"id": "flush_bounce_exec", "name": "Capitulation flush bounce (shadow-parity)",
+     "desc": "ret5<=-3% + vol>=2x flush -> LONG bounce (shadow CONFIRMED)", "side": "LONG",
+     "when": [{"feat": "ret5", "op": "<=", "val": -3.0},
+              {"feat": "vol_ratio", "op": ">=", "val": 2.0}],
+     "sl_pct": 2.5, "tp_pct": 4.0, "timeout": 24},
+
     # --- mean-reversion on RSI ---
     {"id": "rsi_oversold_bounce", "name": "RSI oversold bounce",
      "desc": "Buy dips: RSI<30 (classic oversold long)", "side": "LONG",
