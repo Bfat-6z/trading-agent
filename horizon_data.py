@@ -148,7 +148,7 @@ def build() -> dict:
                     from datetime import datetime, timezone
                     _dt = datetime.fromisoformat(str(_ca).replace("Z", "+00:00"))
                     price_age_s = int((datetime.now(timezone.utc) - _dt).total_seconds())
-                    price_stale = price_age_s > 120
+                    price_stale = price_age_s > 45     # ~2 missed 20s build cycles; 120s let 2-min-old marks look live
                 except Exception:
                     price_stale = True                 # unparseable stamp -> assume stale
             else:
@@ -255,10 +255,9 @@ def build() -> dict:
                 up = round(((mark - entry) if side == "LONG" else (entry - mark)) * qty, 3)
             live_chart = _live_position_chart(cli, p, now_ms)
             pos_out.append({"sym": p.get("symbol"), "side": side, "lev": p.get("leverage"),
-                            "margin": round(float(p.get("margin", 0) or 0), 2),
                             "entry": round(entry, 4), "mark": round(float(mark), 4) if mark else None,
                             "liq": round(float(p.get("liq_px", 0) or 0), 4),
-                            "margin": round(float(p.get("margin", 0) or 0), 3),
+                            "margin": round(float(p.get("margin", 0) or 0), 3),   # was declared twice; later 3dp key won — kept
                             "upnl": up, "opened_at": p.get("opened_at"),
                             "chart": live_chart or p.get("chart"),
                             "chart_kind": ("current" if live_chart else ("entry" if p.get("chart") else None)),
