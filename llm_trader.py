@@ -8,9 +8,9 @@ CONTEXTUALLY — a loss on one coin/regime/time doesn't blanket-ban the setup; t
 same idea can win on another coin at another time. Markets are non-stationary; the
 LLM weighs context rather than a static verdict.
 
-RULES (owner, fixed — enforced in code, not left to the LLM):
-- position size 5-10% of equity per trade
-- leverage EXACTLY x5 or x10
+RULES (owner, updated 2026-07-13 — "vốn/đòn bẩy tùy model tự cân nhắc"):
+- position size & leverage = the MODEL's decision, based on current equity
+- code keeps RUIN floors only: size<=40% margin, lev<=25, gap-to-liq veto
 - higher frequency (short loop)
 
 SAFETY: PAPER-ONLY. This module has its OWN paper account and NEVER calls
@@ -58,10 +58,11 @@ LLM_TIMEOUT = float(os.environ.get("LLM_TRADER_LLM_TIMEOUT", "300"))
 TF = "15m"
 START_EQUITY = 100.0
 MAX_HOLD_BARS = 32
-# OWNER RULES (hard): law = 5-10% size, x5/x10 only. Owner 2026-07-04 ('danh vol
-# to len'): bias to the TOP of his size law (8-10%) and require BIG entry volume.
-SIZE_PCT_MIN, SIZE_PCT_MAX = float(os.environ.get("LLM_TRADER_SIZE_MIN", "8")), 10.0
-ALLOWED_LEVERAGE = (5, 10)
+# OWNER RULES updated 2026-07-13 ("vốn thì tùy model tự cân nhắc dựa trên số vốn hiện có và đòn
+# bẩy cũng thế"): sizing & leverage belong to the MODEL now. Code keeps RUIN floors only —
+# size<=40% margin (isolated: worst gap-to-liq loses the margin, one trade can't wipe the account),
+# lev<=25 (liq ≈ 100/lev%; the gap veto scales with the chosen lev). Clamps live in _validate_decisions.
+# (The old 5-10%/x5-x10 band still applies to the MECHANICAL paths, which have no model in the loop.)
 # entries need strong participation: vol_ratio >= this (his method: EMA+VOL+price;
 # research: breakout on sub-1.5x volume = fakeout). A+ capitulation needs >=1.8 anyway.
 MIN_ENTRY_VOL = float(os.environ.get("LLM_TRADER_MIN_ENTRY_VOL", "1.5"))
@@ -880,8 +881,12 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
             _tp = float(dec.get("tp_pct", 3) or 3)                        # the batch — AND NaN/Inf must not
             if not (_math.isfinite(_sz) and _math.isfinite(_sl) and _math.isfinite(_tp)):
                 raise ValueError("non-finite numeric")                    # slip the clamp as a boundary value
-            lev = 10 if int(dec.get("leverage", 5) or 5) >= 10 else 5     # (NaN size -> max size). x5/x10 only
-            size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, _sz))          # 5-10%
+            # Owner 2026-07-13: "vốn thì tùy model tự cân nhắc dựa trên số vốn hiện có, đòn bẩy cũng
+            # thế" — sizing & leverage are the MODEL's call now. Code keeps RUIN floors only:
+            # lev<=25 (liq ≈ 100/lev%; the gap-veto scales with the chosen lev), size<=40% margin
+            # (isolated: worst gap-to-liq loses the margin -> one trade can never wipe the account).
+            lev = max(1, min(25, int(dec.get("leverage", 10) or 10)))
+            size_pct = max(1.0, min(40.0, _sz))
             sl_pct = max(0.3, min(8.0, _sl))
             tp_pct = max(0.3, min(15.0, _tp))
         except Exception:
@@ -914,8 +919,11 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
 _MEMORY_RULE = ("Learn from your MEMORY block CONTEXTUALLY: the counts are evidence to weigh, not bans — a past "
                 "loss does NOT blanket-ban a setup; the same idea can win on another coin/regime/time (markets are "
                 "non-stationary). Pick only the BEST setups; SKIP is common and fine — no forced trades. "
-                "Owner LAW (hard, non-negotiable): leverage EXACTLY 5 or 10; size 8-10% of equity (top of the "
-                "5-10 band). Your EMA+VOLUME+price method strongly PREFERS strong participation — quiet-bar "
+                "Owner LAW (updated 2026-07-13): position SIZE and LEVERAGE are YOUR decisions — size each trade "
+                "from your CURRENT equity, open exposure, setup quality and stop distance. Know the physics: "
+                "liquidation sits ~100/leverage % away and a gap-risk veto blocks entries whose liquidation is "
+                "within ~3 ATR; code only clamps insanity (size<=40% margin, lev<=25). Bet bigger on A+ setups, "
+                "smaller on B — that judgment is the job. Your EMA+VOLUME+price method strongly PREFERS strong participation — quiet-bar "
                 "entries (vol_ratio<1.5) are your measured losing pattern, so weigh volume heavily and prefer "
                 "vol_ratio>=1.5 — but that is now YOUR call, not a code block; a limit into the volume bar is ideal.")
 _DECISION_SCHEMA = (
@@ -936,7 +944,7 @@ _DECISION_SCHEMA = (
     "current extended price. Only omit entry_px (market enter) for a confirmed breakout that won't retrace. A limit "
     "waits for price to come to you and cancels if it runs away — this is how a disciplined trader enters.\n"
     "===DECISIONS===\nThen a JSON ARRAY (may be empty) of ONLY coins that PASSED the gate: "
-    "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\",\"leverage\":5|10,\"size_pct\":5-10,"
+    "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\",\"leverage\":<YOUR call, 1-25>,\"size_pct\":<YOUR call, % of equity, 1-40>,"
     "\"entry_px\":<limit price, or omit for market>,\"sl_pct\":0.5-5,\"tp_pct\":0.5-10,"
     "\"tf_basis\":\"15m|1h|4h\",\"rationale\":\"cite levels + how many confluences\"}]")
 
