@@ -27,6 +27,7 @@ STATE_DIR = ROOT / "state"
 PID_FILE = STATE_DIR / "agent_process_supervisor.pid"
 LOCK_FILE = STATE_DIR / "agent_process_supervisor.lock"
 STOP_FILE = STATE_DIR / "STOP_AGENT_PROCESS_SUPERVISOR"
+SUPERVISOR_HB = STATE_DIR / "supervisor_heartbeat.json"   # per-cycle liveness (wedge detection, 2026-07-12)
 LOG_FILE = STATE_DIR / "agent_process_supervisor.jsonl"
 HEARTBEAT_PATH = STATE_DIR / "agent_process_supervisor_heartbeat.json"
 SUPERVISOR_SCRIPT = "agent_process_supervisor.py"
@@ -800,6 +801,16 @@ def run_loop(args: argparse.Namespace) -> int:
             print(f"agent_supervisor ok restarted={','.join(restarted) if restarted else 'none'}", flush=True)
         except Exception as exc:
             append_jsonl("supervisor_error", {"error": str(exc)[:300]})
+        try:
+            # per-cycle liveness artifact (2026-07-12: supervisor WEDGED silently for 77min — process
+            # alive, loop frozen in a blocking call; jsonl only records EVENTS so quiet != dead was
+            # undetectable). fleet_watchdog kills us if this goes stale while the process still exists.
+            tmp = SUPERVISOR_HB.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"pid": os.getpid(), "updated_at":
+                           datetime.now(timezone.utc).isoformat(timespec="seconds")}), encoding="utf-8")
+            os.replace(tmp, SUPERVISOR_HB)
+        except Exception:
+            pass
         if args.once:
             break
         time.sleep(args.check_seconds)
