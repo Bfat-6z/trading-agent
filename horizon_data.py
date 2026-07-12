@@ -520,6 +520,9 @@ def build() -> dict:
                     "trades": int(v.get("trades", 0) or 0),
                     "win": round(float(w) * 100, 1) if w is not None else None,
                     "open": int(v.get("open", 0) or 0), "busted": bool(v.get("busted")),
+                    # owner-cull flag (summary "closed"); named `culled` because full_rows already
+                    # uses "closed" for the recent-trades LIST — a bool here would collide with it.
+                    "culled": bool(v.get("closed")),
                     "is_random": k == "L00_random", "armed": mid in armed_ids}
             full_rows.append({**base, "curve": curve, "closed": recent, "open_pos": opos})
         full_rows.sort(key=lambda r: -r["equity"])
@@ -543,8 +546,9 @@ def build() -> dict:
             print(json.dumps({"lanes_write_error": repr(_we)[:200]}))
         # LIGHT summary (no curve/closed/open_pos) for the dashboard table
         lanes["lanes"] = [{kk: r[kk] for kk in ("k", "mid", "desc", "family", "side", "equity",
-                            "pnl", "trades", "win", "open", "busted", "is_random", "armed")}
+                            "pnl", "trades", "win", "open", "busted", "culled", "is_random", "armed")}
                           for r in full_rows]
+        lanes["culled_n"] = sum(1 for r in full_rows if r.get("culled"))
     except Exception as _le:
         # bughunt: was `pass` — it silently swallowed a NameError (missing `import os`) for ~an hour,
         # leaving lanes.json stale with no signal. Surface build errors instead of hiding them.
