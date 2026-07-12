@@ -452,9 +452,11 @@ def build() -> dict:
         pass
 
     mission = {"start": 100.0, "target": 1000.0,
-               "equity": lt.get("equity"), "pct": None}
+               "equity": lt.get("equity"), "pct": None, "ret_pct": None}
     try:
-        mission["pct"] = round((float(lt.get("equity") or 100) - 100.0) / 900.0 * 100, 2)
+        _eq = float(lt.get("equity") or 100)
+        mission["pct"] = round((_eq - 100.0) / 900.0 * 100, 2)      # progress toward the $1000 target (0->100)
+        mission["ret_pct"] = round((_eq - 100.0) / 100.0 * 100, 2)  # REAL return vs $100 start — the honest P&L%
     except Exception:
         pass
 
