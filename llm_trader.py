@@ -1001,7 +1001,7 @@ def _activity_score(c: dict[str, Any]) -> float:
 
 
 def decide(context: list[dict[str, Any]], equity: float,
-           status: dict[str, Any] | None = None, *, max_charts: int = 4,
+           status: dict[str, Any] | None = None, *, max_charts: int = 6,   # owner 2026-07-13 "vắt kiệt model": see MORE coins/cycle (4->6)
            client: Any = None, now_ms: int | None = None) -> list[dict[str, Any]]:
     """CHART-BASED decision (owner request A+B): scan all coins numerically, pick
     the most active ones, RENDER their candlestick+EMA+volume charts and let
@@ -1461,6 +1461,139 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
     return filled
 
 
+MANAGE_INTERVAL_MS = int(float(os.environ.get("LLM_TRADER_MANAGE_SEC", "240")) * 1000)
+
+
+def _manage_positions_llm(client: Any, now_ms: int) -> int:
+    """VẮT KIỆT MODEL (owner 2026-07-13: "model nó linh hoạt hơn rule rất nhiều"): the model
+    MANAGES its own open discretionary positions. The entry bracket is its opening opinion,
+    not a prison — every ~4min it sees a FRESH chart + live state per position and may HOLD,
+    CLOSE (market, next bar), or move SL/TP to structure. Mech positions are excluded (their
+    fixed bracket IS the experiment being measured).
+
+    ANTI-LOOKAHEAD (the exact trap the lane-ratchet review caught): resolve() replays all
+    bars since entry each cycle, so a stop moved on TODAY's knowledge must never apply to
+    YESTERDAY's bars. Adjustments are appended to p["mgmt"] with a timestamp and resolve()
+    activates each entry only for bars that OPEN at/after that timestamp.
+
+    RUIN FLOORS ONLY: SL must stay outside a 2% liquidation buffer and on the correct side
+    of the mark; TP on the correct side; CLOSE always allowed (risk-reducing). Widening the
+    stop is ALLOWED (owner: trust the model — max loss is still capped by the margin)."""
+    open_pos = _load(POSITIONS)
+    cand = [p for p in open_pos if not p.get("mech")]
+    if not cand:
+        return 0
+    stf = LT_DIR / "manage_state.json"
+    try:
+        if now_ms - int(json.loads(stf.read_text()).get("last_ms") or 0) < MANAGE_INTERVAL_MS:
+            return 0
+    except Exception:
+        pass
+    try:
+        # stamp the throttle NOW (Opus F1): a failed pass (Binance ban -> no states; LLM down ->
+        # no reply) must still cost the full cooldown, else every 90s cycle re-fires 4 klines
+        # fetches + a vision call exactly when we need back-off (IP-ban history).
+        stf.write_text(json.dumps({"last_ms": now_ms}), encoding="utf-8")
+    except Exception:
+        pass
+    images, states = [], []
+    bar_ms = of._TF_MS[TF]
+    for p in cand[:4]:
+        try:
+            fb = of.fetch_klines_with_flow(p["symbol"], TF, months=0.03, end_ms=now_ms,
+                                           client=client, sleep_between=0.02)
+            bars = [b for b in fb if int(b["ts_ms"]) + bar_ms <= now_ms]
+            if len(bars) < 30:
+                continue
+            mark = float(bars[-1]["close"])
+            entry = float(p["entry"]); side = p["side"]
+            up_pct = ((mark / entry - 1) if side == "LONG" else (1 - mark / entry)) * 100 * int(p["leverage"])
+            b64 = ltc.render_chart(p["symbol"], bars, tf=TF, title_suffix=f" · OPEN {side}")
+            if not b64:
+                continue
+            images.append((f"{p['symbol']} (your open {side})", b64))
+            states.append({"symbol": p["symbol"], "side": side, "leverage": p["leverage"],
+                           "entry": entry, "mark": mark, "sl": float(p["sl"]), "tp": float(p["tp"]),
+                           "liq_px": p.get("liq_px"), "upnl_pct_on_margin": round(up_pct, 2),
+                           "bars_held": int((now_ms - int(p["entry_ts"])) / bar_ms),
+                           "your_entry_rationale": (p.get("rationale") or "")[:160]})
+        except Exception:
+            continue
+    if not states:
+        return 0
+    sys_p = ("You are managing YOUR OWN open futures positions (paper). For each position you see its "
+             "fresh chart and live state. You have FULL authority: HOLD, CLOSE (market out — cutting a "
+             "broken thesis early is a skill), or ADJUST sl_px/tp_px to structure (trail a winner, "
+             "protect breakeven, give a thesis room — your call; know liquidation sits at liq_px). "
+             "Reply STRICT JSON array only: "
+             '[{"symbol":"...","action":"HOLD|CLOSE|ADJUST","sl_px":<number|null>,"tp_px":<number|null>,'
+             '"reason":"<=100 chars"}]')
+    txt = _llm_vision(sys_p, json.dumps({"positions": states}, default=str), images)
+    arr = _split_thinking(txt) if txt else None    # returns the parsed decisions JSON
+    if isinstance(arr, dict):
+        arr = [arr]
+    if not isinstance(arr, list):
+        return 0
+    by_sym = {p["symbol"]: p for p in open_pos}
+    applied = 0
+    for a in arr:
+        if not isinstance(a, dict):
+            continue
+        p = by_sym.get(str(a.get("symbol")))
+        act = str(a.get("action", "HOLD")).upper()
+        if not p or p.get("mech") or act == "HOLD":
+            continue
+        st_row = next((s for s in states if s["symbol"] == p["symbol"]), None)
+        if st_row is None:
+            continue
+        if act == "CLOSE":
+            p["close_req_ts"] = now_ms
+            applied += 1
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "llm_manage_close", "symbol": p["symbol"],
+                     "reason": str(a.get("reason", ""))[:120]})
+            continue
+        if act != "ADJUST":
+            continue
+        mark = st_row["mark"]; side = p["side"]
+        liq = float(p.get("liq_px") or 0)
+        new_sl = new_tp = None
+        try:
+            import math as _math
+            if a.get("sl_px") is not None:
+                v = float(a["sl_px"])
+                ok = _math.isfinite(v) and v > 0 and (   # Opus F2: -inf slipped the comparisons
+                    (v < mark and (liq <= 0 or v > liq * 1.02)) if side == "LONG" else
+                    (v > mark and (liq <= 0 or v < liq * 0.98)))
+                if ok:
+                    new_sl = v
+            if a.get("tp_px") is not None:
+                v = float(a["tp_px"])
+                if _math.isfinite(v) and v > 0 and (
+                        (side == "LONG" and v > mark) or (side == "SHORT" and v < mark)):
+                    new_tp = v
+        except Exception:
+            pass
+        if new_sl is None and new_tp is None:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "llm_manage_rejected", "symbol": p["symbol"],
+                     "sl_px": a.get("sl_px"), "tp_px": a.get("tp_px")})
+            continue
+        p.setdefault("mgmt", []).append({"ts": now_ms, "sl": new_sl, "tp": new_tp,
+                                         "why": str(a.get("reason", ""))[:120]})
+        applied += 1
+        _append(LT_DIR / "governance.jsonl",
+                {"ts_ms": now_ms, "event": "llm_manage_adjust", "symbol": p["symbol"],
+                 "sl": new_sl, "tp": new_tp, "reason": str(a.get("reason", ""))[:120]})
+    if applied:
+        _rewrite(POSITIONS, open_pos)
+    try:
+        stf.write_text(json.dumps({"last_ms": now_ms}), encoding="utf-8")
+    except Exception:
+        pass
+    return applied
+
+
 def resolve(client: Any, now_ms: int) -> int:
     """Resolve open paper positions against CLOSED bars — honest exit model.
 
@@ -1520,7 +1653,23 @@ def resolve(client: Any, now_ms: int) -> int:
         fb_ts = int(p.get("fill_bar_ts") or -1)
         is_mech = bool(p.get("mech"))
         hold_cap = int(p.get("max_hold") or MAX_HOLD_BARS)   # proven methods: 16 bars, as backtested
+        # model management (VẮT KIỆT MODEL 2026-07-13): timestamped SL/TP adjustments apply only to
+        # bars that OPEN at/after the decision — current-knowledge stops never rewrite past bars
+        # (the lane-ratchet lookahead lesson). Each entry applies ONCE at its activation bar so the
+        # mechanical BE/trail ratchet below can keep tightening on top of it. Deterministic replay.
+        _mgmt = sorted((p.get("mgmt") or []), key=lambda m: int(m.get("ts") or 0)) if not is_mech else []
+        _mi = 0
+        _crq = int(p.get("close_req_ts") or 0) if not is_mech else 0
         for k, b in enumerate(fut):
+            while _mi < len(_mgmt) and int(_mgmt[_mi].get("ts") or 0) <= int(b["ts_ms"]):
+                if _mgmt[_mi].get("sl") is not None: sl = float(_mgmt[_mi]["sl"])
+                if _mgmt[_mi].get("tp") is not None: tp = float(_mgmt[_mi]["tp"])
+                _mi += 1
+            if _crq and int(b["ts_ms"]) >= _crq:
+                # model requested a market close: fill at the OPEN of the first bar starting
+                # after the request (honest — no intrabar hindsight), market slippage below.
+                exit_px, reason = float(b.get("open") or b["close"]), "llm_close"
+                exit_ts = int(b["ts_ms"]); break
             if int(b["ts_ms"]) == fb_ts:
                 # the bar our limit filled on: intrabar sequence is unknown — a TP
                 # touch may have happened BEFORE the fill, so only ADVERSE exits
@@ -1599,7 +1748,7 @@ def resolve(client: Any, now_ms: int) -> int:
         if reason in ("sl", "trail"):
             slip = float(pcm.fill_bps(tier, is_stop=True)) / 10000.0
             exit_px = exit_px * (1 - slip) if side == "LONG" else exit_px * (1 + slip)
-        elif reason == "timeout":
+        elif reason in ("timeout", "llm_close"):     # plain market orders
             slip = float(pcm.fill_bps(tier)) / 10000.0
             exit_px = exit_px * (1 - slip) if side == "LONG" else exit_px * (1 + slip)
         # Funding as P&L: charge every 8h event inside (entry_ts, exit_ts].
@@ -1786,6 +1935,12 @@ def run_once() -> dict[str, Any]:
     acct = load_account()
     equity = float(acct["equity"])
     pend_filled = _resolve_pending(client, equity, utc_now(), now_ms)   # fill/cancel limit orders
+    try:
+        # VẮT KIỆT MODEL: model manages its own open positions (HOLD/CLOSE/move SL-TP) every ~4min.
+        _manage_positions_llm(client, now_ms)
+    except Exception as _mge:
+        _append(LT_DIR / "governance.jsonl",
+                {"ts_ms": now_ms, "event": "llm_manage_error", "error": repr(_mge)[:160]})
     if pend_filled:
         acct = load_account(); equity = float(acct["equity"])
     card = refresh_scorecard(client)
