@@ -110,7 +110,8 @@ def lane_configs():
                       "family": m.get("family") or "?", "side": m.get("side", "LONG"),
                       "margin": MARGIN_PCT, "sl": float(m.get("sl_pct") or 1.5),
                       "tp": float(m.get("tp_pct") or 3.0), "to": int(m.get("timeout") or 16),
-                      "max_open": MAX_OPEN, "methods": [m]})
+                      "max_open": MAX_OPEN, "methods": [m],
+                      "ratchet": bool(m.get("ratchet"))})   # BE+trail exit walk (A/B vs fixed bracket)
     dropped = evaluable - (len(lanes) - 1)            # -1 for the random control
     if dropped > 0:                                    # NO silent cull (owner: don't drop any)
         print(json.dumps({"warn": "lane cap hit", "evaluable": evaluable,
@@ -214,26 +215,80 @@ def run_once(client):
             after = [b for b in bars if int(b["ts_ms"]) > int(p["entry_ts_ms"])]
             side, entry, sl, tp = p["side"], p["entry"], p["sl"], p["tp"]
             to = int(p["timeout"]); ex = rs = None; used = 0
-            for i, b in enumerate(after[:to]):
-                used = i + 1
-                lo, hi = float(b["low"]), float(b["high"])
-                if side == "LONG":
-                    if lo <= sl: ex, rs = sl, "sl"; break
-                    if hi >= tp: ex, rs = tp, "tp"; break
-                else:
-                    if hi >= sl: ex, rs = sl, "sl"; break
-                    if lo <= tp: ex, rs = tp, "tp"; break
-            if ex is None and len(after) >= to:
-                ex, rs, used = float(after[to - 1]["close"]), "timeout", to
-            if ex is None:
-                still.append(p); continue
+            # R denominator must be the INITIAL risk: for ratchet lanes p["sl"] moves, so a trailed
+            # stop would fake a tiny risk -> inflated r. sl0 is set at open for ratchet positions.
+            risk0 = abs(entry - float(p.get("sl0") or sl))
+            if "sl0" in p:
+                # RATCHET walk (Tradebot X shape, exits.rs parity; forensic fix #1+#3):
+                # BE at MFE>=0.5R (entry±0.05·ATR), trail at >=1R to peak∓1.2·ATR (floor entry±0.5R),
+                # monotonic, never ratcheted beyond the bar close (untradeable stop). Once moved,
+                # the stop triggers on CLOSE only (anti wick-out) and fills at the close (pessimistic).
+                # Exits are checked with the PREVIOUS bar's stop before this bar updates it (no
+                # same-bar lookahead). SL-before-TP pessimism preserved.
+                # PURE REPLAY (Opus review HIGH-1): the walk replays from entry every cycle, so trail
+                # state must be RECOMPUTED from sl0 each time — persisting sl/peak/moved across cycles
+                # let state derived from LATER bars contaminate EARLIER bars on the next replay
+                # (impossible early "trail" exits = lookahead). Deterministic per bar-set => idempotent.
+                sl = float(p["sl0"]); peak = entry
+                moved = False; atr_px = entry * float(p.get("atr_pct_e") or 0) / 100.0
+                for i, b in enumerate(after[:to]):
+                    used = i + 1
+                    lo, hi, cl = float(b["low"]), float(b["high"]), float(b["close"])
+                    if side == "LONG":
+                        if not moved and lo <= sl: ex, rs = sl, "sl"; break
+                        if moved and cl <= sl: ex, rs = cl, "trail"; break
+                        if hi >= tp: ex, rs = tp, "tp"; break
+                        peak = max(peak, hi)
+                        r_mfe = (peak - entry) / risk0 if risk0 > 0 else 0.0
+                        cand = None
+                        if r_mfe >= 1.0:
+                            cand = max(entry + 0.5 * risk0,
+                                       (peak - 1.2 * atr_px) if atr_px > 0 else entry + 0.5 * risk0)
+                        elif r_mfe >= 0.5:
+                            cand = entry + (0.05 * atr_px if atr_px > 0 else entry * 0.001)
+                        if cand is not None:
+                            new_sl = min(max(sl, cand), cl)      # monotonic up, capped at the close
+                            if new_sl > sl: sl, moved = new_sl, True
+                    else:
+                        if not moved and hi >= sl: ex, rs = sl, "sl"; break
+                        if moved and cl >= sl: ex, rs = cl, "trail"; break
+                        if lo <= tp: ex, rs = tp, "tp"; break
+                        peak = min(peak, lo)                      # trough for SHORT
+                        r_mfe = (entry - peak) / risk0 if risk0 > 0 else 0.0
+                        cand = None
+                        if r_mfe >= 1.0:
+                            cand = min(entry - 0.5 * risk0,
+                                       (peak + 1.2 * atr_px) if atr_px > 0 else entry - 0.5 * risk0)
+                        elif r_mfe >= 0.5:
+                            cand = entry - (0.05 * atr_px if atr_px > 0 else entry * 0.001)
+                        if cand is not None:
+                            new_sl = max(min(sl, cand), cl)      # monotonic down, capped at the close
+                            if new_sl < sl: sl, moved = new_sl, True
+                if ex is None and len(after) >= to:
+                    ex, rs, used = float(after[to - 1]["close"]), "timeout", to
+                if ex is None:
+                    still.append(p); continue     # NO state persistence — pure replay recomputes from sl0
+            else:
+                for i, b in enumerate(after[:to]):
+                    used = i + 1
+                    lo, hi = float(b["low"]), float(b["high"])
+                    if side == "LONG":
+                        if lo <= sl: ex, rs = sl, "sl"; break
+                        if hi >= tp: ex, rs = tp, "tp"; break
+                    else:
+                        if hi >= sl: ex, rs = sl, "sl"; break
+                        if lo <= tp: ex, rs = tp, "tp"; break
+                if ex is None and len(after) >= to:
+                    ex, rs, used = float(after[to - 1]["close"]), "timeout", to
+                if ex is None:
+                    still.append(p); continue
             gross = (ex / entry - 1) if side == "LONG" else (entry - ex) / entry
             netp = gross - FEE
             pnl = round(netp * p["margin"] * LEV, 4)
             a["equity"] = round(a["equity"] + pnl, 4)
             a["trades"] += 1; a["wins"] += 1 if pnl > 0 else 0
             rec = {**p, "exit": ex, "reason": rs, "net": netp, "pnl": pnl,
-                   "r": round(netp / (abs(entry - sl) / entry), 3), "bars_held": used,
+                   "r": round(netp / (risk0 / entry), 3) if risk0 > 0 else None, "bars_held": used,
                    "closed_ts_ms": now, "method": p.get("method")}
             _append(_lp(k) / "closed.jsonl", rec)
             closed += 1
@@ -293,12 +348,16 @@ def run_once(client):
                           "px_vs_ema200", "atr_pct", "close_pos", "ema_stack") if row.get(f) is not None}
                 if cfg["methods"] == "RANDOM":
                     a["rand_bar"] = cur_bar
-                still.append({"symbol": s, "method": fire_m["id"], "side": side, "entry": entry,
-                              "sl": entry * (1 - slp) if side == "LONG" else entry * (1 + slp),
-                              "tp": entry * (1 + tpp) if side == "LONG" else entry * (1 - tpp),
-                              "timeout": cfg["to"], "margin": margin, "entry_feats": feats,
-                              "entry_ts_ms": int(last["ts_ms"]), "opened_ts_ms": now,
-                              "pos_id": f"{s}_{int(last['ts_ms'])}_{k}"})
+                pos = {"symbol": s, "method": fire_m["id"], "side": side, "entry": entry,
+                       "sl": entry * (1 - slp) if side == "LONG" else entry * (1 + slp),
+                       "tp": entry * (1 + tpp) if side == "LONG" else entry * (1 - tpp),
+                       "timeout": cfg["to"], "margin": margin, "entry_feats": feats,
+                       "entry_ts_ms": int(last["ts_ms"]), "opened_ts_ms": now,
+                       "pos_id": f"{s}_{int(last['ts_ms'])}_{k}"}
+                if cfg.get("ratchet"):                # BE+trail walk needs the initial stop + entry ATR
+                    pos["sl0"] = pos["sl"]            # (walk state itself is NOT persisted — pure replay)
+                    pos["atr_pct_e"] = float(row.get("atr_pct") or 0)
+                still.append(pos)
                 open_syms.add(s)
         op = _lp(k) / "open.jsonl"
         op.parent.mkdir(parents=True, exist_ok=True)

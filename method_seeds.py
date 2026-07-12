@@ -25,6 +25,30 @@ SEED_METHODS = [
               {"feat": "vol_ratio", "op": ">=", "val": 2.0}],
      "sl_pct": 2.5, "tp_pct": 4.0, "timeout": 24},
 
+    # --- A/B: EXIT RATCHET + EXTENSION GATE (Tradebot X reference impl + lane forensic 2026-07-11) ---
+    # ratchet: True -> lane_farm walks the position with BE at 0.5R (entry±0.05·ATR), trail at 1R
+    # (peak∓1.2·ATR, floored at entry±0.5R), stop close-confirmed once moved (anti wick-out).
+    # Forensic said fixed brackets noise-stop winners + never reach TP; these lanes measure the fix.
+    {"id": "flush_bounce_ratchet", "name": "Flush bounce + exit ratchet",
+     "desc": "same flush signal, ratchet exits (A/B vs flush_bounce_exec)", "side": "LONG",
+     "when": [{"feat": "ret5", "op": "<=", "val": -3.0},
+              {"feat": "vol_ratio", "op": ">=", "val": 2.0}],
+     "sl_pct": 2.5, "tp_pct": 4.0, "timeout": 24, "ratchet": True},
+    # extension gate (forensic #2: ema_stack_long losers were the EXTENDED entries —
+    # px_vs_ema200 5.7 loser vs 3.1 winner, rsi 64+, atr 1.23): same signal, capped extension.
+    {"id": "ema_stack_long_gated", "name": "EMA stack long + extension gate",
+     "desc": "bull stack + vol, skip extended (ema200<=4%, rsi<=68, atr<=1.1)", "side": "LONG",
+     "when": [{"feat": "ema_stack", "op": "==", "val": 1}, {"feat": "vol_ratio", "op": ">", "val": 1.2},
+              {"feat": "px_vs_ema200", "op": "<=", "val": 4.0}, {"feat": "rsi14", "op": "<=", "val": 68},
+              {"feat": "atr_pct", "op": "<=", "val": 1.1}],
+     "sl_pct": 2.0, "tp_pct": 3.0},
+    {"id": "ema_stack_long_gated_ratchet", "name": "EMA stack gated + ratchet",
+     "desc": "extension-gated stack + ratchet exits (full TX shape)", "side": "LONG",
+     "when": [{"feat": "ema_stack", "op": "==", "val": 1}, {"feat": "vol_ratio", "op": ">", "val": 1.2},
+              {"feat": "px_vs_ema200", "op": "<=", "val": 4.0}, {"feat": "rsi14", "op": "<=", "val": 68},
+              {"feat": "atr_pct", "op": "<=", "val": 1.1}],
+     "sl_pct": 2.0, "tp_pct": 3.0, "ratchet": True},
+
     # --- mean-reversion on RSI ---
     {"id": "rsi_oversold_bounce", "name": "RSI oversold bounce",
      "desc": "Buy dips: RSI<30 (classic oversold long)", "side": "LONG",
