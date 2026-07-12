@@ -661,6 +661,73 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
     return out
 
 
+def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
+                          already: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
+    """MECHANICAL executor for the measured-positive flush paths (owner 2026-07-13: "m sợ quá
+    nhiều thứ" — stop double-gating a CONFIRMED signal). Shadow live-forward: flush_no_oi
+    CONFIRMED positive (n>=30), flush_oi_dn positive accruing. The model+stage-2 pipeline was
+    capturing ~25% of those fires; this path takes them ALL, deterministically — the same
+    bracket as the flush_bounce_exec lane (sl 2.5% / tp 4% / 24 bars ≈ the shadow ATR bracket)
+    so mission-vs-lane stays directly comparable. No model, no stage-2 (the signal is code-
+    confirmed; a second LLM opinion on it was fear, not discipline). SAFETY KEPT: caller runs
+    _apply_gap_veto (ruin control), LAW sizing (x10, 5-10% margin), 1-per-symbol in
+    open_positions, live LOCKED. One trade per flush EPISODE (2h window, mirrors the shadow
+    dedup) so a trigger that stays true across 90s cycles can't churn re-entries."""
+    hits = []
+    for sym, h in (trig_map or {}).items():
+        paths = set((h or {}).get("paths") or [])
+        if "flush_no_oi" in paths or "flush_oi_dn" in paths:
+            hits.append((sym, "flush_no_oi" if "flush_no_oi" in paths else "flush_oi_dn"))
+    if not hits:
+        return []
+    by_sym = {c.get("symbol"): c for c in ctx}
+    taken = {d.get("symbol") for d in (already or [])}
+    open_syms = ({p.get("symbol") for p in _load(POSITIONS)}
+                 | {p.get("symbol") for p in _load(PENDING)})
+    # episode dedup: any flush-mech trade on this symbol entered/closed in the last 2h = same flush
+    recent = set()
+    try:
+        for r in _load(CLOSED)[-150:]:
+            if (r.get("mech_method") or "").startswith("flush") and \
+               now_ms - int(r.get("closed_ts") or 0) < 2 * 3600 * 1000:
+                recent.add(r.get("symbol"))
+    except Exception:
+        pass
+    out = []
+    # correlated-cluster cap (Opus review A): a market-wide capitulation fires MANY coins at
+    # once — all LONG, maximally correlated; 9×10%×x10 into a flash-crash approaches wipeout
+    # (the one fear that's earned: ruin). Cap 3 new fires/cycle, CONFIRMED path first; a real
+    # multi-coin flush still builds across cycles, just not in one all-in candle.
+    hits.sort(key=lambda sp: 0 if sp[1] == "flush_no_oi" else 1)
+    for sym, path in hits:
+        if len(out) >= 3:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "flush_mech_cluster_cap", "skipped": sym})
+            continue
+        c = by_sym.get(sym)
+        if not c or sym in taken or sym in open_syms or sym in recent:
+            continue
+        feats = None
+        try:
+            import method_lab as ml
+            from brain import LESSON_FEATS
+            row = ml.feature_frame(c.get("_bars") or [], funding=c.get("_funding"))[-1]
+            feats = {k: row.get(k) for k in LESSON_FEATS if row.get(k) is not None}
+        except Exception:
+            pass
+        size = 10.0 if path == "flush_no_oi" else 5.0     # LAW band 5-10%: full size on the CONFIRMED path
+        out.append({**c, "action": "LONG", "leverage": MECH_LEV, "size_pct": size,
+                    "sl_pct": 2.5, "tp_pct": 4.0, "entry_px": None,
+                    "_mech": True, "_max_hold": 24, "_mech_method": f"{path}_mech",
+                    "_entry_feats": feats,
+                    "rationale": f"MECH FLUSH {path} (shadow-confirmed capitulation bounce; "
+                                 f"lane-parity bracket 2.5/4.0/24)"})
+        _append(LT_DIR / "governance.jsonl",
+                {"ts_ms": now_ms, "event": "flush_mech_fire", "symbol": sym, "path": path,
+                 "size_pct": size})
+    return out
+
+
 def _mistakes_block() -> str:
     """Surface the measured failure-mode lessons PROMINENTLY in the system prompt
     (not buried in the memory JSON) so the model actually corrects them — the
@@ -1793,6 +1860,15 @@ def run_once() -> dict[str, Any]:
             decisions = _stage2_confirm(decisions, client, now_ms)
         else:
             decisions = []   # no coin triggered -> no discretionary trades this cycle (by design)
+        # MECHANICAL FLUSH (2026-07-13): the CONFIRMED path fires without asking the model or
+        # stage-2 — runs regardless of what the model decided (dedup inside; gap-veto applied).
+        try:
+            mech_flush = _apply_gap_veto(
+                _flush_mech_decisions(ctx, trig_map, decisions, now_ms), ctx)
+            decisions = decisions + mech_flush
+        except Exception as _fme:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "flush_mech_error", "error": repr(_fme)[:160]})
     else:
         # DISCRETIONARY: gpt-5.5 vision reads the charts and decides. Loosened from PROVEN_ONLY so the
         # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),
