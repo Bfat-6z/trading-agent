@@ -166,7 +166,7 @@ def build() -> dict:
                                               "cached_at": utc_now()}), encoding="utf-8")
         except Exception:
             pass
-    fp_rs = [float(c.get("r_multiple", 0)) for c in fp_closed]
+    fp_rs = [float(c.get("r_multiple") or 0) for c in fp_closed]   # `or 0`: a null r_multiple must not crash the whole build
     fp_mean = round(sum(fp_rs) / len(fp_rs), 4) if fp_rs else 0.0
 
     ft_labels = 0
@@ -225,11 +225,14 @@ def build() -> dict:
         lt["equity"] = round(float(la.get("equity", 0) or 0), 2)
         lt["trades"] = int(la.get("trades", 0) or 0)
         lt["win_rate"] = (round(int(la.get("wins", 0)) / lt["trades"], 3) if lt["trades"] else None)
-        card = json.loads((lt_dir / "scorecard.json").read_text())
-        lt["verdict"] = str(card.get("verdict", {}).get("code", "—"))
-        lt["pvalue"] = card.get("pvalue")
-        lt["liq_count"] = int(card.get("metrics", {}).get("liq_count", 0) or 0)
-        lt["mean_r"] = card.get("metrics", {}).get("mean_r")
+        try:                                     # scorecard is written by llm_trader concurrently; a
+            card = json.loads((lt_dir / "scorecard.json").read_text())   # racing/corrupt read must NOT
+            lt["verdict"] = str(card.get("verdict", {}).get("code", "—"))  # blank the feed/curve/positions
+            lt["pvalue"] = card.get("pvalue")                              # built below — keep verdict defaults.
+            lt["liq_count"] = int(card.get("metrics", {}).get("liq_count", 0) or 0)
+            lt["mean_r"] = card.get("metrics", {}).get("mean_r")
+        except Exception:
+            pass
         open_rows = _load_jsonl(lt_dir / "positions.jsonl")
         # dedupe double-booked closes (concurrent-loop overlap) by trade identity
         _cr = _load_jsonl(lt_dir / "closed.jsonl"); _seen = set(); closed_rows = []
@@ -453,12 +456,14 @@ def build() -> dict:
 
     mission = {"start": 100.0, "target": 1000.0,
                "equity": lt.get("equity"), "pct": None, "ret_pct": None}
-    try:
-        _eq = float(lt.get("equity") or 100)
-        mission["pct"] = round((_eq - 100.0) / 900.0 * 100, 2)      # progress toward the $1000 target (0->100)
-        mission["ret_pct"] = round((_eq - 100.0) / 100.0 * 100, 2)  # REAL return vs $100 start — the honest P&L%
-    except Exception:
-        pass
+    _eq = lt.get("equity")                          # None-aware: a wiped account (equity 0.0 = -100%) or a
+    if _eq is not None:                             # failed block (None) must NOT read as 0% via `or 100`
+        try:
+            _eq = float(_eq)
+            mission["pct"] = round((_eq - 100.0) / 900.0 * 100, 2)      # progress toward the $1000 target (0->100)
+            mission["ret_pct"] = round((_eq - 100.0) / 100.0 * 100, 2)  # REAL return vs $100 start — the honest P&L%
+        except Exception:
+            pass
 
     # Lane farm: up to 100 parallel $100 paper lanes, one per method (owner: '100 kênh
     # từ toàn bộ phương pháp'). L00_random is the RANDOM-entry control (the alpha floor).
