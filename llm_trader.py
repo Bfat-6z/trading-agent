@@ -981,6 +981,16 @@ def _btc_context_chart(client: Any, now_ms: int) -> tuple[str, str] | None:
         fb = [b for b in fb if int(b["ts_ms"]) + of._TF_MS["1h"] <= now_ms]
         if len(fb) < 40:
             return None
+        try:                                        # numeric tide (sếp 2026-07-13: "thị trường thay
+            closes = [float(b["close"]) for b in fb]   # đổi long hay short nó phải theo") — the chart
+            r24 = round((closes[-1] / closes[-25] - 1) * 100, 2) if len(closes) > 25 else None
+            e50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+            _btc_context_chart._tide = {            # is an image; the model also gets it as NUMBERS.
+                "btc_ret_24h_pct": r24,
+                "btc_vs_ema50_1h": round((closes[-1] / e50 - 1) * 100, 2) if e50 else None,
+                "tide": ("dumping" if (r24 or 0) < -1.5 else "pumping" if (r24 or 0) > 1.5 else "flat")}
+        except Exception:
+            _btc_context_chart._tide = None
         b64 = ltc.render_chart("BTCUSDT", fb[-160:], tf="1h", title_suffix=" · MARKET CONTEXT")
         return ("BTCUSDT 1h — MARKET CONTEXT (the tide all alts swim in)", b64) if b64 else None
     except Exception:
@@ -1009,10 +1019,13 @@ def _board_pass(context: list[dict[str, Any]], status: dict[str, Any] | None,
                  "your open positions, and your own past record per symbol (respect it — re-proposing "
                  "a setup you were burned on repeatedly is your measured mistake). NOTE: capitulation "
                  "flushes are auto-traded by a mechanical path — your edge is everything ELSE: trends, "
-                 "breakdowns, shorts, structure plays. Pick the coins genuinely worth a deep chart "
+                 "breakdowns, shorts, structure plays. DIRECTION FOLLOWS THE TAPE (owner): market_tide "
+                 "dumping -> hunt SHORT setups first; pumping -> longs first; flip when it flips. "
+                 "Pick the coins genuinely worth a deep chart "
                  "look RIGHT NOW (fewer is fine; empty if nothing is interesting). Reply STRICT JSON: "
                  '{"investigate":["SYMBOL1",...max 6],"why":"<=120 chars"}')
         txt = _llm(sys_p, json.dumps({"board": rows, "your_open_positions": opens,
+                                      "market_tide": getattr(_btc_context_chart, "_tide", None),
                                       "capacity": (status or {}).get("capacity")}, default=str),
                    max_tokens=4000, effort="medium")   # triage call, not the deep decision (Opus F2:
                                                        # high-effort at 2k tokens could truncate to a no-op)
@@ -1189,12 +1202,19 @@ def decide(context: list[dict[str, Any]], equity: float,
            "aside or take only a high-conviction setup with a WIDE structure stop that clears the wicks. "
            "Likewise 'regime':'choppy' has been your worst zone (7% win) — trade it only with a genuine "
            "edge, not a marginal one. These are YOUR calls now, not code gates.\n\n"
+           "DIRECTION IS ADAPTIVE (owner directive): LONG and SHORT are equal citizens — your side must "
+           "FOLLOW the current tape, never a habit. Check 'market_tide' + the BTCUSDT MARKET CONTEXT "
+           "chart FIRST: when the market is DUMPING, breakdown continuations and bounce-fade SHORTS are "
+           "the high-probability side and longs need exceptional justification; when it is PUMPING, the "
+           "reverse. When the tide FLIPS, you flip with it. (A mechanical path already buys capitulation "
+           "flushes automatically — do not duplicate it; your job is the directional judgment it lacks.)\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
            + _proven_methods_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)   # _mistakes_block removed
            # (P1 2026-07-09): at 17% WR it tripped OVER-TRADING+AVOID-LONG+AVOID-SHORT+STAND-ASIDE
            # simultaneously = self-cancelling "don't trade at all", and authorized ignoring all memory.
            # The honest feedback channel is the calibration report (llm_trader_learning.py), not this.
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
+                       "market_tide": getattr(_btc_context_chart, "_tide", None),   # numeric tide (sếp: side must follow the tape)
                        "memory": mem, "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
     out = _validate_decisions(_split_thinking(_llm_vision(sys, text, images)), by_sym)
