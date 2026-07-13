@@ -549,6 +549,23 @@ def build() -> dict:
                             "pnl", "trades", "win", "open", "busted", "culled", "is_random", "armed")}
                           for r in full_rows]
         lanes["culled_n"] = sum(1 for r in full_rows if r.get("culled"))
+        # deletion-history tab (owner 2026-07-13 "thêm 1 tab lịch sử xoá"): merge both TF cull
+        # files (reason + when) with the lane's frozen stats where we have them (15m summary).
+        _cl = []
+        _stats = {r["k"]: r for r in full_rows}
+        for _tf, _cp in (("15m", st / "lanes" / "closed_lanes.json"),
+                         ("1h", st / "lanes_1h" / "closed_lanes.json")):
+            try:
+                for _k, _v in (json.loads(_cp.read_text(encoding="utf-8")) or {}).items():
+                    _r = _stats.get(_k) or {}
+                    _cl.append({"k": _k, "tf": _tf, "reason": (_v or {}).get("reason", "owner-closed"),
+                                "ts": int((_v or {}).get("ts") or 0),
+                                "equity": _r.get("equity"), "trades": _r.get("trades"),
+                                "win": _r.get("win")})
+            except Exception:
+                pass
+        _cl.sort(key=lambda x: -x["ts"])
+        lanes["culled_list"] = _cl
     except Exception as _le:
         # bughunt: was `pass` — it silently swallowed a NameError (missing `import os`) for ~an hour,
         # leaving lanes.json stale with no signal. Surface build errors instead of hiding them.
