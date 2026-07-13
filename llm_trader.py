@@ -972,6 +972,29 @@ def _symbol_history() -> dict[str, dict[str, Any]]:
     return out
 
 
+def _recent_rejections(hours: float = 12.0) -> dict[str, dict[str, Any]]:
+    """{sym: {n, last_reason}} from recent stage-2 rejections — stage-1 had NO memory of them,
+    so it re-proposed the same idea every cycle (TAO 29x in 8h, each a burned vision call).
+    Injected into the board + coins_txt so the model stops knocking on a door it already
+    closed — unless the structure actually CHANGED (its call, told in the prompt)."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        import time as _t
+        cutoff = _t.time() * 1000 - hours * 3600 * 1000
+        for l in (LT_DIR / "governance.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
+            try:
+                g = json.loads(l)
+            except Exception:
+                continue
+            if g.get("event") == "stage2_reject" and float(g.get("ts_ms") or 0) >= cutoff:
+                d = out.setdefault(str(g.get("symbol")), {"n": 0, "last_reason": ""})
+                d["n"] += 1
+                d["last_reason"] = str(g.get("reason") or "")[:90]
+    except Exception:
+        pass
+    return out
+
+
 def _btc_context_chart(client: Any, now_ms: int) -> tuple[str, str] | None:
     """BTC 1h chart — the market-regime context every alt decision should see (data-flow v2:
     the model was trading alts blind to what BTC is doing RIGHT NOW). Best-effort."""
@@ -1005,6 +1028,7 @@ def _board_pass(context: list[dict[str, Any]], status: dict[str, Any] | None,
     this cycle. Replaces the code-side activity heuristic as the chooser; falls back to the
     activity ranking on any failure (fail-open, never blocks the cycle)."""
     try:
+        _rej = _recent_rejections()
         rows = []
         for c in context:
             rows.append({k: c.get(k) for k in
@@ -1012,7 +1036,9 @@ def _board_pass(context: list[dict[str, Any]], status: dict[str, Any] | None,
                           "atr_pct", "regime", "funding_rate", "wick_intensity") if c.get(k) is not None}
                         | ({"trigger_edge": list((c.get("trigger_info") or {}).get("_edge", {}))}
                            if isinstance(c.get("trigger_info"), dict) else {})
-                        | ({"your_record_here": hist[c["symbol"]]} if c.get("symbol") in hist else {}))
+                        | ({"your_record_here": hist[c["symbol"]]} if c.get("symbol") in hist else {})
+                        | ({"rejected_by_your_2nd_look": _rej[c["symbol"]]}
+                           if c.get("symbol") in _rej else {}))
         opens = [{"symbol": p.get("symbol"), "side": p.get("side")} for p in _load(POSITIONS)]
         sys_p = ("You are a discretionary futures trader scanning the FULL board to allocate your "
                  "attention. Below: numeric state of every hot coin (both LONG and SHORT are yours), "
@@ -1030,13 +1056,26 @@ def _board_pass(context: list[dict[str, Any]], status: dict[str, Any] | None,
                    max_tokens=4000, effort="medium")   # triage call, not the deep decision (Opus F2:
                                                        # high-effort at 2k tokens could truncate to a no-op)
         d = _extract_json(txt) if txt else None
-        if isinstance(d, dict) and isinstance(d.get("investigate"), list):
+        # _extract_json prefers the FIRST [...] span, so on {"investigate":[...]} it returns the
+        # INNER ARRAY, not the dict (silent-None bug caught 07-14: board_pass never fired once).
+        picks = None
+        if isinstance(d, list) and all(isinstance(s, str) for s in d):
+            picks = [str(s).upper() for s in d][:6]
+        elif isinstance(d, dict) and isinstance(d.get("investigate"), list):
             picks = [str(s).upper() for s in d["investigate"] if isinstance(s, str)][:6]
+        if picks is not None:
             _append(LT_DIR / "governance.jsonl",
-                    {"event": "board_pass", "picks": picks, "why": str(d.get("why", ""))[:120]})
+                    {"event": "board_pass", "picks": picks,
+                     "why": (str(d.get("why", ""))[:120] if isinstance(d, dict) else "")})
             return picks
-    except Exception:
-        pass
+        _append(LT_DIR / "governance.jsonl",     # NEVER fail silently again
+                {"event": "board_pass_fail", "reply_head": (txt or "")[:120]})
+    except Exception as _bpe:
+        try:
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "board_pass_fail", "error": repr(_bpe)[:120]})
+        except Exception:
+            pass
     return None
 
 
@@ -1167,8 +1206,10 @@ def decide(context: list[dict[str, Any]], equity: float,
     if _btc:
         images.append(_btc)          # market tide context rides with every alt decision
     # compact numeric + SMC read to accompany each chart (no raw bars in text)
+    _rej = _recent_rejections()
     coins_txt = [{"symbol": c["symbol"], "smc": c.get("_smc", {}),
                   "your_record_here": hist.get(c["symbol"]),   # its OWN past on this symbol
+                  "your_recent_rejections_here": _rej.get(c["symbol"]),   # stage-2 already said no N times
                   **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                  for c in charted]
     market_overview = [{"symbol": c["symbol"], "ret20_pct": c.get("ret20_pct"),
@@ -1202,6 +1243,10 @@ def decide(context: list[dict[str, Any]], equity: float,
            "aside or take only a high-conviction setup with a WIDE structure stop that clears the wicks. "
            "Likewise 'regime':'choppy' has been your worst zone (7% win) — trade it only with a genuine "
            "edge, not a marginal one. These are YOUR calls now, not code gates.\n\n"
+           "REJECTION MEMORY: 'your_recent_rejections_here' = how many times YOUR OWN second look already "
+           "rejected this coin recently and why. Do NOT re-propose the same idea unless the chart shows the "
+           "exact thing the rejection said was missing (e.g. the retest/confirmation has now printed). "
+           "Re-knocking on a closed door burns calls and is your measured over-trading pattern.\n\n"
            "DIRECTION IS ADAPTIVE (owner directive): LONG and SHORT are equal citizens — your side must "
            "FOLLOW the current tape, never a habit. Check 'market_tide' + the BTCUSDT MARKET CONTEXT "
            "chart FIRST: when the market is DUMPING, breakdown continuations and bounce-fade SHORTS are "
