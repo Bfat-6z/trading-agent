@@ -758,7 +758,8 @@ def memory_context() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # LLM decision (9router, OpenAI-compatible)
 # ---------------------------------------------------------------------------
-def _llm(system: str, user: str, max_tokens: int | None = None) -> str | None:
+def _llm(system: str, user: str, max_tokens: int | None = None,
+         effort: str | None = None) -> str | None:
     """Text-only chat call via the SAME direct 9router path that _llm_vision uses
     (reliable), not call_large_model (which hangs here). Full reasoning effort + no
     tight token ceiling. Returns text or None."""
@@ -772,7 +773,7 @@ def _llm(system: str, user: str, max_tokens: int | None = None) -> str | None:
         except Exception:
             return None
     body = json.dumps({"model": MODEL, "max_tokens": max_tokens, "temperature": 0.3,
-                       "reasoning_effort": REASONING_EFFORT,
+                       "reasoning_effort": effort or REASONING_EFFORT,
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}]}).encode()
     req = urllib.request.Request(base + "/chat/completions", data=body,
@@ -952,6 +953,80 @@ _DECISION_SCHEMA = (
 _THINK_PATH = LT_DIR / "thinking_latest.json"
 
 
+def _symbol_history() -> dict[str, dict[str, Any]]:
+    """Per-symbol dossier of the model's OWN record (data-flow v2, owner 2026-07-13: the model
+    was re-proposing KORU 31 times with no memory that it had already been rejected/burned
+    there). {sym: {n, net, last_reasons}} from the closed ledger — cheap, computed per cycle."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        for r in _dedupe_closed(_load(CLOSED))[-200:]:
+            s = r.get("symbol")
+            if not s:
+                continue
+            d = out.setdefault(s, {"n": 0, "net": 0.0, "last_reasons": []})
+            d["n"] += 1
+            d["net"] = round(d["net"] + float(r.get("net") or 0), 3)
+            d["last_reasons"] = (d["last_reasons"] + [r.get("reason")])[-3:]
+    except Exception:
+        pass
+    return out
+
+
+def _btc_context_chart(client: Any, now_ms: int) -> tuple[str, str] | None:
+    """BTC 1h chart — the market-regime context every alt decision should see (data-flow v2:
+    the model was trading alts blind to what BTC is doing RIGHT NOW). Best-effort."""
+    try:
+        fb = of.fetch_klines_with_flow("BTCUSDT", "1h", months=0.5, end_ms=now_ms,
+                                       client=client, sleep_between=0.02, with_deriv=False)
+        fb = [b for b in fb if int(b["ts_ms"]) + of._TF_MS["1h"] <= now_ms]
+        if len(fb) < 40:
+            return None
+        b64 = ltc.render_chart("BTCUSDT", fb[-160:], tf="1h", title_suffix=" · MARKET CONTEXT")
+        return ("BTCUSDT 1h — MARKET CONTEXT (the tide all alts swim in)", b64) if b64 else None
+    except Exception:
+        return None
+
+
+def _board_pass(context: list[dict[str, Any]], status: dict[str, Any] | None,
+                hist: dict[str, dict[str, Any]]) -> list[str] | None:
+    """DATA-FLOW v2 (owner: "flow chảy của dữ liệu"): the MODEL drives its own attention.
+    One cheap TEXT call: the full numeric board (every hot coin, both directions) + its open
+    positions + its per-symbol record -> it returns the symbols worth deep chart analysis
+    this cycle. Replaces the code-side activity heuristic as the chooser; falls back to the
+    activity ranking on any failure (fail-open, never blocks the cycle)."""
+    try:
+        rows = []
+        for c in context:
+            rows.append({k: c.get(k) for k in
+                         ("symbol", "price", "ret5_pct", "ret20_pct", "rsi14", "vol_ratio",
+                          "atr_pct", "regime", "funding_rate", "wick_intensity") if c.get(k) is not None}
+                        | ({"trigger_edge": list((c.get("trigger_info") or {}).get("_edge", {}))}
+                           if isinstance(c.get("trigger_info"), dict) else {})
+                        | ({"your_record_here": hist[c["symbol"]]} if c.get("symbol") in hist else {}))
+        opens = [{"symbol": p.get("symbol"), "side": p.get("side")} for p in _load(POSITIONS)]
+        sys_p = ("You are a discretionary futures trader scanning the FULL board to allocate your "
+                 "attention. Below: numeric state of every hot coin (both LONG and SHORT are yours), "
+                 "your open positions, and your own past record per symbol (respect it — re-proposing "
+                 "a setup you were burned on repeatedly is your measured mistake). NOTE: capitulation "
+                 "flushes are auto-traded by a mechanical path — your edge is everything ELSE: trends, "
+                 "breakdowns, shorts, structure plays. Pick the coins genuinely worth a deep chart "
+                 "look RIGHT NOW (fewer is fine; empty if nothing is interesting). Reply STRICT JSON: "
+                 '{"investigate":["SYMBOL1",...max 6],"why":"<=120 chars"}')
+        txt = _llm(sys_p, json.dumps({"board": rows, "your_open_positions": opens,
+                                      "capacity": (status or {}).get("capacity")}, default=str),
+                   max_tokens=4000, effort="medium")   # triage call, not the deep decision (Opus F2:
+                                                       # high-effort at 2k tokens could truncate to a no-op)
+        d = _extract_json(txt) if txt else None
+        if isinstance(d, dict) and isinstance(d.get("investigate"), list):
+            picks = [str(s).upper() for s in d["investigate"] if isinstance(s, str)][:6]
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "board_pass", "picks": picks, "why": str(d.get("why", ""))[:120]})
+            return picks
+    except Exception:
+        pass
+    return None
+
+
 def _split_thinking(raw: str | None) -> Any:
     """Split the model's 'THINKING: ... ===DECISIONS=== [json]' reply: persist the
     reasoning trace (for the dashboard) and return the parsed decisions JSON. Falls
@@ -1010,9 +1085,21 @@ def decide(context: list[dict[str, Any]], equity: float,
     the same shortlist if the vision call fails, so it never stalls."""
     if not context:
         return []
-    # shortlist the most active coins to chart (wider scope -> better candidates)
+    # shortlist: DATA-FLOW v2 — the MODEL scans the full numeric board and chooses what to
+    # investigate (its attention, its call). None = board-pass failed -> activity fallback;
+    # [] = model says nothing is interesting -> respect it (mech/proven paths still run).
     ranked = sorted(context, key=_activity_score, reverse=True)
-    shortlist = ranked[:max_charts]
+    hist = _symbol_history()
+    picks = _board_pass(context, status, hist)
+    try:      # mid-cycle heartbeat (Opus F1): the extra LLM call must not eat the supervisor's
+        _hb({"phase": "board_pass", "picks": len(picks) if picks else 0})   # 1200s stale margin
+    except Exception:
+        pass
+    if picks is not None:
+        _by = {c["symbol"]: c for c in context}
+        shortlist = [_by[s] for s in picks if s in _by][:max_charts]
+    else:
+        shortlist = ranked[:max_charts]
     # A+ OVERRIDE: the lab-proven capitulation setup (rsi<22 + vol>=1.8) is too rare
     # to ever miss — a coin printing it gets charted regardless of activity rank
     # (top-5-only scanning would have missed the LTC/INJ flushes outside the list).
@@ -1063,8 +1150,12 @@ def decide(context: list[dict[str, Any]], equity: float,
                         pass
     if not images:
         return _decide_numeric(shortlist, equity, status)   # nothing rendered -> numeric
+    _btc = _btc_context_chart(client, _nowms) if client is not None else None
+    if _btc:
+        images.append(_btc)          # market tide context rides with every alt decision
     # compact numeric + SMC read to accompany each chart (no raw bars in text)
     coins_txt = [{"symbol": c["symbol"], "smc": c.get("_smc", {}),
+                  "your_record_here": hist.get(c["symbol"]),   # its OWN past on this symbol
                   **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                  for c in charted]
     market_overview = [{"symbol": c["symbol"], "ret20_pct": c.get("ret20_pct"),
@@ -1521,6 +1612,9 @@ def _manage_positions_llm(client: Any, now_ms: int) -> int:
             continue
     if not states:
         return 0
+    _btc = _btc_context_chart(client, now_ms)
+    if _btc:
+        images.append(_btc)          # manage with the market tide in view, not just own chart
     sys_p = ("You are managing YOUR OWN open futures positions (paper). For each position you see its "
              "fresh chart and live state. You have FULL authority: HOLD, CLOSE (market out — cutting a "
              "broken thesis early is a skill), or ADJUST sl_px/tp_px to structure (trail a winner, "
@@ -1941,6 +2035,10 @@ def run_once() -> dict[str, Any]:
     except Exception as _mge:
         _append(LT_DIR / "governance.jsonl",
                 {"ts_ms": now_ms, "event": "llm_manage_error", "error": repr(_mge)[:160]})
+    try:
+        _hb({"phase": "post_manage"})     # mid-cycle heartbeat (Opus F1): manage adds a vision call
+    except Exception:
+        pass
     if pend_filled:
         acct = load_account(); equity = float(acct["equity"])
     card = refresh_scorecard(client)
