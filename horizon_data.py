@@ -557,7 +557,9 @@ def build() -> dict:
                          ("1h", st / "lanes_1h" / "closed_lanes.json")):
             try:
                 for _k, _v in (json.loads(_cp.read_text(encoding="utf-8")) or {}).items():
-                    _r = _stats.get(_k) or {}
+                    # stats only from the MATCHING farm: full_rows is the 15m summary — a 1h lane
+                    # with the same key would wrongly inherit the 15m twin's numbers.
+                    _r = (_stats.get(_k) or {}) if _tf == "15m" else {}
                     _cl.append({"k": _k, "tf": _tf, "reason": (_v or {}).get("reason", "owner-closed"),
                                 "ts": int((_v or {}).get("ts") or 0),
                                 "equity": _r.get("equity"), "trades": _r.get("trades"),
