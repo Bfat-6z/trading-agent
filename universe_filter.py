@@ -31,7 +31,7 @@ NON_CRYPTO: frozenset = frozenset({
     # mega-cap / tech / semiconductor stocks
     "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN", "NFLX",
     "INTC", "AMD", "INTU", "CRM", "ORCL", "DIS",
-    "MU", "MRVL", "DRAM", "SKHYNIX", "SAMSUNG", "SNDK",        # memory/semis (MU, DRAM new 07-11)
+    "MU", "MRVL", "DRAM", "SKHYNIX", "SKHY", "SAMSUNG", "SNDK",  # memory/semis (SKHY = renamed Hynix variant 07-13; MU/DRAM 07-11)
     # consumer / finance / industrial
     "JPM", "BAC", "V", "MA", "KO", "PEP", "WMT", "MCD", "HD", "NKE", "BA", "GE", "F", "GM",
     # ETFs / indices / leveraged
