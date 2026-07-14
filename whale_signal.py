@@ -150,7 +150,18 @@ def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
         ]
         if wr_line:
             lines.append(wr_line)
-        lines.append("⚠️ Vào TAY trên TidalFi. Kèo báo để tham khảo, không phải lệnh tự động.")
+        # DELAY GUARD (owner: "báo rồi đánh tay thì có độ trễ"): a manual fill lags the signal, so
+        # place a LIMIT at the entry (fills at the right price or not at all — never chase Market),
+        # and if price has already run toward TP past a small tolerance, SKIP instead of chasing.
+        tol = 0.5 if is_flush else 0.8            # flush bounces are faster -> tighter chase window
+        if side == "LONG":
+            skip_above = entry * (1 + tol / 100)
+        else:
+            skip_above = entry * (1 - tol / 100)
+        lines.append(
+            f"⏱ Đặt <b>LIMIT</b> ở giá entry (KHÔNG Market). Nếu giá đã chạy quá "
+            f"<code>{px(skip_above)}</code> về phía TP → <b>BỎ</b>, đừng đuổi.")
+        lines.append("⚠️ Vào TAY trên TidalFi. Kèo tham khảo, không phải lệnh tự động.")
         if why:
             lines.append(f"💡 {why}")
         return "\n".join(lines)
