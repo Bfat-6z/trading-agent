@@ -47,7 +47,22 @@ def _save(d: dict) -> None:
         pass
 
 
+LOG = ROOT / "state" / "whale_signal.log"
+
+
+def _log(ev: dict) -> None:
+    try:
+        import time as _t
+        ev["ts"] = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def _api(token: str, method: str, payload: dict, timeout: float = 8.0) -> dict | None:
+    """Hardened (gap #1): on an HTTP error, still parse Telegram's body so callers see
+    error_code/description/retry_after; a revoked token or 429 is LOGGED, never silent."""
     try:
         req = urllib.request.Request(
             _API.format(token, method),
@@ -55,8 +70,35 @@ def _api(token: str, method: str, payload: dict, timeout: float = 8.0) -> dict |
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
-    except Exception:
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"ok": False, "error_code": e.code, "description": str(e)[:120]}
+        _log({"send_fail": method, "code": body.get("error_code"), "desc": str(body.get("description"))[:140]})
+        return body
+    except Exception as e:
+        _log({"send_error": method, "error": repr(e)[:140]})
         return None
+
+
+import re as _re
+
+
+def _send(token: str, chat, text: str) -> bool:
+    """Send with HTML; on a parse error (400 can't parse entities) retry once as PLAIN text so a
+    bad tag can't drop a signal. 429 -> logged, retried next cycle (send-only, no in-loop sleep)."""
+    res = _api(token, "sendMessage",
+               {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
+    if res and res.get("ok"):
+        return True
+    desc = str((res or {}).get("description") or "").lower()
+    if res and res.get("error_code") == 400 and "parse" in desc:
+        plain = _re.sub(r"<[^>]+>", "", text)
+        res2 = _api(token, "sendMessage",
+                    {"chat_id": chat, "text": plain, "disable_web_page_preview": True})
+        return bool(res2 and res2.get("ok"))
+    return False
 
 
 def get_chat_id(token: str) -> int | None:
@@ -98,8 +140,9 @@ def _winrates() -> dict:
     return out
 
 
-def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
-    """Build a Telegram signal from an open-position row (paper), re-sized for the prop account."""
+def _fmt_signal(p: dict, wr: dict | None = None, exp: dict | None = None) -> str | None:
+    """Build a Telegram signal from an open-position row (paper), re-sized for the prop account.
+    `exp` = prop exposure state (open count, aggregate risk, day est, near-cap flag)."""
     try:
         sym = str(p.get("symbol") or "").replace("USDT", "")
         side = str(p.get("side") or "").upper()
@@ -137,8 +180,14 @@ def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
         def px(v):
             return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
 
+        exp = exp or {}
+        head = "🐋 <b>CÁ VOI TẬP SỰ</b> — KÈO MỚI"
+        if exp.get("near_cap"):
+            head = ("⛔ <b>GẦN TRẦN NGÀY — KÈO NÀY KHÔNG KHUYÊN VÀO</b>\n"
+                    f"   (hôm nay ước tính {exp.get('day_est'):,.0f}$ / trần −${DAILY_LOSS_CAP:.0f})\n"
+                    "🐋 <b>CÁ VOI TẬP SỰ</b> — kèo (tham khảo, cân nhắc BỎ)")
         lines = [
-            "🐋 <b>CÁ VOI TẬP SỰ</b> — KÈO MỚI",
+            head,
             "━━━━━━━━━━━━━━",
             f"📊 <b>{sym}</b> · {arrow} · x{lev}   <i>({src})</i>",
             f"📍 Entry: <code>{px(entry)}</code>",
@@ -150,6 +199,12 @@ def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
         ]
         if wr_line:
             lines.append(wr_line)
+        if exp.get("n_open"):            # portfolio state so a correlated stack is visible (gap #2)
+            conc = exp.get("concentration") or 0
+            warn = " ⚠️ cùng chiều — coi chừng BTC dump quét cả cụm" if conc >= 3 else ""
+            lines.append(f"📊 Đang mở <b>{exp['n_open']}</b> kèo · tổng risk ~<b>${exp.get('risk_usd',0)}</b>{warn}")
+        lines.append(f"📅 Hôm nay: <b>{'+' if exp.get('day_est',0) >= 0 else ''}{exp.get('day_est',0):,.0f}$</b>"
+                     f" (ước tính) · trần −${DAILY_LOSS_CAP:.0f}")
         # DELAY GUARD (owner: "báo rồi đánh tay thì có độ trễ"): a manual fill lags the signal, so
         # place a LIMIT at the entry (fills at the right price or not at all — never chase Market),
         # and if price has already run toward TP past a small tolerance, SKIP instead of chasing.
@@ -172,28 +227,38 @@ def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
         return None
 
 
-def emit(open_rows: list[dict]) -> int:
-    """Send a Telegram signal for each NEW open position (dedup by pos id). Called from the
-    mission loop end. No-op (returns 0) until config has bot_token + chat_id + enabled."""
+def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
+    """Send a Telegram signal for each NEW open position (dedup by pos id). PROP RISK STATE
+    (gap #2): the signal carries the current prop-account picture — today's est P&L, open count,
+    aggregate risk, same-direction concentration — and when near the −$200 daily cap the new-entry
+    signal is RED-FLAGGED as 'không khuyên vào'. No-op until config has token + chat + enabled."""
+    import time as _t
     cfg = _load()
     token, chat = cfg.get("bot_token"), cfg.get("chat_id")
     if not token or chat is None or not cfg.get("enabled", True):
         return 0
     sent = set(cfg.get("sent_ids") or [])
     wr = _winrates()
+    est, w, l = _prop_day_est(closed_rows or [], _t.time())
+    opens = open_rows or []
+    n_open = len(opens)
+    same_dir = {}
+    for p in opens:
+        same_dir[str(p.get("side"))] = same_dir.get(str(p.get("side")), 0) + 1
+    risk = ACCOUNT_USD * RISK_PCT / 100.0
+    exposure = {"n_open": n_open, "risk_usd": round(n_open * risk),
+                "concentration": max(same_dir.values()) if same_dir else 0,
+                "day_est": est, "near_cap": est <= -(DAILY_LOSS_CAP * 0.75)}
     n = 0
-    for p in open_rows or []:
+    for p in opens:
         pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
         if pid in sent:
             continue
-        text = _fmt_signal(p, wr)
+        text = _fmt_signal(p, wr, exposure)
         if not text:
             sent.add(pid)                # malformed -> mark so we don't retry every cycle
             continue
-        res = _api(token, "sendMessage",
-                   {"chat_id": chat, "text": text, "parse_mode": "HTML",
-                    "disable_web_page_preview": True})
-        if res and res.get("ok"):
+        if _send(token, chat, text):
             sent.add(pid)
             n += 1
         # transient send failure -> NOT marked -> retried next cycle (a signal is worth retrying)
@@ -289,11 +354,8 @@ def emit_closes(closed_rows: list[dict]) -> int:
         text = _fmt_close(r, day_line)
         if text and est <= -150:
             text += "\n⛔ <b>GẦN TRẦN NGÀY — khuyên NGỪNG đánh tới 07:00 mai.</b>"
-        if text:
-            res = _api(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
-                                              "disable_web_page_preview": True})
-            if res and res.get("ok"):
-                n += 1
+        if text and _send(token, chat, text):
+            n += 1
         wm = max(wm, float(r.get("closed_ts") or 0))
     cfg["last_close_ts"] = wm
     _save(cfg)
@@ -337,7 +399,7 @@ def handle_commands(status_fn=None) -> int:
 def tick(open_rows: list[dict], closed_rows: list[dict], status_fn=None) -> None:
     """One call per mission cycle: entry signals + exit notifications + command handling.
     Each part isolated — one failing must not stop the others."""
-    for fn in ((lambda: emit(open_rows)), (lambda: emit_closes(closed_rows)),
+    for fn in ((lambda: emit(open_rows, closed_rows)), (lambda: emit_closes(closed_rows)),
                (lambda: handle_commands(status_fn))):
         try:
             fn()
