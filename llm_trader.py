@@ -483,11 +483,14 @@ def _method_def_from_brain(mid: str) -> dict | None:
     d = None
     try:
         import sqlite3
-        con = sqlite3.connect(str(ROOT / "state" / "memory" / "brain.db"))
-        row = con.execute("SELECT dsl_canonical FROM trials WHERE method_id=? AND "
-                          "dsl_canonical IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-                          (mid,)).fetchone()
-        con.close()
+        con = sqlite3.connect(f"file:{ROOT / 'state' / 'memory' / 'brain.db'}?mode=ro",
+                              uri=True, timeout=10)   # ro: a READ path must never create
+        try:                                          # a stub db file (audit#3 LOW)
+            row = con.execute("SELECT dsl_canonical FROM trials WHERE method_id=? AND "
+                              "dsl_canonical IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                              (mid,)).fetchone()
+        finally:
+            con.close()
         if row and row[0]:
             cand = json.loads(row[0])
             if cand.get("when") or cand.get("conds"):

@@ -193,11 +193,14 @@ def _def_for(mid: str) -> dict | None:
         return d
     try:
         import sqlite3
-        con = sqlite3.connect(str(ROOT / "state" / "memory" / "brain.db"))
-        row = con.execute("SELECT dsl_canonical FROM trials WHERE method_id=? AND "
-                          "dsl_canonical IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-                          (mid,)).fetchone()
-        con.close()
+        con = sqlite3.connect(f"file:{ROOT / 'state' / 'memory' / 'brain.db'}?mode=ro",
+                              uri=True, timeout=10)   # ro: a READ path must never create
+        try:                                          # a stub db file (audit#3 LOW)
+            row = con.execute("SELECT dsl_canonical FROM trials WHERE method_id=? AND "
+                              "dsl_canonical IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                              (mid,)).fetchone()
+        finally:
+            con.close()
         if row and row[0]:
             d = json.loads(row[0])
             if d.get("when") or d.get("conds"):
