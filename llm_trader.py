@@ -662,6 +662,34 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
     return out
 
 
+FLUSH_DISARM_MIN_N = 15        # need this many mission flush closes before a disarm can trigger
+FLUSH_DISARM_FLOOR = -0.10     # mean R-on-margin below this over the window = edge decayed on LIVE money
+
+
+def _flush_armed(now_ms: int) -> bool:
+    """FLUSH EDGE-DECAY MONITOR (gap #6): the mech flush path auto-fires x10 on the FROZEN shadow
+    'CONFIRMED' verdict — it must not run forever if the edge decays on the mission's own money.
+    Once there are >=15 flush closes, if the rolling mean R turns clearly negative, DISARM the path
+    (stop auto-firing) and raise a loud alert. Re-arms automatically if the mean recovers (the
+    ledger is the source of truth each cycle). Fail-OPEN: a read error keeps it armed (don't kill a
+    working edge on a glitch) but logs."""
+    try:
+        rows = [r for r in _dedupe_closed(_load(CLOSED))
+                if str(r.get("mech_method") or "").startswith("flush")][-40:]
+        if len(rows) < FLUSH_DISARM_MIN_N:
+            return True
+        mr = sum(float(r.get("r") or 0) for r in rows) / len(rows)
+        if mr <= FLUSH_DISARM_FLOOR:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "flush_mech_DISARMED", "mean_r": round(mr, 3), "n": len(rows)})
+            return False
+        return True
+    except Exception as _fae:
+        _append(LT_DIR / "governance.jsonl",
+                {"ts_ms": now_ms, "event": "flush_armed_error", "error": repr(_fae)[:120]})
+        return True
+
+
 def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
                           already: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
     """MECHANICAL executor for the measured-positive flush paths (owner 2026-07-13: "m sợ quá
@@ -674,6 +702,8 @@ def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
     _apply_gap_veto (ruin control), LAW sizing (x10, 5-10% margin), 1-per-symbol in
     open_positions, live LOCKED. One trade per flush EPISODE (2h window, mirrors the shadow
     dedup) so a trigger that stays true across 90s cycles can't churn re-entries."""
+    if not _flush_armed(now_ms):      # edge-decay auto-disarm (gap #6): stop auto-firing if the
+        return []                      # mission's own flush closes turned clearly -EV
     hits = []
     for sym, h in (trig_map or {}).items():
         paths = set((h or {}).get("paths") or [])
@@ -2245,7 +2275,8 @@ def run_once() -> dict[str, Any]:
                     f"📈 win flush {_wr.get('flush') or '—'} · 30 lệnh gần {_wr.get('recent') or '—'}\n"
                     f"📌 Đang mở:\n{_ol}")
 
-        whale_signal.tick(_load(POSITIONS), _dedupe_closed(_load(CLOSED))[-120:], _ws_status)
+        whale_signal.tick(_load(POSITIONS), _dedupe_closed(_load(CLOSED))[-120:],
+                          _load(PENDING), _ws_status)
     except Exception as _wse:
         _append(LT_DIR / "governance.jsonl", {"ts_ms": now_ms, "event": "whale_signal_error", "error": repr(_wse)[:150]})
     try:

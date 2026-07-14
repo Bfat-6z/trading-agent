@@ -399,6 +399,96 @@ def handle_commands(status_fn=None) -> int:
 INCIDENTS = ROOT / "state" / "incidents_latest.json"
 
 
+def emit_mgmt(open_rows: list[dict]) -> int:
+    """MID-TRADE UPDATES (gap #3): the model manages its own open positions (moves SL/TP, cuts
+    early). Those changes live in p['mgmt']; the owner holding a manual position must be told when
+    the paper stop moves — else they sit on the original stop the system has already tightened.
+    Tracks the last mgmt count per pos_id; on growth, sends the new SL/TP."""
+    cfg = _load()
+    token, chat = cfg.get("bot_token"), cfg.get("chat_id")
+    if not token or chat is None or not cfg.get("enabled", True):
+        return 0
+    seen = cfg.get("mgmt_seen") or {}
+    n = 0
+    for p in open_rows or []:
+        pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
+        mg = p.get("mgmt") or []
+        if len(mg) <= int(seen.get(pid, 0)):
+            continue
+        last = mg[-1] if mg else {}
+        sym = str(p.get("symbol") or "").replace("USDT", "")
+
+        def px(v):
+            v = float(v)
+            return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
+
+        parts = []
+        if last.get("sl") is not None:
+            parts.append(f"SL → <code>{px(last['sl'])}</code>")
+        if last.get("tp") is not None:
+            parts.append(f"TP → <code>{px(last['tp'])}</code>")
+        why = str(last.get("why") or "")[:90]
+        text = (f"🔧 <b>CẬP NHẬT — {sym} {p.get('side')}</b>\n"
+                f"   model dời {' · '.join(parts) if parts else 'mức'}\n"
+                f"   👉 sửa lệnh trên TidalFi cho khớp." + (f"\n   💡 {why}" if why else ""))
+        if _send(token, chat, text):
+            seen[pid] = len(mg)
+            n += 1
+    if n:
+        cfg["mgmt_seen"] = {k: v for k, v in list(seen.items())[-300:]}
+        _save(cfg)
+    return n
+
+
+def emit_pending(pending_rows: list[dict]) -> int:
+    """LIMIT PLACE / CANCEL (gap #4): the model often queues a LIMIT (wait for the pullback). Signal
+    it WHEN placed so the owner's limit rests in the book at the same time as the paper's — not only
+    after it fills (which would miss every fast flush). On disappearance: became a position (already
+    signalled by emit) -> silent; else cancelled/expired -> notify."""
+    cfg = _load()
+    token, chat = cfg.get("bot_token"), cfg.get("chat_id")
+    if not token or chat is None or not cfg.get("enabled", True):
+        return 0
+    prev = set(cfg.get("pending_seen") or [])
+    filled = set(cfg.get("sent_ids") or [])
+    cur = {}
+    for q in pending_rows or []:
+        qid = f"{q.get('symbol')}_{q.get('placed_ms')}"
+        cur[qid] = q
+    n = 0
+    for qid, q in cur.items():                        # NEW pending -> place signal
+        if qid in prev:
+            continue
+        sym = str(q.get("symbol") or "").replace("USDT", "")
+        side = str(q.get("side") or "").upper()
+        ep = q.get("entry_px")
+        if ep is None:
+            continue
+
+        def px(v):
+            v = float(v)
+            return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
+
+        arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+        text = (f"⏳ <b>CHỜ LIMIT — {sym}</b> · {arrow}\n"
+                f"   đặt LIMIT ở <code>{px(ep)}</code> (chờ giá về, ~2h)\n"
+                f"   👉 đặt limit trên TidalFi ngay để nằm cùng book.")
+        if _send(token, chat, text):
+            n += 1
+    for qid in prev - set(cur):                       # gone: cancelled/expired (not a fill)
+        # a pos_id for a filled pending contains the coin; if we already signalled a same-coin
+        # position recently, treat as fill (silent). Heuristic: coin part present in sent_ids.
+        coin = qid.split("_")[0]
+        if any(coin in str(s) for s in filled):
+            continue
+        sym = coin.replace("USDT", "")
+        if _send(token, chat, f"❌ <b>HỦY LIMIT — {sym}</b> (giá chạy quá / hết hạn). Nếu mày đã đặt limit trên TidalFi thì HỦY."):
+            n += 1
+    cfg["pending_seen"] = list(cur.keys())[-100:]
+    _save(cfg)
+    return n
+
+
 def emit_ops_alerts() -> int:
     """OPS ALERT DRAIN (gap #8): incidents ARE recorded (state/incidents_latest.json) but nobody
     is told — the supervisor wedged 77min + a 6h quarantine happened silently. Push each NEW open,
@@ -451,11 +541,16 @@ def emit_ops_alerts() -> int:
     return n
 
 
-def tick(open_rows: list[dict], closed_rows: list[dict], status_fn=None) -> None:
-    """One call per mission cycle: entry signals + exit notifications + command handling.
-    Each part isolated — one failing must not stop the others."""
-    for fn in ((lambda: emit(open_rows, closed_rows)), (lambda: emit_closes(closed_rows)),
-               (lambda: emit_ops_alerts()), (lambda: handle_commands(status_fn))):
+def tick(open_rows: list[dict], closed_rows: list[dict], pending_rows: list[dict] | None = None,
+         status_fn=None) -> None:
+    """One call per mission cycle: entry + LIMIT-place/cancel + mid-trade updates + exits + ops
+    alerts + /status. Each part isolated — one failing must not stop the others."""
+    for fn in ((lambda: emit(open_rows, closed_rows)),
+               (lambda: emit_pending(pending_rows or [])),
+               (lambda: emit_mgmt(open_rows)),
+               (lambda: emit_closes(closed_rows)),
+               (lambda: emit_ops_alerts()),
+               (lambda: handle_commands(status_fn))):
         try:
             fn()
         except Exception:
