@@ -663,26 +663,46 @@ def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 FLUSH_DISARM_MIN_N = 15        # need this many mission flush closes before a disarm can trigger
-FLUSH_DISARM_FLOOR = -0.10     # mean R-on-margin below this over the window = edge decayed on LIVE money
+FLUSH_DISARM_FLOOR = -0.10     # mean r-on-margin below this over the window = edge decayed on LIVE money
+FLUSH_REPROBE_MS = 12 * 3600 * 1000   # after a disarm, re-arm for a fresh probe every 12h
+FLUSH_DISARM_FILE = LT_DIR / "flush_disarm.json"   # persisted latch state (Opus review: log-once + latch)
 
 
 def _flush_armed(now_ms: int) -> bool:
     """FLUSH EDGE-DECAY MONITOR (gap #6): the mech flush path auto-fires x10 on the FROZEN shadow
     'CONFIRMED' verdict — it must not run forever if the edge decays on the mission's own money.
-    Once there are >=15 flush closes, if the rolling mean R turns clearly negative, DISARM the path
-    (stop auto-firing) and raise a loud alert. Re-arms automatically if the mean recovers (the
-    ledger is the source of truth each cycle). Fail-OPEN: a read error keeps it armed (don't kill a
-    working edge on a glitch) but logs."""
+    Once there are >=15 flush closes with a finite r, if the rolling mean r-on-margin turns clearly
+    negative (<=-0.10) the path is DISARMED (a LATCH — no new closes accrue while disarmed, so it
+    can't self-recover from its own frozen window; Opus review). It re-arms via a TIME re-probe: 12h
+    after a disarm the path fires again so fresh closes can accrue; if it re-decays it disarms again
+    (the 12h cooldown = hysteresis, no cycle flapping). State persists in flush_disarm.json and is
+    logged ONLY on a transition (not every cycle). Fail-OPEN on error (keep armed, logged)."""
+    import math
     try:
         rows = [r for r in _dedupe_closed(_load(CLOSED))
-                if str(r.get("mech_method") or "").startswith("flush")][-40:]
-        if len(rows) < FLUSH_DISARM_MIN_N:
-            return True
-        mr = sum(float(r.get("r") or 0) for r in rows) / len(rows)
-        if mr <= FLUSH_DISARM_FLOOR:
-            _append(LT_DIR / "governance.jsonl",
-                    {"ts_ms": now_ms, "event": "flush_mech_DISARMED", "mean_r": round(mr, 3), "n": len(rows)})
-            return False
+                if str(r.get("mech_method") or "") in ("flush_no_oi_mech", "flush_oi_dn_mech")][-40:]
+        vals = [x for r in rows if math.isfinite(x := float(r.get("r") or 0))]   # drop null/NaN (bias guard)
+        try:
+            st = json.loads(FLUSH_DISARM_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            st = {"disarmed": False, "since_ms": 0}
+
+        def _flip(disarmed: bool, event: str, extra: dict) -> None:
+            FLUSH_DISARM_FILE.write_text(json.dumps({"disarmed": disarmed, "since_ms": now_ms}),
+                                         encoding="utf-8")
+            _append(LT_DIR / "governance.jsonl", {"ts_ms": now_ms, "event": event, **extra})
+
+        if st.get("disarmed"):
+            if now_ms - int(st.get("since_ms") or 0) >= FLUSH_REPROBE_MS:   # cooldown over -> re-probe
+                _flip(False, "flush_mech_REARM_probe", {})
+                return True
+            return False                                                    # still latched
+        # armed: check for decay
+        if len(vals) >= FLUSH_DISARM_MIN_N:
+            mr = sum(vals) / len(vals)
+            if mr <= FLUSH_DISARM_FLOOR:
+                _flip(True, "flush_mech_DISARMED", {"mean_r": round(mr, 3), "n": len(vals)})
+                return False
         return True
     except Exception as _fae:
         _append(LT_DIR / "governance.jsonl",
