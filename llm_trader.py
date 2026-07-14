@@ -803,16 +803,54 @@ def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
 def _mistakes_block() -> str:
     """Surface the measured failure-mode lessons PROMINENTLY in the system prompt
     (not buried in the memory JSON) so the model actually corrects them — the
-    'learn from your own mistakes' channel. Computed from realized P&L each cycle."""
+    'learn from your own mistakes' channel. Computed from realized P&L each cycle.
+
+    Re-wired 2026-07-15 (loop-forensic: the LLM had NO mistake feedback at all) with
+    fixes for the P1-2026-07-09 degeneracy that got it removed, hardened per the
+    Codex FIX-FIRST review (era-fallback contamination + blanket-pair suppression):
+      1. DISCRETIONARY ONLY: mech-fired rows never teach the LLM (they fire without
+         it — their outcomes say nothing about LLM decision quality), in BOTH the
+         era window and the fallback.
+      2. ERA-WINDOWED: rows stamped with the CURRENT model once >=8 exist; until
+         then the last-30 discretionary window, honestly LABELLED as the previous
+         model's record (system-level cautions, not 'your' sins).
+      3. CAP 2 + max ONE blanket line: structural leaks (noise-stop, inverted R:R)
+         outrank blanket bans; STAND-ASIDE / AVOID-side / OVER-TRADING compete for
+         a single slot — the all-four self-cancelling storm cannot re-form."""
     try:
-        ms = ltm.mistake_lessons(_dedupe_closed(_load(CLOSED)))
+        rows = _dedupe_closed(_load(CLOSED))
+        disc = [r for r in rows if not r.get("mech_method")]
+        era = [r for r in disc if r.get("model") == MODEL]
+        prior_era = len(era) < 8
+        ms = ltm.mistake_lessons(disc[-30:] if prior_era else era[-30:])   # recent window either way
+                                                                           # (unbounded era re-converges
+                                                                           #  to stale lifetime scolding)
     except Exception:
         ms = []
     if not ms:
         return ""
-    lines = "\n".join(f"- {m}" for m in ms)
-    return ("=== YOUR MEASURED MISTAKES (from your OWN losing trades — actively correct these; "
-            "do NOT repeat them) ===\n" + lines + "\n=== END MISTAKES ===\n\n")
+    def _rank(line: str) -> int:                      # actionable first, blanket last
+        for i, pfx in enumerate(("NOISE-STOPPED", "WEAK R:R", "STAND ASIDE",
+                                 "AVOID", "OVER-TRADING")):    # prefixes: llm_trader_memory lockstep
+            if line.startswith(pfx):
+                return i
+        return 9
+    _BLANKET = ("STAND ASIDE", "AVOID", "OVER-TRADING")
+    picked: list[str] = []
+    for m in sorted(ms, key=_rank):                   # <=2 lines, <=1 blanket-suppression
+        if m.startswith(_BLANKET) and any(p.startswith(_BLANKET) for p in picked):
+            continue
+        picked.append(m)
+        if len(picked) == 2:
+            break
+    lines = "\n".join(f"- {m}" for m in picked)
+    hdr = ("=== YOUR MEASURED MISTAKES (from your OWN recent losing trades — actively correct "
+           "these; do NOT repeat them) ===\n")
+    if prior_era:
+        hdr = ("=== MEASURED MISTAKES IN THIS SYSTEM'S RECENT DISCRETIONARY TRADES (mostly the "
+               "PREVIOUS model's record — your own is still accumulating; treat as system-level "
+               "cautions, not your personal stats) ===\n")
+    return hdr + lines + "\n=== END MISTAKES ===\n\n"
 
 
 def memory_context() -> dict[str, Any]:
@@ -1186,10 +1224,9 @@ def _decide_numeric(context: list[dict[str, Any]], equity: float,
     payload = [{"symbol": c["symbol"], **{k: v for k, v in c.items() if not k.startswith("_") and k != "symbol"}}
                for c in context]
     sys = ("You are a discretionary crypto FUTURES scalper on PAPER money reading numeric context per coin. "
-           + _proven_methods_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)   # _mistakes_block removed
-           # (P1 2026-07-09): at 17% WR it tripped OVER-TRADING+AVOID-LONG+AVOID-SHORT+STAND-ASIDE
-           # simultaneously = self-cancelling "don't trade at all", and authorized ignoring all memory.
-           # The honest feedback channel is the calibration report (llm_trader_learning.py), not this.
+           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           # _mistakes_block RE-WIRED 2026-07-15: era-windowed + capped-2 + de-conflicted — the
+           # P1-2026-07-09 degeneracy (all-four storm on lifetime 17% WR) can no longer fire.
     usr = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                       "memory": memory_context(), "coins": payload}, default=str)
     return _validate_decisions(_split_thinking(_llm(sys, usr)), by_sym)
@@ -1330,10 +1367,9 @@ def decide(context: list[dict[str, Any]], equity: float,
            "reverse. When the tide FLIPS, you flip with it. (A mechanical path already buys capitulation "
            "flushes automatically — do not duplicate it; your job is the directional judgment it lacks.)\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
-           + _proven_methods_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)   # _mistakes_block removed
-           # (P1 2026-07-09): at 17% WR it tripped OVER-TRADING+AVOID-LONG+AVOID-SHORT+STAND-ASIDE
-           # simultaneously = self-cancelling "don't trade at all", and authorized ignoring all memory.
-           # The honest feedback channel is the calibration report (llm_trader_learning.py), not this.
+           + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
+           # _mistakes_block RE-WIRED 2026-07-15: era-windowed + capped-2 + de-conflicted — the
+           # P1-2026-07-09 degeneracy (all-four storm on lifetime 17% WR) can no longer fire.
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
                        "market_tide": getattr(_btc_context_chart, "_tide", None),   # numeric tide (sếp: side must follow the tape)
                        "memory": mem, "charted_coins": coins_txt,
@@ -1682,6 +1718,10 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
                  "tf_basis": po.get("tf_basis", "15m"),
                  "_trigger_paths": po.get("trigger_paths"),   # R1 tag flows through the limit path too
                  "_stage2": po.get("stage2"),                 # R2 tag flows through the limit path too
+                 "_model": po.get("model"),                   # provenance flows through the limit path too
+                 "_pipeline_mode": po.get("pipeline_mode"),   # (Opus IMPORTANT-2: limit fills closed with
+                 "_tide_at_entry": po.get("tide_at_entry"),   #  model=None forever -> era gate starved +
+                 "_tide_aligned": po.get("tide_aligned"),     #  selection bias against limit entries)
                  "rationale": (po.get("rationale") or "") + " [limit filled]"}
             got = open_positions([d], equity, now_iso, now_ms=now_ms)
             if got:

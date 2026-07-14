@@ -219,9 +219,14 @@ def mistake_lessons(closed: list[dict[str, Any]], min_n: int = 8) -> list[str]:
     aw = sum(_num(t["net"]) for t in wins) / len(wins) if wins else 0.0
     al = sum(_num(t["net"]) for t in losses) / len(losses) if losses else 0.0
     if al < 0 and wins and abs(aw / al) < 1.3:
-        out.append(f"LOSSES BIGGER THAN WINS: realized R:R {abs(aw/al):.2f} (avg win ${aw:.2f} < avg loss "
-                   f"${abs(al):.2f}). Only take setups where the TP to a REAL opposing zone is >=1.5x the SL "
-                   f"distance; if a sensible stop doesn't leave >=1.5:1, SKIP. Never widen TP to force it.")
+        # NB: the "WEAK R:R" prefix is keyed on by llm_trader._mistakes_block's _rank/_BLANKET —
+        # rename in lockstep. Comparator is conditional (Opus IMPORTANT-1: a fixed phrase was
+        # factually wrong for ratios < 1.0, in the channel whose whole point is honest numbers).
+        _cmp = "worse than" if aw < abs(al) else "barely better than"
+        out.append(f"WEAK R:R: realized R:R only {abs(aw/al):.2f} (avg win ${aw:.2f} vs avg loss "
+                   f"${abs(al):.2f} — {_cmp} 1:1). Only take setups where the TP to a REAL opposing "
+                   f"zone is >=1.5x the SL distance; if a sensible stop doesn't leave >=1.5:1, SKIP. "
+                   f"Never widen TP to force it.")
 
     # 3. Noise-stopped: SL exits dominate and almost never win.
     reason = {}
