@@ -26,6 +26,22 @@ ACCOUNT_USD = 5000.0      # TidalFi 5K Two-Step Challenge
 RISK_PCT = 1.0            # risk per trade => $50; daily cap $200 = 4 losers of headroom
 DAILY_LOSS_CAP = 200.0
 PROP_MAX_LEV = 5          # boss 2026-07-13: "ký quỹ max 5x thôi" — cap the SIGNAL leverage for prop
+
+# TidalFi listed perps (boss screenshots 2026-07-15: "sàn chỉ có những coin này thôi") —
+# signals for anything else are unactionable noise (KITE/VELVET/... can't be traded there).
+TIDALFI_SYMBOLS = frozenset({
+    "BTCUSDT", "ETHUSDT", "XAUUSDT", "SOLUSDT", "MUUSDT", "SPCXUSDT",
+    "XAGUSDT", "ZECUSDT", "HYPEUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT",
+    "NEARUSDT", "1000PEPEUSDT", "ADAUSDT", "INTCUSDT", "NVDAUSDT", "LINKUSDT",
+    "UNIUSDT", "AVAXUSDT", "AMDUSDT", "XLMUSDT", "METAUSDT", "TSLAUSDT",
+    "TRXUSDT", "LTCUSDT", "ORCLUSDT", "DOTUSDT", "ASTERUSDT", "1000SHIBUSDT",
+    "TSMUSDT", "MSFTUSDT", "GOOGLUSDT", "AAPLUSDT", "AVGOUSDT", "AMZNUSDT",
+    "OPENAIUSDT", "JPMUSDT", "CSCOUSDT", "WMTUSDT", "BRKBUSDT", "VUSDT",
+})
+
+
+def _on_prop(sym) -> bool:
+    return str(sym or "") in TIDALFI_SYMBOLS
 _API = "https://api.telegram.org/bot{}/{}"
 
 
@@ -254,6 +270,10 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
         pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
         if pid in sent:
             continue
+        if not _on_prop(p.get("symbol")):    # not listed on TidalFi -> unactionable, skip
+            sent.add(pid)                    # (marked so we never retry it)
+            _log({"skip_not_on_prop": str(p.get("symbol"))})
+            continue
         text = _fmt_signal(p, wr, exposure)
         if not text:
             sent.add(pid)                # malformed -> mark so we don't retry every cycle
@@ -362,6 +382,9 @@ def emit_closes(closed_rows: list[dict]) -> int:
                 f" ({w}W/{l}L) · trần −${DAILY_LOSS_CAP:.0f}")
     n = 0
     for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):
+        if not _on_prop(r.get("symbol")):             # unlisted coin: entry was never signalled;
+            wm = max(wm, float(r.get("closed_ts") or 0))   # advance watermark, send nothing
+            continue
         text = _fmt_close(r, day_line)
         if text and est <= -150:
             text += "\n⛔ <b>GẦN TRẦN NGÀY — khuyên NGỪNG đánh tới 07:00 mai.</b>"
@@ -422,6 +445,8 @@ def emit_mgmt(open_rows: list[dict]) -> int:
     seen = cfg.get("mgmt_seen") or {}
     n = 0
     for p in open_rows or []:
+        if not _on_prop(p.get("symbol")):             # entry was never signalled -> no updates
+            continue
         pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
         mg = p.get("mgmt") or []
         if len(mg) <= int(seen.get(pid, 0)):
@@ -470,6 +495,8 @@ def emit_pending(pending_rows: list[dict]) -> int:
     for qid, q in cur.items():                        # NEW pending -> place signal
         if qid in prev:
             continue
+        if not _on_prop(q.get("symbol")):             # not on TidalFi -> skip (cancel notice
+            continue                                  # also naturally suppressed via prev)
         sym = str(q.get("symbol") or "").replace("USDT", "")
         side = str(q.get("side") or "").upper()
         ep = q.get("entry_px")
@@ -518,6 +545,8 @@ def emit_pending(pending_rows: list[dict]) -> int:
         # a pos_id for a filled pending contains the coin; if we already signalled a same-coin
         # position recently, treat as fill (silent). Heuristic: coin part present in sent_ids.
         coin = qid.split("_")[0]
+        if not _on_prop(coin):                        # never announced -> nothing to cancel
+            continue
         if any(coin in str(s) for s in filled):
             continue
         sym = coin.replace("USDT", "")
