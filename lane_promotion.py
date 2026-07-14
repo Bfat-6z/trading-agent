@@ -220,12 +220,28 @@ def _load_confirm_set() -> dict:
         return {"__corrupt__": True}
 
 
+def _safe_key(mid: str) -> str:
+    """MUST mirror lane_farm._safe_key — lane dir names are this transform of the mid."""
+    return "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(mid))[:48]
+
+
 def _ensure_candidates_active(cs: dict) -> None:
     """Self-repair every tick (Opus I3): registration writes three files; a crash between
     them — or a later manual cull sweep — leaves a candidate culled/unpinned and silently
     'accumulating' forever (lane_farm's cull check runs BEFORE its pin loop). Re-assert
-    both invariants idempotently: every candidate with a def is pinned + not culled."""
-    cands = cs.get("candidates") or []
+    both invariants idempotently: every candidate with a def is pinned + not culled.
+    ALSO covers armed lane_promoted methods (audit#2: they are demote-monitored via their
+    lane's fresh closes — if their lane stops trading, they become undemotable zombies)."""
+    cands = list(cs.get("candidates") or [])
+    try:
+        _a = json.loads(ARMED.read_text(encoding="utf-8"))
+        _a = _a if isinstance(_a, list) else _a.get("methods", [])
+        have = {c["k"] for c in cands}
+        cands += [{"k": _safe_key(m["id"]), "mid": m["id"]}
+                  for m in _a if m.get("source") == "lane_promoted"
+                  and _safe_key(m["id"]) not in have]
+    except Exception:
+        pass
     if not cands:
         return
     try:
@@ -395,7 +411,9 @@ def apply_promotions(winners: list[dict], stat_by_mid: dict, state: dict, dry: b
         if m.get("source") == "lane_promoted":
             st = stat_by_mid.get(m["id"]) or {}
             ps = state.get(m["id"], {})
-            has_data = (st.get("n", 0) or 0) > 0
+            has_data = (st.get("n", 0) or 0) >= 5   # audit#2: n>0 hard-demoted on a SINGLE
+                                                     # losing fresh close after every
+                                                     # re-registration — coin-flip demotion
             hard_fail = has_data and ((st.get("net", 0) or 0) <= 0 or (st.get("mean_r", 0) or 0) <= 0)
             persist_fail = ps.get("fails", 0) >= DEMOTE_FAILS
             if m["id"] in win_ids or not (hard_fail or persist_fail):
@@ -438,9 +456,8 @@ def run_once(dry: bool = False) -> dict:
     cs = _load_confirm_set()
     if cs.get("__corrupt__"):
         out = {"error": "confirm_set_corrupt", "action": "fix file or --reregister (fail-closed)"}
-        HB.write_text(json.dumps({"agent": "lane_promotion", "pid": os.getpid(),
-                                  "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                  "status": "error", **out}), encoding="utf-8")
+        if not dry:
+            _write_hb({"status": "error", **out})
         return out
     if not cs.get("candidates"):
         # Opus I2: an EMPTY registered round must not re-screen every tick (54s compute +
@@ -468,26 +485,33 @@ def run_once(dry: bool = False) -> dict:
         _armed = _armed if isinstance(_armed, list) else _armed.get("methods", [])
     except Exception:
         _armed = []
-    it_set += [{"k": m["id"], "mid": m["id"], "armed_watch": True}
+    it_set += [{"k": _safe_key(m["id"]), "mid": m["id"], "armed_watch": True}
                for m in _armed if m.get("source") == "lane_promoted" and m["id"] not in cand_mids]
+    # (audit#2: lane dirs are _safe_key(mid) — a mangled/truncated id read as a raw dir name
+    #  would find no ledger -> fresh n=0 forever -> undemotable zombie)
     stat_by_mid, rows = {}, []
     for c in it_set:
         rows_f = [x for x in _lane_rows(c["k"]) if _ts_ms(x) > reg_ms]
         fs = _stats_of(rows_f)
-        ps = state.setdefault(c["mid"], {"passes": 0, "fails": 0, "last_n": 0, "last_pass_n": 0})
-        if "last_pass_n" not in ps:                 # migration (re-audit #4): pre-upgrade entries lack
-            ps["last_pass_n"] = ps.get("last_n", 0)  # this key; seed to last_n so the first post-upgrade
-            # tick can't hand a free +1 pass (n-0>=MIN_STEP always true) to a lane with existing passes>=1
+        ps = state.setdefault(c["mid"], {"passes": 0, "fails": 0, "last_n": 0,
+                                         "last_pass_n": 0, "last_eval_n": 0})
+        if "last_eval_n" not in ps:                  # migration: window cursor for v2.1 scoring
+            ps["last_eval_n"] = ps.get("last_pass_n", ps.get("last_n", 0))
         if fs["n"] < ps.get("last_n", 0):           # closed count went backwards = legacy lifetime
-            ps["passes"] = 0; ps["fails"] = 0; ps["last_pass_n"] = 0   # counter or re-registration:
-        ps["last_n"] = fs["n"]                       # one-time reset, then fresh-n is monotone
-        # Opus I1: the significance test runs on the DISJOINT slice since the last COUNTED pass
-        # (first pass: slice == full fresh window). Cumulative-window re-testing every tick is
-        # optional-stopping; disjoint windows make PERSIST≈independent replications.
-        dis = [_f(x.get("r")) for x in rows_f[int(ps.get("last_pass_n", 0)):]]
+            ps["passes"] = 0; ps["fails"] = 0       # counter or re-registration:
+            ps["last_pass_n"] = 0; ps["last_eval_n"] = 0   # one-time reset, then fresh-n is monotone
+        ps["last_n"] = fs["n"]
+        # WINDOW-SCORED persistence (audit#2 CRITICAL): score pass OR fail exactly ONCE per
+        # >=MIN_STEP-new-closes window since the last SCORED evaluation. The old shape scored
+        # every 30-min tick: after a counted pass the <15-row disjoint slice made dis_p=1.0 ->
+        # tick counted as FAIL -> passes oscillated 0->1->0 forever (funnel inert, v1 disease)
+        # and an armed method hit DEMOTE_FAILS within 2 ticks. Between windows: HOLD.
+        lev_n = int(ps.get("last_eval_n", 0))
+        dis = [_f(x.get("r")) for x in rows_f[lev_n:]]   # disjoint since last SCORED window
         dis_p = _perm_p(dis, min_n=MIN_STEP)
         r = {"k": c["k"], "mid": c["mid"], "is_random": False, **fs,
              "p_dis": round(dis_p, 5), "armed_watch": bool(c.get("armed_watch")),
+             "window_new": fs["n"] - lev_n,
              "confirm_bar": {"min_n": CONFIRM_MIN_N, "min_r": CONFIRM_MIN_R,
                              "min_pf": CONFIRM_MIN_PF, "rand_base": round(rand_base, 4),
                              "alpha": CONFIRM_ALPHA}}
@@ -497,17 +521,16 @@ def run_once(dry: bool = False) -> dict:
                          and dis_p < CONFIRM_ALPHA)
         rows.append(r)
         stat_by_mid[r["mid"]] = r
-        if r["pass"]:
-            # bughunt: only count a pass on a GENUINELY FRESH window (>=MIN_STEP new closes since the
-            # last counted pass) — re-scoring a static closed.jsonl every tick must not advance PERSIST.
-            if r["n"] - ps.get("last_pass_n", 0) >= MIN_STEP:
-                ps["passes"] = ps.get("passes", 0) + 1; ps["last_pass_n"] = r["n"]; ps["fails"] = 0
-            # else: passing but no fresh data -> hold the counter (neither promote-progress nor fail)
-        elif r["n"] >= CONFIRM_MIN_N:
-            # a FAIL is only meaningful once the fresh sample exists; a young candidate that
-            # hasn't traded 25 fresh closes yet is "accumulating", not "failing" (v1 burned
-            # fails on every tick and reset passes for lanes that simply hadn't traded).
-            ps["fails"] = ps.get("fails", 0) + 1; ps["passes"] = 0
+        scoreable = fs["n"] >= CONFIRM_MIN_N and (fs["n"] - lev_n) >= MIN_STEP
+        if scoreable:
+            if r["pass"]:
+                ps["passes"] = ps.get("passes", 0) + 1; ps["fails"] = 0
+                ps["last_pass_n"] = fs["n"]
+            else:
+                ps["fails"] = ps.get("fails", 0) + 1; ps["passes"] = 0
+            ps["last_eval_n"] = fs["n"]              # window consumed either way
+        # else: accumulating (young candidate OR <MIN_STEP new closes since the last scored
+        # window) -> HOLD both counters. Never score a window that doesn't exist yet.
     # eligible = PERSIST consecutive passes (Codex #2 winner's-curse), ranked by fresh LCB.
     # armed_watch rows are demote-monitoring only — already promoted, never re-winners.
     eligible = [r for r in rows
@@ -524,10 +547,19 @@ def run_once(dry: bool = False) -> dict:
                 "evaluated": len(rows), "eligible": len(eligible),
                 "fresh": {r["k"]: {"n": r["n"], "mean_r": r["mean_r"], "pf": r["pf"],
                                    "p": r["p"], "pass": r["pass"]} for r in rows}})
-    HB.write_text(json.dumps({"agent": "lane_promotion", "pid": os.getpid(),
-                              "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                              "status": "running", **res}), encoding="utf-8")
+    if not dry:                       # audit#2: a manual --dry run must not clobber the
+        _write_hb({"status": "running", **res})   # live daemon's heartbeat with its own pid
     return res
+
+
+def _write_hb(payload: dict) -> None:
+    """Atomic heartbeat write (the old bare write_text was the file's only non-atomic write)."""
+    body = json.dumps({"agent": "lane_promotion", "pid": os.getpid(),
+                       "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       **payload})
+    tmp = HB.with_suffix(".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, HB)
 
 
 def main():

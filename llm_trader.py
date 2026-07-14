@@ -470,6 +470,34 @@ def _kelly_size_pct(win: float, payoff: float, sl_pct: float, lev: int) -> float
 _ARMED_METHODS = ROOT / "state" / "method_lab" / "armed_methods.json"
 
 
+_DEF_MISSING_LOGGED: set = set()
+_BRAIN_DEF_CACHE: dict = {}
+
+
+def _method_def_from_brain(mid: str) -> dict | None:
+    """Resurrect a method def from brain.db trials.dsl_canonical (cached — no sqlite
+    hit per 90s cycle). Same fallback lane_promotion._def_for uses; without it an
+    armed method whose def rotated out of methods_pool is silently never fired."""
+    if mid in _BRAIN_DEF_CACHE:
+        return _BRAIN_DEF_CACHE[mid]
+    d = None
+    try:
+        import sqlite3
+        con = sqlite3.connect(str(ROOT / "state" / "memory" / "brain.db"))
+        row = con.execute("SELECT dsl_canonical FROM trials WHERE method_id=? AND "
+                          "dsl_canonical IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                          (mid,)).fetchone()
+        con.close()
+        if row and row[0]:
+            cand = json.loads(row[0])
+            if cand.get("when") or cand.get("conds"):
+                d = cand
+    except Exception:
+        d = None
+    _BRAIN_DEF_CACHE[mid] = d
+    return d
+
+
 def _survivor_methods() -> list[dict[str, Any]]:
     """Methods the mission bot is allowed to fire, joined to their DSL conditions.
 
@@ -505,6 +533,16 @@ def _survivor_methods() -> list[dict[str, Any]]:
                              # outlive methods_pool rotation — Opus gate-v2 C1: joining back
                              # to the pool by id silently disarmed exactly those winners)
             if not d:
+                d = _method_def_from_brain(s["id"])   # audit#2 F1: pool rotation had ALREADY
+                                                      # silently disarmed hand-armed
+                                                      # wr_flush_notknife (lockbox p=0.0002);
+                                                      # brain.db dsl_canonical resurrects it
+            if not d:
+                if s["id"] not in _DEF_MISSING_LOGGED:   # loud, once per process (was silent)
+                    _DEF_MISSING_LOGGED.add(s["id"])
+                    _append(LT_DIR / "governance.jsonl",
+                            {"event": "method_def_missing", "id": s["id"],
+                             "ts_ms": int(time.time() * 1000)})
                 continue
             m = {**d}
             if s.get("source"):
@@ -643,9 +681,19 @@ def _mechanical_decisions(context: list[dict[str, Any]],
     except Exception:
         pass
     sized = {(o["coin"], o["method"]): o for o in msz.size_fires(fires, dists, lev=MECH_LEV)}
+    _lane_src = {m["id"]: m.get("source") for m in methods}
     out = []
     for (sym, mid) in fires:
         o = sized.get((sym, mid))
+        if not o and _lane_src.get(mid) == "lane_promoted" and mid not in dists:
+            # audit#2 F2: a brain.db-resurrected lane method has NO survivor_distribution
+            # by construction (only full_scale_validation writes that file) -> Kelly sizer
+            # skips it forever and the funnel is inert at the LAST hop. Fixed conservative
+            # size instead: 5% margin (half PER_POS_CAP), same ruin bounds as every path.
+            o = {"coin": sym, "method": mid, "margin_pct": 5.0}
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "lane_promoted_fixed_size", "symbol": sym, "method": mid,
+                     "margin_pct": 5.0})
         if not o:                                    # sizer skipped it (edge shrank away / capped out)
             _append(LT_DIR / "governance.jsonl", {"event": "proven_fire_unsized", "symbol": sym, "method": mid})
             continue
@@ -2360,10 +2408,34 @@ def run_once() -> dict[str, Any]:
         try:
             _lp = [m for m in _survivor_methods() if m.get("source") == "lane_promoted"]
             if _lp:
+                # churn guards (audit#2 F3 — parity with flush-mech, which got these from a
+                # Codex CRITICAL): a still-true condition re-fires every 90s cycle after a
+                # 1-bar SL, serially bleeding sl x lev. Dedup vs open+pending, 2h episode
+                # memo per (symbol, method), and a concurrent-open cap of 3.
                 _have = {d.get("symbol") for d in decisions}
-                mech_lane = [d for d in _apply_gap_veto(_mechanical_decisions(ctx, methods=_lp), ctx)
-                             if d.get("symbol") not in _have]
+                _have |= {p.get("symbol") for p in _load(POSITIONS)}
+                _have |= {q.get("symbol") for q in _load(PENDING)}
+                _ep_f = LT_DIR / "lane_mech_episodes.json"
+                try:
+                    _eps = json.loads(_ep_f.read_text(encoding="utf-8"))
+                    _eps = _eps if isinstance(_eps, dict) else {}
+                except Exception:
+                    _eps = {}
+                _lp_ids = {m["id"] for m in _lp}
+                _n_open = sum(1 for p in _load(POSITIONS) if p.get("mech_method") in _lp_ids)
+                mech_lane = []
+                for d in _apply_gap_veto(_mechanical_decisions(ctx, methods=_lp), ctx):
+                    _k = f"{d.get('symbol')}|{d.get('_mech_method') or ''}"
+                    if (d.get("symbol") in _have or _n_open + len(mech_lane) >= 3
+                            or now_ms - int(_eps.get(_k) or 0) < 2 * 3600 * 1000):
+                        continue
+                    _eps[_k] = now_ms
+                    mech_lane.append(d)
                 if mech_lane:
+                    _eps = dict(sorted(_eps.items(), key=lambda kv: -kv[1])[:200])
+                    _tmp = _ep_f.with_suffix(".tmp")
+                    _tmp.write_text(json.dumps(_eps), encoding="utf-8")
+                    os.replace(_tmp, _ep_f)
                     _append(LT_DIR / "governance.jsonl",
                             {"ts_ms": now_ms, "event": "lane_promoted_fire",
                              "symbols": [d.get("symbol") for d in mech_lane]})
