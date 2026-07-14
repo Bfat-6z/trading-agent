@@ -72,7 +72,32 @@ def get_chat_id(token: str) -> int | None:
     return None
 
 
-def _fmt_signal(p: dict) -> str | None:
+CLOSED = ROOT / "state" / "llm_trader" / "closed.jsonl"
+
+
+def _winrates() -> dict:
+    """Real win rates from the paper ledger for the signal footer (owner asked 'tỷ lệ win đâu').
+    Split by SOURCE + a recent-30 window, because the lifetime overall is dragged down by the
+    replaced gpt-5.5 degen era — the recent/flush numbers are what this system actually is."""
+    out = {}
+    try:
+        rows = [json.loads(l) for l in CLOSED.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except Exception:
+        return out
+
+    def wr(sub):
+        if not sub:
+            return None
+        w = sum(1 for r in sub if float(r.get("net", 0) or 0) > 0)
+        return f"{round(w / len(sub) * 100)}% ({w}/{len(sub)})"
+
+    out["flush"] = wr([r for r in rows if r.get("mech_method") == "flush_no_oi_mech"])
+    out["model"] = wr([r for r in rows if not r.get("mech_method")][-40:])   # recent model only
+    out["recent"] = wr(rows[-30:])
+    return out
+
+
+def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
     """Build a Telegram signal from an open-position row (paper), re-sized for the prop account."""
     try:
         sym = str(p.get("symbol") or "").replace("USDT", "")
@@ -93,8 +118,20 @@ def _fmt_signal(p: dict) -> str | None:
         margin = notional / max(1, lev)
         n_losers = int(DAILY_LOSS_CAP / risk_usd)                 # 4
         arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-        src = "🤖 máy (flush)" if str(p.get("mech_method") or "").startswith(("flush", "flush_")) else "🧠 model"
+        is_flush = str(p.get("mech_method") or "").startswith("flush")
+        src = "🤖 máy (flush)" if is_flush else "🧠 model"
         why = (p.get("rationale") or "")[:160]
+        wr = wr or {}
+        wr_src = wr.get("flush") if is_flush else wr.get("model")
+        wr_line = None
+        if wr_src or wr.get("recent"):
+            _lbl = "kèo flush" if is_flush else "model gần"
+            parts = []
+            if wr_src:
+                parts.append(f"win {_lbl} <b>{wr_src}</b>")
+            if wr.get("recent"):
+                parts.append(f"hệ 30 lệnh gần <b>{wr['recent']}</b>")
+            wr_line = "📈 " + " · ".join(parts)
 
         def px(v):
             return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
@@ -109,8 +146,10 @@ def _fmt_signal(p: dict) -> str | None:
             "━━━━━━━━━━━━━━",
             f"💰 <b>Prop $5K</b> (rủi ro 1%): vào ~<b>${notional:,.0f}</b> (ký quỹ ~${margin:,.0f} @ x{lev})",
             f"   → dính SL lỗ ~<b>${risk_usd:.0f}</b>. Trần ngày −${DAILY_LOSS_CAP:.0f} = tối đa <b>{n_losers} lệnh thua</b>.",
-            "⚠️ Vào TAY trên TidalFi. Kèo báo để tham khảo, không phải lệnh tự động.",
         ]
+        if wr_line:
+            lines.append(wr_line)
+        lines.append("⚠️ Vào TAY trên TidalFi. Kèo báo để tham khảo, không phải lệnh tự động.")
         if why:
             lines.append(f"💡 {why}")
         return "\n".join(lines)
@@ -126,12 +165,13 @@ def emit(open_rows: list[dict]) -> int:
     if not token or chat is None or not cfg.get("enabled", True):
         return 0
     sent = set(cfg.get("sent_ids") or [])
+    wr = _winrates()
     n = 0
     for p in open_rows or []:
         pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
         if pid in sent:
             continue
-        text = _fmt_signal(p)
+        text = _fmt_signal(p, wr)
         if not text:
             sent.add(pid)                # malformed -> mark so we don't retry every cycle
             continue
@@ -166,6 +206,7 @@ if __name__ == "__main__":                # CLI: setup + smoke test
     elif len(sys.argv) >= 2 and sys.argv[1] == "test":
         print(_fmt_signal({"symbol": "BTCUSDT", "side": "LONG", "entry": 62341.3,
                            "sl": 61094.0, "tp": 64834.0, "leverage": 10,
-                           "rationale": "4h bull, 15m pullback về EMA20 + volume, SL dưới swing."}))
+                           "mech_method": "flush_no_oi_mech",
+                           "rationale": "Capitulation flush -> bounce."}, _winrates()))
     else:
         print("usage: whale_signal.py set-token <TOKEN> | test")
