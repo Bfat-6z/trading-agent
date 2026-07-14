@@ -340,10 +340,21 @@ def emit_closes(closed_rows: list[dict]) -> int:
     token, chat = cfg.get("bot_token"), cfg.get("chat_id")
     if not token or chat is None or not cfg.get("enabled", True):
         return 0
+    # FIRST-RUN BASELINE (bugfix 2026-07-14): with no watermark, EVERY historical close looked
+    # "new" -> a 120-message burst -> Telegram 429 rate-limit. On first run, baseline to the newest
+    # close and send NOTHING historical; only genuinely-new closes fire afterwards.
+    if cfg.get("last_close_ts") is None:
+        mx = max((float(r.get("closed_ts") or 0) for r in (closed_rows or [])), default=0)
+        cfg["last_close_ts"] = mx
+        _save(cfg)
+        return 0
     wm = float(cfg.get("last_close_ts") or 0)
     new = [r for r in (closed_rows or []) if float(r.get("closed_ts") or 0) > wm]
     if not new:
         return 0
+    if len(new) > 5:                 # safety cap: never burst more than 5 closes/cycle (429 guard)
+        new = sorted(new, key=lambda x: float(x.get("closed_ts") or 0))[-5:]
+        cfg["last_close_ts"] = max(wm, min(float(r.get("closed_ts") or 0) for r in new) - 1)
     now_s = _t.time()
     est, w, l = _prop_day_est(closed_rows, now_s)
     left = DAILY_LOSS_CAP + est if est < 0 else DAILY_LOSS_CAP
