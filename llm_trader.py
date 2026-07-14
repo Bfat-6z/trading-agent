@@ -136,6 +136,9 @@ UNIVERSE_CACHE = LT_DIR / "universe_cache.json"
 # day; does not close positions).
 MAX_CONCURRENT = int(os.environ.get("LLM_TRADER_MAX_CONCURRENT", "50"))
 MAX_TOTAL_MARGIN_PCT = float(os.environ.get("LLM_TRADER_MAX_MARGIN_PCT", "95"))
+PER_TRADE_NOTIONAL_PCT = 100.0    # Codex CRITICAL-1: cap per-trade notional (size*lev) at 100% equity
+AGG_NOTIONAL_CAP_PCT = 400.0      # Codex CRITICAL-1: cap aggregate notional across open+new at 4x equity
+MAX_FLUSH_MECH_OPEN = 3           # Codex CRITICAL(flush): cap CONCURRENT mech-flush positions (per-EVENT bound)
 # Owner (2026-07-05): "bo cai phanh ngay do di" — DISABLE the daily-loss breaker.
 # Owner accepts the risk (paper account). Set to "1" to re-arm. NOTE: with this OFF
 # there is NO daily circuit-breaker; a run of losing capitulation fires on a hard
@@ -526,7 +529,7 @@ GAP_RISK_MULT = float(os.environ.get("MECH_GAP_RISK_MULT", "1.5"))
 # Bind the gate's liquidation distance AND the sizer to the SAME value so they can
 # never drift apart — a hardcoded 10 in one place and a x5 sizer would wrong-sign
 # the gate (Codex review point a). ~100/lev % is the naive liq distance at `lev`.
-MECH_LEV = int(os.environ.get("MECH_LEV", "10"))
+MECH_LEV = 10 if int(os.environ.get("MECH_LEV", "10") or 10) >= 10 else 5   # Codex: hard-clamp to {5,10} (env can't make mech x25)
 
 
 def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -681,7 +684,15 @@ def _flush_armed(now_ms: int) -> bool:
     try:
         rows = [r for r in _dedupe_closed(_load(CLOSED))
                 if str(r.get("mech_method") or "") in ("flush_no_oi_mech", "flush_oi_dn_mech")][-40:]
-        vals = [x for r in rows if math.isfinite(x := float(r.get("r") or 0))]   # drop null/NaN (bias guard)
+        vals = []                        # Codex: a single non-numeric r ("bad") raised -> outer catch
+        for r in rows:                    # -> fail-OPEN kept a decayed edge firing. Parse per row.
+            v = r.get("r")
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue                  # missing / non-numeric -> skip, don't poison the mean
+            if math.isfinite(fv):
+                vals.append(fv)
         try:
             st = json.loads(FLUSH_DISARM_FILE.read_text(encoding="utf-8"))
         except Exception:
@@ -733,8 +744,17 @@ def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
         return []
     by_sym = {c.get("symbol"): c for c in ctx}
     taken = {d.get("symbol") for d in (already or [])}
-    open_syms = ({p.get("symbol") for p in _load(POSITIONS)}
+    _open_rows = _load(POSITIONS)
+    open_syms = ({p.get("symbol") for p in _open_rows}
                  | {p.get("symbol") for p in _load(PENDING)})
+    # PER-EVENT cap (Codex CRITICAL): the 3/cycle cap did NOT bound one flush event — a trigger
+    # persisting across 90s cycles opened 3+3+3... to the margin cap. Cap CONCURRENT mech-flush
+    # positions instead: once MAX_FLUSH_MECH_OPEN are live, no more fire until they resolve. Also
+    # count the model's OWN flush-trigger picks this cycle against the budget (correlated exposure).
+    n_flush_open = sum(1 for p in _open_rows if str(p.get("mech_method") or "").startswith("flush"))
+    n_flush_model = sum(1 for d in (already or [])
+                        if any(pp in ("flush_no_oi", "flush_oi_dn") for pp in (d.get("_trigger_paths") or [])))
+    flush_budget = max(0, MAX_FLUSH_MECH_OPEN - n_flush_open - n_flush_model)
     # episode dedup: any flush-mech trade on this symbol entered/closed in the last 2h = same flush
     recent = set()
     try:
@@ -751,9 +771,10 @@ def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
     # multi-coin flush still builds across cycles, just not in one all-in candle.
     hits.sort(key=lambda sp: 0 if sp[1] == "flush_no_oi" else 1)
     for sym, path in hits:
-        if len(out) >= 3:
+        if len(out) >= flush_budget:      # concurrent cap: total live flush-mech <= MAX_FLUSH_MECH_OPEN
             _append(LT_DIR / "governance.jsonl",
-                    {"ts_ms": now_ms, "event": "flush_mech_cluster_cap", "skipped": sym})
+                    {"ts_ms": now_ms, "event": "flush_mech_concurrent_cap", "skipped": sym,
+                     "open": n_flush_open, "model": n_flush_model, "budget": flush_budget})
             continue
         c = by_sym.get(sym)
         if not c or sym in taken or sym in open_syms or sym in recent:
@@ -937,7 +958,12 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
             # lev<=25 (liq ≈ 100/lev%; the gap-veto scales with the chosen lev), size<=40% margin
             # (isolated: worst gap-to-liq loses the margin -> one trade can never wipe the account).
             lev = max(1, min(25, int(dec.get("leverage", 10) or 10)))
+            # PER-TRADE NOTIONAL CAP (Codex review CRITICAL-1): the model owns size+lev, but
+            # size*lev = notional must not blow the account. Cap notional at PER_TRADE_NOTIONAL_PCT
+            # of equity, so size AUTOMATICALLY shrinks as leverage rises (x25 -> <=4% margin;
+            # x5 -> <=20%). Replaces the removed x5/x10 band's implicit ceiling.
             size_pct = max(1.0, min(40.0, _sz))
+            size_pct = min(size_pct, PER_TRADE_NOTIONAL_PCT / lev)
             sl_pct = max(0.3, min(8.0, _sl))
             tp_pct = max(0.3, min(15.0, _tp))
         except Exception:
@@ -1566,6 +1592,16 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                      "symbol": d["symbol"]})
             continue
         notional = margin * lev
+        # AGGREGATE NOTIONAL CAP (Codex CRITICAL-1): total margin cap alone doesn't bound risk
+        # when leverage is free — 95% margin at x25 = 23x notional. Cap SUM of open notional
+        # (margin*lev) + this new one at AGG_NOTIONAL_CAP_PCT of equity. Bounds correlated ruin.
+        _open_notional = sum(float(p.get("margin") or 0) * int(p.get("leverage") or 1)
+                             for p in _load(POSITIONS))   # reflects opens already made THIS cycle
+        if equity > 0 and (_open_notional + notional) / equity * 100 > AGG_NOTIONAL_CAP_PCT:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "agg_notional_cap_block", "symbol": d["symbol"],
+                     "open_notional_pct": round(_open_notional / equity * 100), "add_pct": round(notional / equity * 100)})
+            continue
         qty = notional / entry if entry > 0 else 0.0
         # FULL TRUST (owner 2026-07-09: "the brain is gpt-5.5, let it think on the indicators + balance").
         # Use the model's OWN sl/tp % — it set them reading the multi-TF charts and structure itself. No
@@ -1694,16 +1730,25 @@ def _manage_positions_llm(client: Any, now_ms: int) -> int:
     if not cand:
         return 0
     stf = LT_DIR / "manage_state.json"
+    cursor = 0
     try:
-        if now_ms - int(json.loads(stf.read_text()).get("last_ms") or 0) < MANAGE_INTERVAL_MS:
+        _mst = json.loads(stf.read_text())
+        if now_ms - int(_mst.get("last_ms") or 0) < MANAGE_INTERVAL_MS:
             return 0
+        cursor = int(_mst.get("cursor") or 0)
     except Exception:
         pass
+    # ROTATE (Codex: only first 4 of N were ever managed) — window advances each pass so every
+    # position gets reviewed. EFFECTIVE sl/tp (Codex CRITICAL: the model saw the STALE entry sl,
+    # not its own prior adjustments in p['mgmt'] -> it could "tighten" and actually WIDEN).
+    if len(cand) > 4:
+        cursor = cursor % len(cand)
+        cand = (cand + cand)[cursor:cursor + 4]
     try:
         # stamp the throttle NOW (Opus F1): a failed pass (Binance ban -> no states; LLM down ->
         # no reply) must still cost the full cooldown, else every 90s cycle re-fires 4 klines
         # fetches + a vision call exactly when we need back-off (IP-ban history).
-        stf.write_text(json.dumps({"last_ms": now_ms}), encoding="utf-8")
+        stf.write_text(json.dumps({"last_ms": now_ms, "cursor": cursor}), encoding="utf-8")
     except Exception:
         pass
     images, states = [], []
@@ -1722,8 +1767,12 @@ def _manage_positions_llm(client: Any, now_ms: int) -> int:
             if not b64:
                 continue
             images.append((f"{p['symbol']} (your open {side})", b64))
+            _esl, _etp = float(p["sl"]), float(p["tp"])      # EFFECTIVE sl/tp = base + latest mgmt override
+            for _m in (p.get("mgmt") or []):
+                if _m.get("sl") is not None: _esl = float(_m["sl"])
+                if _m.get("tp") is not None: _etp = float(_m["tp"])
             states.append({"symbol": p["symbol"], "side": side, "leverage": p["leverage"],
-                           "entry": entry, "mark": mark, "sl": float(p["sl"]), "tp": float(p["tp"]),
+                           "entry": entry, "mark": mark, "sl": _esl, "tp": _etp,
                            "liq_px": p.get("liq_px"), "upnl_pct_on_margin": round(up_pct, 2),
                            "bars_held": int((now_ms - int(p["entry_ts"])) / bar_ms),
                            "your_entry_rationale": (p.get("rationale") or "")[:160]})
@@ -1801,7 +1850,7 @@ def _manage_positions_llm(client: Any, now_ms: int) -> int:
     if applied:
         _rewrite(POSITIONS, open_pos)
     try:
-        stf.write_text(json.dumps({"last_ms": now_ms}), encoding="utf-8")
+        stf.write_text(json.dumps({"last_ms": now_ms, "cursor": cursor + 4}), encoding="utf-8")
     except Exception:
         pass
     return applied
@@ -1879,9 +1928,14 @@ def resolve(client: Any, now_ms: int) -> int:
                 if _mgmt[_mi].get("tp") is not None: tp = float(_mgmt[_mi]["tp"])
                 _mi += 1
             if _crq and int(b["ts_ms"]) >= _crq:
-                # model requested a market close: fill at the OPEN of the first bar starting
-                # after the request (honest — no intrabar hindsight), market slippage below.
-                exit_px, reason = float(b.get("open") or b["close"]), "llm_close"
+                # model requested a market close: fill at the OPEN of the first bar starting after
+                # the request. Codex: if that bar GAPPED past liquidation, the position was
+                # liquidated BEFORE the voluntary close could fill — book liquidation, not llm_close.
+                _bo = float(b.get("open") or b["close"])
+                if (side == "LONG" and _bo <= liq_px) or (side == "SHORT" and _bo >= liq_px):
+                    exit_px, reason = liq_px, "liquidation"
+                else:
+                    exit_px, reason = _bo, "llm_close"
                 exit_ts = int(b["ts_ms"]); break
             if int(b["ts_ms"]) == fb_ts:
                 # the bar our limit filled on: intrabar sequence is unknown — a TP
