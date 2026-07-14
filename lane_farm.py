@@ -79,6 +79,18 @@ def _safe_key(mid: str) -> str:
     return "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(mid))[:48]
 
 
+def _pinned_defs() -> dict:
+    """Confirm-set pins (state/lanes/pinned_lanes.json, written by lane_promotion stage-A):
+    {lane_key: method_def} with defs stored INLINE, so methods_pool rotation can never
+    evict a pre-registered candidate mid-confirmation. Force-included past MAX_LANES
+    (bounded by SCREEN_MAX<=10)."""
+    try:
+        d = json.loads((LDIR / "pinned_lanes.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
 def lane_configs():
     defs = _all_method_defs()
     prio = {}                                        # rank slots by backtest expectancy
@@ -112,6 +124,20 @@ def lane_configs():
                       "tp": float(m.get("tp_pct") or 3.0), "to": int(m.get("timeout") or 16),
                       "max_open": MAX_OPEN, "methods": [m],
                       "ratchet": bool(m.get("ratchet"))})   # BE+trail exit walk (A/B vs fixed bracket)
+    # confirm-set pins LAST + past the cap: a registered candidate must always trade,
+    # even after methods_pool rotated its def out (defs come inline from the pin file).
+    for pk, m in _pinned_defs().items():
+        k = _safe_key(pk)
+        if k in seen or not isinstance(m, dict) or not (m.get("when") or m.get("conds")):
+            continue
+        seen.add(k)
+        lanes.append({"k": k, "mid": m.get("id", pk),
+                      "desc": ("PIN " + (m.get("desc") or m.get("family") or pk))[:44],
+                      "family": m.get("family") or "?", "side": m.get("side", "LONG"),
+                      "margin": MARGIN_PCT, "sl": float(m.get("sl_pct") or 1.5),
+                      "tp": float(m.get("tp_pct") or 3.0), "to": int(m.get("timeout") or 16),
+                      "max_open": MAX_OPEN, "methods": [m],
+                      "ratchet": bool(m.get("ratchet")), "pinned": True})
     dropped = evaluable - (len(lanes) - 1)            # -1 for the random control
     if dropped > 0:                                    # NO silent cull (owner: don't drop any)
         print(json.dumps({"warn": "lane cap hit", "evaluable": evaluable,

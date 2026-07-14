@@ -500,9 +500,15 @@ def _survivor_methods() -> list[dict[str, Any]]:
         out = []
         for s in src:
             d = defs.get(s["id"])
+            if not d and (s.get("when") or s.get("conds")):
+                d = s        # armed row carries its def INLINE (lane_promoted resurrections
+                             # outlive methods_pool rotation — Opus gate-v2 C1: joining back
+                             # to the pool by id silently disarmed exactly those winners)
             if not d:
                 continue
             m = {**d}
+            if s.get("source"):
+                m["source"] = s["source"]    # lane_promoted tag rides along for mode gating
             if s.get("sl_pct") is not None:      # deep-optimal exits override the pool default
                 m["sl_pct"] = s["sl_pct"]
             if s.get("tp_pct") is not None:
@@ -532,15 +538,17 @@ GAP_RISK_MULT = float(os.environ.get("MECH_GAP_RISK_MULT", "1.5"))
 MECH_LEV = 10 if int(os.environ.get("MECH_LEV", "10") or 10) >= 10 else 5   # Codex: hard-clamp to {5,10} (env can't make mech x25)
 
 
-def _mechanical_decisions(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _mechanical_decisions(context: list[dict[str, Any]],
+                          methods: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """PROVEN-ONLY decide: fire a trade ONLY where a lab-survivor method's DSL
     condition holds on the coin's live CLOSED bars — evaluated with method_lab's
     own feature_frame/method_fires (the exact code that proved it). Execution is
     faithful to what was backtested: the method's own sl/tp %, x10 (owner wants
-    size at max conviction), no structure override, no trailing, 16-bar timeout."""
+    size at max conviction), no structure override, no trailing, 16-bar timeout.
+    `methods` overrides the armed set (REDESIGN fires only lane_promoted rows)."""
     import method_lab as ml
     import mech_sizing as msz
-    methods = _survivor_methods()
+    methods = _survivor_methods() if methods is None else methods
     if not methods:
         return []
     # PASS 1: find every (coin, method) that FIRES this bar (one method per coin).
@@ -2345,6 +2353,24 @@ def run_once() -> dict[str, Any]:
         except Exception as _fme:
             _append(LT_DIR / "governance.jsonl",
                     {"ts_ms": now_ms, "event": "flush_mech_error", "error": repr(_fme)[:160]})
+        # LANE-PROMOTED methods fire mechanically in REDESIGN too (gate-v2 funnel output).
+        # Without this the promotion file was WRITE-ONLY in this mode (Opus C1 — the exact
+        # "wired but inert" disease the funnel redesign exists to cure). Scope: ONLY rows
+        # tagged source=lane_promoted — hand-armed behavior in REDESIGN is unchanged (off).
+        try:
+            _lp = [m for m in _survivor_methods() if m.get("source") == "lane_promoted"]
+            if _lp:
+                _have = {d.get("symbol") for d in decisions}
+                mech_lane = [d for d in _apply_gap_veto(_mechanical_decisions(ctx, methods=_lp), ctx)
+                             if d.get("symbol") not in _have]
+                if mech_lane:
+                    _append(LT_DIR / "governance.jsonl",
+                            {"ts_ms": now_ms, "event": "lane_promoted_fire",
+                             "symbols": [d.get("symbol") for d in mech_lane]})
+                decisions = decisions + mech_lane
+        except Exception as _lpe:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "lane_promoted_mech_error", "error": repr(_lpe)[:160]})
     else:
         # DISCRETIONARY: gpt-5.5 vision reads the charts and decides. Loosened from PROVEN_ONLY so the
         # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),
