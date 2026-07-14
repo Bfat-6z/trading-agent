@@ -25,6 +25,7 @@ CFG = ROOT / "state" / "whale_signal.json"
 ACCOUNT_USD = 5000.0      # TidalFi 5K Two-Step Challenge
 RISK_PCT = 1.0            # risk per trade => $50; daily cap $200 = 4 losers of headroom
 DAILY_LOSS_CAP = 200.0
+PROP_MAX_LEV = 5          # boss 2026-07-13: "ký quỹ max 5x thôi" — cap the SIGNAL leverage for prop
 _API = "https://api.telegram.org/bot{}/{}"
 
 
@@ -105,7 +106,7 @@ def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
         entry = float(p.get("entry") or 0)
         sl = float(p.get("sl") or 0)
         tp = float(p.get("tp") or 0)
-        lev = int(p.get("leverage") or 10)
+        lev = min(int(p.get("leverage") or 5), PROP_MAX_LEV)   # prop signal capped at 5x (boss)
         if not sym or side not in ("LONG", "SHORT") or entry <= 0 or sl <= 0 or tp <= 0:
             return None
         sl_pct = abs(entry - sl) / entry * 100
