@@ -1483,6 +1483,8 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                                   "tf_basis": d.get("tf_basis", "15m"),
                                   "trigger_paths": d.get("_trigger_paths"),   # R1 measurement tag
                                   "stage2": d.get("_stage2"),                 # R2 second-look outcome
+                                  "model": d.get("_model"), "pipeline_mode": d.get("_pipeline_mode"),
+                                  "tide_at_entry": d.get("_tide_at_entry"), "tide_aligned": d.get("_tide_aligned"),
                                   "rationale": d.get("rationale", "")})
                 pend_syms.add(d["symbol"])
             else:
@@ -1536,6 +1538,8 @@ def open_positions(decisions: list[dict[str, Any]], equity: float, now_iso: str,
                          "mech_method": d.get("_mech_method"), "entry_feats": d.get("_entry_feats"),
                          "trigger_paths": d.get("_trigger_paths"),   # R1: which selection paths fired (measurement)
                          "stage2": d.get("_stage2"),   # R2: confirmed | error_passthrough | skipped_budget | None
+                         "model": d.get("_model"), "pipeline_mode": d.get("_pipeline_mode"),   # provenance (gap #5)
+                         "tide_at_entry": d.get("_tide_at_entry"), "tide_aligned": d.get("_tide_aligned"),
                          "chart": chart_rel, "vol": d.get("vol_ratio"),   # volume at entry (owner watches this)
                          "hour_utc": (int(d["_ts"]) // 3600000) % 24, "rationale": d["rationale"]})
         open_syms.add(d["symbol"]); n += 1
@@ -1947,6 +1951,8 @@ def resolve(client: Any, now_ms: int) -> int:
                "mech_method": p.get("mech_method"), "entry_feats": p.get("entry_feats"),
                "trigger_paths": p.get("trigger_paths"),   # R1: per-path expectancy is judged on THIS field
                "stage2": p.get("stage2"),                 # R2: second-look outcome rides to the ledger
+               "model": p.get("model"), "pipeline_mode": p.get("pipeline_mode"),   # provenance (gap #5)
+               "tide_at_entry": p.get("tide_at_entry"), "tide_aligned": p.get("tide_aligned"),
                "rationale": p.get("rationale"), "chart": p.get("chart"), "closed_ts": now_ms}
         try:    # owner feature: closed-trade chart with BUY/SELL markers
             b64 = ltc.render_trade_chart(p["symbol"], fb, side=side,
@@ -2200,9 +2206,21 @@ def run_once() -> dict[str, Any]:
         # strong model actually trades — but the gap-tail RUIN veto still applies (bughunt LLM#1),
         # because "don't get liquidated on a gap" is safety, not rigidity.
         decisions = _apply_gap_veto(decide(ctx, equity, status=status, client=client, now_ms=now_ms), ctx)
+    # PROVENANCE STAMP (gap #5): every decision carries WHICH brain + mode + tide made it, so any
+    # future "does it have edge?" analysis can split cleanly by model era / pipeline / tide-alignment
+    # instead of confounding 3 model generations. A few strings now unlocks retroactive A/B forever.
+    _tide = getattr(_btc_context_chart, "_tide", None) if not PROVEN_ONLY else None
+    _mode = "PROVEN_ONLY" if PROVEN_ONLY else ("REDESIGN" if REDESIGN else "DISCRETIONARY")
     for _d in decisions:   # tag which trigger paths the coin hit THIS cycle (measurement metadata)
         try:
             _d["_trigger_paths"] = (trig_map.get(_d.get("symbol")) or {}).get("paths")
+            _d["_model"] = MODEL
+            _d["_pipeline_mode"] = _mode
+            _d["_tide_at_entry"] = (_tide or {}).get("tide") if isinstance(_tide, dict) else None
+            _side = str(_d.get("action") or "").upper()
+            _t = (_tide or {}).get("tide") if isinstance(_tide, dict) else None
+            _d["_tide_aligned"] = (None if _t in (None, "flat") else
+                                   (_side == "LONG") == (_t == "pumping"))
         except Exception:
             pass
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
