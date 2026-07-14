@@ -481,8 +481,36 @@ def emit_pending(pending_rows: list[dict]) -> int:
             return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
 
         arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-        text = (f"⏳ <b>CHỜ LIMIT — {sym}</b> · {arrow}\n"
+        # enrich (owner group asked 'tỷ lệ đâu'): a resting-limit ticket must carry the same
+        # info as a market entry — source, SL/TP, R:R, prop sizing + the win rates.
+        lev = min(int(q.get("leverage") or 5), PROP_MAX_LEV)     # prop cap 5x
+        slp = float(q.get("sl_pct") or 0)
+        tpp = float(q.get("tp_pct") or 0)
+        epf = float(ep)
+        if side == "LONG":
+            sl_px, tp_px = epf * (1 - slp / 100), epf * (1 + tpp / 100)
+        else:
+            sl_px, tp_px = epf * (1 + slp / 100), epf * (1 - tpp / 100)
+        rr = (tpp / slp) if slp > 0 else 0
+        is_flush = str(q.get("mech_method") or "").startswith("flush")
+        src = "🤖 máy (flush)" if is_flush else "🧠 model"
+        wr = _winrates()
+        wr_src = wr.get("flush") if is_flush else wr.get("model")
+        wr_bits = []
+        if wr_src:
+            wr_bits.append(f"win {'kèo flush' if is_flush else 'model gần'} <b>{wr_src}</b>")
+        if wr.get("recent"):
+            wr_bits.append(f"hệ 30 gần <b>{wr['recent']}</b>")
+        wr_line = ("📈 " + " · ".join(wr_bits) + "\n") if wr_bits else ""
+        risk_usd = ACCOUNT_USD * RISK_PCT / 100.0                # $50 = 1% acc
+        notional = risk_usd / (slp / 100.0) if slp > 0 else 0
+        margin = notional / max(1, lev)
+        rr_line = f"   🛑 SL <code>{px(sl_px)}</code> · 🎯 TP <code>{px(tp_px)}</code>" + (f" · R:R <b>{rr:.1f}</b>\n" if rr else "\n") if slp > 0 and tpp > 0 else ""
+        sz_line = f"   💵 vốn ~<b>${margin:,.0f}</b> · x{lev} · rủi ro <b>${risk_usd:,.0f}</b>\n" if notional > 0 else ""
+        text = (f"⏳ <b>CHỜ LIMIT — {sym}</b> · {arrow} · x{lev}   <i>({src})</i>\n"
+                f"━━━━━━━━━━━━━━\n"
                 f"   đặt LIMIT ở <code>{px(ep)}</code> (chờ giá về, ~2h)\n"
+                f"{rr_line}{sz_line}{wr_line}"
                 f"   👉 đặt limit trên TidalFi ngay để nằm cùng book.")
         if _send(token, chat, text):
             n += 1
