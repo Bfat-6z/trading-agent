@@ -161,7 +161,10 @@ def _fmt_signal(p: dict, wr: dict | None = None) -> str | None:
         lines.append(
             f"⏱ Đặt <b>LIMIT</b> ở giá entry (KHÔNG Market). Nếu giá đã chạy quá "
             f"<code>{px(skip_above)}</code> về phía TP → <b>BỎ</b>, đừng đuổi.")
-        lines.append("⚠️ Vào TAY trên TidalFi. Kèo tham khảo, không phải lệnh tự động.")
+        # TAP-TO-COPY order (owner wanted a 'copy button'): a Telegram <code> line copies on tap,
+        # so one tap gives the full ticket to paste on TidalFi — no browser automation, ToS-safe.
+        lines.append(f"📋 <code>{sym} {side} · vốn ${margin:,.0f} x{lev} · SL {px(sl)} · TP {px(tp)}</code>")
+        lines.append("⚠️ Vào TAY trên TidalFi (bấm dòng trên để copy). Kèo tham khảo, không phải lệnh tự động.")
         if why:
             lines.append(f"💡 {why}")
         return "\n".join(lines)
