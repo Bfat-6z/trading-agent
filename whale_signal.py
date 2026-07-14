@@ -203,6 +203,148 @@ def emit(open_rows: list[dict]) -> int:
     return n
 
 
+def _prop_day_window_start(now_s: float) -> float:
+    """Start of the CURRENT prop day: TidalFi daily loss resets 07:00 GMT+7."""
+    import time as _t
+    import calendar as _cal
+    lt = _t.gmtime(now_s + 7 * 3600)                      # GMT+7 wall clock
+    day_start_gmt7 = _cal.timegm((lt.tm_year, lt.tm_mon, lt.tm_mday, 7, 0, 0, 0, 0, 0)) - 7 * 3600
+    if now_s < day_start_gmt7:                            # before 07:00 -> window began yesterday
+        day_start_gmt7 -= 86400
+    return day_start_gmt7
+
+
+def _prop_day_est(closed_rows: list[dict], now_s: float) -> tuple[float, int, int]:
+    """Estimated prop-account P&L for TODAY's window if the owner took every signal at 1% risk:
+    each closed trade contributes actual_R * $50 (signal risk). Returns (est_usd, wins, losses)."""
+    start_ms = _prop_day_window_start(now_s) * 1000
+    est = 0.0; w = 0; l = 0
+    risk = ACCOUNT_USD * RISK_PCT / 100.0
+    for r in closed_rows or []:
+        try:
+            if float(r.get("closed_ts") or 0) < start_ms:
+                continue
+            aR = r.get("actual_R")
+            if aR is None:                                 # fallback: net/margin r (leverage-scaled)
+                continue
+            est += float(aR) * risk
+            if float(r.get("net") or 0) > 0: w += 1
+            else: l += 1
+        except Exception:
+            continue
+    return round(est, 2), w, l
+
+
+def _fmt_close(r: dict, day_line: str) -> str | None:
+    """Exit notification: the signal's OTHER half (owner: bot chỉ báo vào, không báo ra)."""
+    try:
+        sym = str(r.get("symbol") or "").replace("USDT", "")
+        side = str(r.get("side") or "").upper()
+        exit_px = float(r.get("exit") or 0)
+        reason = str(r.get("reason") or "")
+        aR = r.get("actual_R")
+        if not sym or exit_px <= 0:
+            return None
+        risk = ACCOUNT_USD * RISK_PCT / 100.0
+        prop = (float(aR) * risk) if aR is not None else None
+        win = (prop or 0) > 0 or float(r.get("net") or 0) > 0
+        head = "✅ CHỐT LỜI" if win else "🔻 ĐÓNG LỆNH"
+        why = {"tp": "chạm TP 🎯", "sl": "dính SL 🛑", "trail": "trail stop khóa lời 🪤",
+               "llm_close": "model TỰ CẮT (đổi ý) ✂️", "timeout": "hết giờ (timeout kèo máy) ⏱",
+               "liquidation": "THANH LÝ ⚠️"}.get(reason, reason)
+
+        def px(v):
+            return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
+
+        lines = [f"{head} — <b>{sym}</b> {side}",
+                 f"   thoát <code>{px(exit_px)}</code> · {why}"]
+        if prop is not None:
+            lines.append(f"   prop ước tính: <b>{'+' if prop >= 0 else ''}{prop:,.0f}$</b> (risk $50/kèo)")
+        if day_line:
+            lines.append(day_line)
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def emit_closes(closed_rows: list[dict]) -> int:
+    """Send exit notifications for NEW closes since the last watermark + the daily prop line.
+    Near the daily cap -> loud warning. Same fail-soft/dedup discipline as emit()."""
+    import time as _t
+    cfg = _load()
+    token, chat = cfg.get("bot_token"), cfg.get("chat_id")
+    if not token or chat is None or not cfg.get("enabled", True):
+        return 0
+    wm = float(cfg.get("last_close_ts") or 0)
+    new = [r for r in (closed_rows or []) if float(r.get("closed_ts") or 0) > wm]
+    if not new:
+        return 0
+    now_s = _t.time()
+    est, w, l = _prop_day_est(closed_rows, now_s)
+    left = DAILY_LOSS_CAP + est if est < 0 else DAILY_LOSS_CAP
+    day_line = (f"📅 Hôm nay (reset 07:00): <b>{'+' if est >= 0 else ''}{est:,.0f}$</b> ước tính"
+                f" ({w}W/{l}L) · trần −${DAILY_LOSS_CAP:.0f}")
+    n = 0
+    for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):
+        text = _fmt_close(r, day_line)
+        if text and est <= -150:
+            text += "\n⛔ <b>GẦN TRẦN NGÀY — khuyên NGỪNG đánh tới 07:00 mai.</b>"
+        if text:
+            res = _api(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                              "disable_web_page_preview": True})
+            if res and res.get("ok"):
+                n += 1
+        wm = max(wm, float(r.get("closed_ts") or 0))
+    cfg["last_close_ts"] = wm
+    _save(cfg)
+    return n
+
+
+def handle_commands(status_fn=None) -> int:
+    """Piggyback /status on the mission loop (getUpdates with offset — no extra process, ~one
+    cycle latency). status_fn() -> str provides the reply body."""
+    cfg = _load()
+    token, chat = cfg.get("bot_token"), cfg.get("chat_id")
+    if not token or chat is None:
+        return 0
+    d = _api(token, "getUpdates", {"offset": int(cfg.get("upd_offset") or 0) + 1, "limit": 10,
+                                   "timeout": 0}, timeout=10.0)
+    if not d or not d.get("ok"):
+        return 0
+    n = 0
+    last = int(cfg.get("upd_offset") or 0)
+    for upd in d.get("result") or []:
+        last = max(last, int(upd.get("update_id") or 0))
+        msg = upd.get("message") or {}
+        text = str(msg.get("text") or "").strip().lower()
+        if (msg.get("chat") or {}).get("id") != chat:
+            continue
+        if text.startswith("/status") or text in ("status", "sao roi", "sao rồi"):
+            body = None
+            try:
+                body = status_fn() if status_fn else None
+            except Exception:
+                body = None
+            _api(token, "sendMessage", {"chat_id": chat, "parse_mode": "HTML",
+                                        "text": body or "🐋 đang chạy — chưa có dữ liệu."})
+            n += 1
+    if last != int(cfg.get("upd_offset") or 0):
+        cfg["upd_offset"] = last
+        _save(cfg)
+    return n
+
+
+def tick(open_rows: list[dict], closed_rows: list[dict], status_fn=None) -> None:
+    """One call per mission cycle: entry signals + exit notifications + command handling.
+    Each part isolated — one failing must not stop the others."""
+    for fn in ((lambda: emit(open_rows)), (lambda: emit_closes(closed_rows)),
+               (lambda: handle_commands(status_fn))):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":                # CLI: setup + smoke test
     import sys
     cfg = _load()

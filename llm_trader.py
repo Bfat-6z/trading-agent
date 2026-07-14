@@ -2207,11 +2207,27 @@ def run_once() -> dict[str, Any]:
             pass
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
     try:
-        # CÁ VOI TẬP SỰ: push each NEW open position to Telegram as a manual-trade signal for the
-        # $5K prop challenge (dedup + prop-safe sizing inside). Dark until token configured; a
+        # CÁ VOI TẬP SỰ: entry signals + exit notifications + /status command, one tick per cycle
+        # (dedup + prop-safe sizing + daily-cap warning inside). Dark until token configured; a
         # Telegram error must NEVER touch the trading loop.
         import whale_signal
-        whale_signal.emit(_load(POSITIONS))
+
+        def _ws_status():
+            import time as _t
+            _rows = _dedupe_closed(_load(CLOSED))
+            est, w, l = whale_signal._prop_day_est(_rows[-120:], _t.time())
+            _wr = whale_signal._winrates()
+            _op = _load(POSITIONS)
+            _ol = "\n".join(f"  • {str(p.get('symbol') or '').replace('USDT','')} {p.get('side')}"
+                            f" ({p.get('mech_method') or 'model'})" for p in _op) or "  (không có)"
+            return ("🐋 <b>CÁ VOI TẬP SỰ — STATUS</b>\n"
+                    f"💼 Paper: <b>${acct['equity']:.2f}</b> · {acct['trades']} lệnh\n"
+                    f"📅 Prop hôm nay ước tính: <b>{'+' if est >= 0 else ''}{est:,.0f}$</b>"
+                    f" ({w}W/{l}L) · trần −$200\n"
+                    f"📈 win flush {_wr.get('flush') or '—'} · 30 lệnh gần {_wr.get('recent') or '—'}\n"
+                    f"📌 Đang mở:\n{_ol}")
+
+        whale_signal.tick(_load(POSITIONS), _dedupe_closed(_load(CLOSED))[-120:], _ws_status)
     except Exception as _wse:
         _append(LT_DIR / "governance.jsonl", {"ts_ms": now_ms, "event": "whale_signal_error", "error": repr(_wse)[:150]})
     try:
