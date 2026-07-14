@@ -1,0 +1,171 @@
+"""CÁ VOI TẬP SỰ — Telegram signal bot (owner 2026-07-13).
+
+The mission (llm_trader) decides paper trades; this ALSO pushes each new entry to Telegram as
+a signal the owner places MANUALLY on the TidalFi $5K prop challenge. Send-only (no polling ->
+~0 RAM), fail-soft (a Telegram error must never touch the trading loop), dedup by position id.
+
+PROP-SAFE SIZING (NOT the paper account's degen size): the challenge caps daily loss at $200
+and max drawdown at $300 on $5000, target $250. So each signal recommends risking ONLY ~1% =
+$50 (=> 4 losers before the daily cap). Position notional = risk$ / SL-distance. The SIGNAL
+(coin/side/entry/SL/TP) mirrors the mission exactly; only the SIZE is re-scaled for the prop.
+
+Config lives in state/whale_signal.json: {"bot_token","chat_id","enabled",...}. Dark (no-op)
+until bot_token + chat_id are set — get_chat_id() auto-detects the chat once the owner messages
+the bot. NEVER commits the token (state/ is gitignored runtime data).
+"""
+from __future__ import annotations
+
+import json
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+CFG = ROOT / "state" / "whale_signal.json"
+
+ACCOUNT_USD = 5000.0      # TidalFi 5K Two-Step Challenge
+RISK_PCT = 1.0            # risk per trade => $50; daily cap $200 = 4 losers of headroom
+DAILY_LOSS_CAP = 200.0
+_API = "https://api.telegram.org/bot{}/{}"
+
+
+def _load() -> dict:
+    try:
+        return json.loads(CFG.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save(d: dict) -> None:
+    try:
+        CFG.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CFG.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        import os
+        os.replace(tmp, CFG)
+    except Exception:
+        pass
+
+
+def _api(token: str, method: str, payload: dict, timeout: float = 8.0) -> dict | None:
+    try:
+        req = urllib.request.Request(
+            _API.format(token, method),
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def get_chat_id(token: str) -> int | None:
+    """Auto-detect the owner's chat id from the most recent message to the bot (setup helper —
+    owner sends any message to the bot, then we read it here). Returns None if none yet."""
+    d = _api(token, "getUpdates", {"limit": 5, "timeout": 0}, timeout=10.0)
+    if not d or not d.get("ok"):
+        return None
+    for upd in reversed(d.get("result") or []):
+        msg = upd.get("message") or upd.get("channel_post") or {}
+        cid = (msg.get("chat") or {}).get("id")
+        if cid is not None:
+            return int(cid)
+    return None
+
+
+def _fmt_signal(p: dict) -> str | None:
+    """Build a Telegram signal from an open-position row (paper), re-sized for the prop account."""
+    try:
+        sym = str(p.get("symbol") or "").replace("USDT", "")
+        side = str(p.get("side") or "").upper()
+        entry = float(p.get("entry") or 0)
+        sl = float(p.get("sl") or 0)
+        tp = float(p.get("tp") or 0)
+        lev = int(p.get("leverage") or 10)
+        if not sym or side not in ("LONG", "SHORT") or entry <= 0 or sl <= 0 or tp <= 0:
+            return None
+        sl_pct = abs(entry - sl) / entry * 100
+        tp_pct = abs(tp - entry) / entry * 100
+        if sl_pct <= 0:
+            return None
+        rr = tp_pct / sl_pct
+        risk_usd = ACCOUNT_USD * RISK_PCT / 100.0                 # $50
+        notional = risk_usd / (sl_pct / 100.0)                    # position size in USDT for a $50 risk
+        margin = notional / max(1, lev)
+        n_losers = int(DAILY_LOSS_CAP / risk_usd)                 # 4
+        arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+        src = "🤖 máy (flush)" if str(p.get("mech_method") or "").startswith(("flush", "flush_")) else "🧠 model"
+        why = (p.get("rationale") or "")[:160]
+
+        def px(v):
+            return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
+
+        lines = [
+            "🐋 <b>CÁ VOI TẬP SỰ</b> — KÈO MỚI",
+            "━━━━━━━━━━━━━━",
+            f"📊 <b>{sym}</b> · {arrow} · x{lev}   <i>({src})</i>",
+            f"📍 Entry: <code>{px(entry)}</code>",
+            f"🛑 SL: <code>{px(sl)}</code>  (−{sl_pct:.2f}%)",
+            f"🎯 TP: <code>{px(tp)}</code>  (+{tp_pct:.2f}%)  ·  R:R <b>{rr:.1f}</b>",
+            "━━━━━━━━━━━━━━",
+            f"💰 <b>Prop $5K</b> (rủi ro 1%): vào ~<b>${notional:,.0f}</b> (ký quỹ ~${margin:,.0f} @ x{lev})",
+            f"   → dính SL lỗ ~<b>${risk_usd:.0f}</b>. Trần ngày −${DAILY_LOSS_CAP:.0f} = tối đa <b>{n_losers} lệnh thua</b>.",
+            "⚠️ Vào TAY trên TidalFi. Kèo báo để tham khảo, không phải lệnh tự động.",
+        ]
+        if why:
+            lines.append(f"💡 {why}")
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def emit(open_rows: list[dict]) -> int:
+    """Send a Telegram signal for each NEW open position (dedup by pos id). Called from the
+    mission loop end. No-op (returns 0) until config has bot_token + chat_id + enabled."""
+    cfg = _load()
+    token, chat = cfg.get("bot_token"), cfg.get("chat_id")
+    if not token or chat is None or not cfg.get("enabled", True):
+        return 0
+    sent = set(cfg.get("sent_ids") or [])
+    n = 0
+    for p in open_rows or []:
+        pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
+        if pid in sent:
+            continue
+        text = _fmt_signal(p)
+        if not text:
+            sent.add(pid)                # malformed -> mark so we don't retry every cycle
+            continue
+        res = _api(token, "sendMessage",
+                   {"chat_id": chat, "text": text, "parse_mode": "HTML",
+                    "disable_web_page_preview": True})
+        if res and res.get("ok"):
+            sent.add(pid)
+            n += 1
+        # transient send failure -> NOT marked -> retried next cycle (a signal is worth retrying)
+    if n or len(sent) != len(set(cfg.get("sent_ids") or [])):
+        cfg["sent_ids"] = list(sent)[-500:]
+        _save(cfg)
+    return n
+
+
+if __name__ == "__main__":                # CLI: setup + smoke test
+    import sys
+    cfg = _load()
+    if len(sys.argv) >= 3 and sys.argv[1] == "set-token":
+        cfg["bot_token"] = sys.argv[2]
+        _save(cfg)
+        cid = get_chat_id(sys.argv[2])
+        if cid is not None:
+            cfg["chat_id"] = cid
+            _save(cfg)
+            _api(sys.argv[2], "sendMessage",
+                 {"chat_id": cid, "text": "🐋 Cá Voi Tập Sự đã kết nối. Từ giờ mọi kèo sẽ báo về đây."})
+            print(json.dumps({"ok": True, "chat_id": cid}))
+        else:
+            print(json.dumps({"ok": False, "need": "nhắn 1 tin cho bot rồi chạy lại"}))
+    elif len(sys.argv) >= 2 and sys.argv[1] == "test":
+        print(_fmt_signal({"symbol": "BTCUSDT", "side": "LONG", "entry": 62341.3,
+                           "sl": 61094.0, "tp": 64834.0, "leverage": 10,
+                           "rationale": "4h bull, 15m pullback về EMA20 + volume, SL dưới swing."}))
+    else:
+        print("usage: whale_signal.py set-token <TOKEN> | test")

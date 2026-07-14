@@ -2207,6 +2207,14 @@ def run_once() -> dict[str, Any]:
             pass
     opened = open_positions(decisions, equity, utc_now(), now_ms=now_ms)
     try:
+        # CÁ VOI TẬP SỰ: push each NEW open position to Telegram as a manual-trade signal for the
+        # $5K prop challenge (dedup + prop-safe sizing inside). Dark until token configured; a
+        # Telegram error must NEVER touch the trading loop.
+        import whale_signal
+        whale_signal.emit(_load(POSITIONS))
+    except Exception as _wse:
+        _append(LT_DIR / "governance.jsonl", {"ts_ms": now_ms, "event": "whale_signal_error", "error": repr(_wse)[:150]})
+    try:
         _write_daily_progress(now_ms)   # P1 KPI snapshot; best-effort, never blocks the cycle
     except Exception:
         pass
