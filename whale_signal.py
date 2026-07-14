@@ -396,11 +396,66 @@ def handle_commands(status_fn=None) -> int:
     return n
 
 
+INCIDENTS = ROOT / "state" / "incidents_latest.json"
+
+
+def emit_ops_alerts() -> int:
+    """OPS ALERT DRAIN (gap #8): incidents ARE recorded (state/incidents_latest.json) but nobody
+    is told — the supervisor wedged 77min + a 6h quarantine happened silently. Push each NEW open,
+    action-required incident to Telegram (deduped by incident_id). Distinct '🔧 HỆ THỐNG' prefix so
+    it's not confused with a trade signal. Only recent (<6h) unresolved ones -> no startup flood."""
+    import time as _t
+    cfg = _load()
+    token, chat = cfg.get("bot_token"), cfg.get("chat_id")
+    if not token or chat is None or not cfg.get("ops_alerts", True):
+        return 0
+    try:
+        d = json.loads(INCIDENTS.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    incs = []
+    if isinstance(d.get("latest"), dict):
+        incs.append(d["latest"])
+    for r in (d.get("recent") or []):
+        if isinstance(r, dict):
+            incs.append(r)
+    sent = set(cfg.get("alerted_incidents") or [])
+    n = 0
+    for inc in incs:
+        iid = inc.get("incident_id")
+        if not iid or iid in sent:
+            continue
+        if inc.get("resolved_at") or inc.get("closed_at"):
+            sent.add(iid)                # already handled -> just remember, don't alert
+            continue
+        try:                             # skip stale (>6h) so a first run doesn't flood
+            op = inc.get("opened_at")
+            if op:
+                import calendar as _cal
+                ts = _cal.timegm(_t.strptime(str(op)[:19], "%Y-%m-%dT%H:%M:%S"))
+                if _t.time() - ts > 6 * 3600:
+                    sent.add(iid)
+                    continue
+        except Exception:
+            pass
+        text = ("🔧 <b>HỆ THỐNG — SỰ CỐ</b>\n"
+                f"• {inc.get('dedupe_key') or inc.get('incident_id')}\n"
+                f"• cần: {inc.get('action_required') or '—'}\n"
+                f"<code>{str(inc.get('detail'))[:180]}</code>")
+        if _send(token, chat, text):
+            sent.add(iid)
+            n += 1
+    if n or len(sent) != len(set(cfg.get("alerted_incidents") or [])):
+        cfg["alerted_incidents"] = list(sent)[-200:]
+        _save(cfg)
+    return n
+
+
 def tick(open_rows: list[dict], closed_rows: list[dict], status_fn=None) -> None:
     """One call per mission cycle: entry signals + exit notifications + command handling.
     Each part isolated — one failing must not stop the others."""
     for fn in ((lambda: emit(open_rows, closed_rows)), (lambda: emit_closes(closed_rows)),
-               (lambda: handle_commands(status_fn))):
+               (lambda: emit_ops_alerts()), (lambda: handle_commands(status_fn))):
         try:
             fn()
         except Exception:
