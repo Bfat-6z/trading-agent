@@ -1,0 +1,348 @@
+{
+  "summary": "Find MISSING capabilities across the trading system (signal bot, mission, risk/prop, ops/data) — gaps, not bugs",
+  "agentCount": 5,
+  "logs": [],
+  "result": {
+    "n_gaps": 28,
+    "plan": "Skill: none — synthesis/ranking task, no code edits or debugging involved.\n\n# Build Plan hợp nhất — Gap Audit 4 chiều (signal-bot / mission-loop / risk-prop / ops-data)\n\n## 1. Executive Summary — 3 gap quan trọng nhất\n\n**① Signal layer mù hoàn toàn về trạng thái prop account (gộp 5 finding).** Mỗi signal size độc lập ($50 risk → notional không clamp), không đếm số kèo đang mở, không biết hôm nay đã thua bao nhiêu, không cảnh báo 3 flush-LONG cùng cycle = một cược BTC-beta duy nhất. Kịch bản cháy cụ thể: ngày đang −$160, flush bắn thêm signal full-size, SL hit → thủng $200 daily cap → challenge $5K fail **bởi chính signal mà bot đủ dữ liệu để chặn**. Đây là cluster duy nhất chạm trực tiếp tiền thật và owner đã approve daily prop tracker — làm đầu tiên.\n\n**② Signal không \"follow được\": mọi thứ sau entry là vô hình.** Paper book trail SL về BE, đóng sớm, đặt/hủy LIMIT — owner không nhận được gì. Hệ quả kép: (a) owner ôm stop gốc trong khi paper đã thoát hòa → ăn nguyên −$50 trên trade hệ thống tính là scratch; (b) LIMIT signal chỉ bắn **sau khi** paper đã fill → owner chỉ fill khi có retest, tức là hụt đúng những cú flush-bounce là edge duy nhất đã confirm. Win-rate footer đang quảng cáo một track record mà người theo tay **về mặt cấu trúc không thể tái tạo**. Owner đã approve close-notifications — mở rộng thành full lifecycle (place → fill → mgmt update → close/cancel).\n\n**③ Learning loop hở ở đúng chỗ tiền chảy nhiều nhất: flush mech auto-fire trên verdict đóng băng + ledger không có provenance.** Path bắn tự động 3 lệnh x10/cycle dựa trên hardcoded string \"CONFIRMED\", không có disarm condition, calibration còn exclude mech rows. Đồng thời closed ledger không stamp model/mode/tide → mọi câu trả lời \"có edge không\" (lý do tồn tại của cả project) bị confound qua 3 model era. Stamp provenance là vài dòng code nhưng làm mọi A/B tương lai khả thi hồi tố — làm ngay kẻo mất thêm data-days.\n\nNguyên tắc xuyên suốt: **không thêm resident process nào** (máy đói RAM) — mọi thứ piggyback vào loop/supervisor/scheduled-task sẵn có.\n\n## 2. Bảng ranked đầy đủ\n\n| # | P | Effort | Item | What + Why (1 dòng) |\n|---|---|--------|------|---------------------|\n| 1 | P0 | S | **Telegram sender hardening** | Log mọi send fail + error_code, honor `retry_after` (429), stop retry 4xx permanent, fallback plain-text khi HTML parse fail — nền móng cho mọi item Telegram phía dưới; hiện tại token revoked = im lặng vĩnh viễn. |\n| 2 | P0 | M | **Prop risk state layer** (gộp: cap-suppression + aggregate exposure + margin clamp + cluster warning) | emit() gọi `_prop_day_est()` trước khi bắn KÈO MỚI (chặn/red-flag khi est ≤ −$150), in \"kèo đang mở: N, tổng risk $X\", clamp notional/margin vs $5K, đếm same-direction alt-LONG — chặn đúng kịch bản cháy challenge trong 1 nến. |\n| 3 | P0 | M | **Position lifecycle notifications** (mgmt/close — owner đã approve) | Detect thay đổi `p['mgmt']`/trail/BE/early-close per pos_id → gửi message UPDATE mới (lưu message_id để reply-thread, KHÔNG build editMessageText); hết cảnh owner ôm stop gốc trong khi paper đã hòa vốn. |\n| 4 | P0 | M | **LIMIT placement + cancel signals** | Bắn signal tại thời điểm vào PENDING book (\"resting limit tại X, valid ~2h\") + notice khi cancel/expire — để lệnh tay của owner nằm trong book cùng lúc với paper, thay vì fill-sau-retest hụt hết flush edge. |\n| 5 | P0 | S | **Provenance + tide stamping** | Stamp `model / pipeline_mode / decision_path(vision‖numeric_fallback) / tide_at_entry / tide_aligned` vào open+closed rows — vài dòng, mở khóa mọi phân tích era/compliance về sau; mỗi ngày chưa stamp là data-day mất trắng. |\n| 6 | P0 | M | **Flush edge-decay monitor + auto-disarm** | Job so rolling mission-realized mean-R của `flush_*_mech` vs shadow expectation, dưới ngưỡng → disarm + alert (chạy trong cycle sẵn có) — path auto-fire to nhất không thể chạy vô hạn trên verdict hardcoded. |\n| 7 | P0 | S | **Backup brain.db + events.jsonl** | Scheduled task (Windows Task Scheduler, không daemon): sqlite `.backup()` + copy events.jsonl/chain_head sang ổ khác/cloud, half-day; git hóa fleet_watchdog.ps1/run_*.bat — 648 trials + hash-chain hiện là single-copy trên 1 ổ đĩa, mất là mất bằng chứng không replay được. |\n| 8 | P0 | S | **Ops alert drain qua Telegram sẵn có** | Piggyback vào llm_trader loop hoặc supervisor tick: drain `alert_outbox.jsonl` → sender của whale_signal (sau item 1) — vụ supervisor wedge 77 phút + quarantine 6h đã xảy ra mà không ai biết. |\n| 9 | P1 | S | **Signal timestamp + expiry + sequence ID** (gộp 2 finding) | In giờ signal + \"hết hạn sau X phút\", skip row cũ hơn ~2 cycle khi send, đánh số \"kèo #N\" + note \"lệnh trước trên coin này đã đóng\" — chặn stale-flood lúc onboard và nhầm re-fire với duplicate. |\n| 10 | P1 | S | **Max-DD $300 cumulative tracker** | Mở rộng prop layer (item 2): running peak/trough cross-day, cảnh báo khi tiến gần −$300 và đưa vào /status — Two-Step chết vì bleed đa ngày mà daily tracker không thấy. |\n| 11 | P1 | S | **Memory recency decay / era windowing** | Half-life decay hoặc filter theo era-tag (cần item 5) trong `aggregate_stats`/`distill_lessons` — model 5.6-sol đang bị dạy bằng track record của degen-era 5.5 đã chết, unwindowed lessons = anti-learning. |\n| 12 | P1 | M | **Stage-2 rejection shadow ledger** | Persist full bracket khi REJECT, replay bằng resolve math sẵn có (cùng pattern shadow_trigger_eval), thêm by_stage2 vào calibration — stage-2 giết phần lớn proposals mà chưa ai biết nó cộng hay trừ EV, và rejection-memory đang compound lỗi chưa đo. |\n| 13 | P1 | S | **Per-process memory watchdog trong supervisor** | Supervisor đã enumerate PID per agent → sample WorkingSet mỗi tick, alert/restart khi vượt ngưỡng (KHÔNG process mới) — leak 750MB đã giết mission một lần, 16GB RAM không có lần hai miễn phí. |\n| 14 | P1 | M | **Log rotation thật sự chạy** | Scheduled task gọi retention_policy/archive sẵn có + truncate nguồn (whale_flow 559MB, micro 486MB...); sửa shadow_trigger_eval đọc incremental (offset) thay vì full-file — chặn cả disk-fill lẫn heartbeat-blown → kill-loop giả. |\n| 15 | P1 | S | **Universe listing screen tự động** | Job diff Binance perp listing vs known bases + heuristic RTH-volume/weekend-ATR, alert base ticker lạ — tokenized stocks ăn ~50% lane loss và rename (SKHY) lách blacklist tay. |\n| 16 | P1 | M | **Discretionary aggregate exposure cap** | Cap tổng notional (hiện cho phép ~23x equity) + same-side concentration trên path LLM (mech đã có cluster cap) — portfolio gap-tail là đúng kiểu ruin HMSTR, và concentration này export thẳng ra prop signal. |\n| 17 | P2 | S | **MTM check trong daily breaker** | Cộng unrealized của open positions vào check −15% (vài dòng trong lr.daily_breaker) — flush day 12 lệnh −8% unrealized mà breaker báo \"ok\" là lỗ hổng thật nhưng paper-only nên xếp sau. |\n| 18 | P2 | M | **Board-pass counterfactual scoring** | Batch job join picks → N-bar returns, so vs activity-fallback + random-6 — selection stage 0 chưa đo, nhưng chờ cost-efficient redesign ổn định pipeline đã rồi hãy đo kẻo đo xong lại đập. |\n| 19 | P2 | S | **Daily health digest qua Telegram** | 1 message/ngày (fleet state, incidents, paper PnL, verdict changes) compose trong daily_exam sẵn có — thay thế vòng lặp \"mở Claude session hỏi\" đang đốt $200 sub. |\n| 20 | P2 | S | **News-path direction fix trong shadow eval** | `_direction()` trả None cho 'news' → mọi news-fire rơi khỏi đo edge; fix nhỏ để path này ít nhất đo được thay vì vô hình. |\n\n**Thứ tự thi công đề xuất:** 1 → 2 → 5 → 7 (tuần đầu, toàn S trừ 2) → 3 → 4 → 6 → 8 → rồi P1 theo bảng. Item 5 và 7 làm sớm dù không \"gấp\" vì chi phí trì hoãn tích lũy theo ngày (data không stamp / không backup là mất vĩnh viễn).\n\n## 3. DO-NOT-BUILD — chủ động bỏ\n\n| Bỏ | Lý do |\n|----|-------|\n| **editMessageText / sửa message gốc** | Message UPDATE mới + reply-thread (lưu message_id) đạt 95% giá trị với 20% độ phức tạp; edit-in-place dễ silent-fail (message quá 48h, parse error) đúng kiểu lỗi item 1 vừa phải vá. |\n| **Full latency/duration instrumentation + per-cycle thinking archive** | Speculative: chưa có quyết định nào chờ số liệu này, pipeline đang bị redesign vì cost — instrument xong lại vứt. Nếu cần realism, stamp 1 field `price_age_s` lúc fill trong item 5 là đủ (gần free). |\n| **Cancelled-limit counterfactual replay** | Defer, không kill hẳn: chờ stage-2 shadow (item 12) dựng xong framework replay + chờ limit-doctrine sống sót qua redesign. Build bây giờ = M effort cho doctrine có thể bị xóa. |\n| **Backfill lịch sử cho chart_align / whale / funding_extreme** | Forensic đã cho thấy các path này gần chết; đổ M effort backfill cho trigger sắp bị KILL là ngược ưu tiên. Để verdict engine tự tích n_live; chỉ fix news-direction (item 20) vì rẻ. |\n| **Drawdown-adaptive RISK_PCT (tự co 1%→0.5%)** | Sizing tự động chưa prove được trên chính paper book; với prop, **halt/cảnh báo** (item 2+10) an toàn và dễ audit hơn logic co giãn — thêm degree-of-freedom chưa có bằng chứng = thêm chỗ bug. |\n| **Bất kỳ resident process mới nào** (alert daemon, digest daemon, watchdog process riêng) | Máy đói RAM, leak đã giết mission một lần. Mọi item trên đều piggyback: supervisor tick, llm_trader cycle, daily_exam, Windows Task Scheduler one-shot. |\n| **Signal-side auto-position-management đầy đủ (bot tự tính partial TP, pyramid cho owner)** | Owner trade tay; ticket càng phức tạp càng khó thi hành đúng. Giữ signal = entry/SL/TP/update rõ ràng, phần còn lại là kỷ luật người. |\n| **Sửa fail-open kill_switch / equity-wipe từ bughunt cũ trong lane-farm** | Không nằm trong 4 dimension này và lane-farm là paper sandbox đang có plan Tier1-5 riêng (plans/bughunt_2026-07-08.md) — đừng trộn scope. |",
+    "raw": [
+      {
+        "title": "SL/TP management updates never reach Telegram (and message_id is discarded, so the original signal can't even be edited)",
+        "what_is_missing": "The paper bot actively manages positions after entry: the LLM manage pass runs every ~4 min and appends new SL/TP to p['mgmt'] (llm_trader.py:1620, 1741-1746) or requests early CLOSE (llm_trader.py:1708-1713), and resolve() runs a mechanical breakeven+trailing ratchet past +2R (llm_trader.py:1796-1798, 1858). None of this is ever sent: whale_signal.emit() dedups by pos_id so each position produces exactly one message for its whole life (whale_signal.py:186-188), _fmt_signal reads only the ORIGINAL entry/sl/tp fields (whale_signal.py:104-109, never p['mgmt']), and the sendMessage response's message_id is thrown away (whale_signal.py:193-198) so there is no way to edit/reply-thread an update onto the original signal even if one wanted to.",
+        "why_it_matters": "The owner's manual TidalFi position rides the original wide stop while the paper book trails to breakeven — e.g. paper moves SL to BE, price reverses, paper exits flat but the owner eats the full −$50; two of those divergences burn half the $200 daily cap on trades the system counts as scratches. Worse, the win-rate footer in every signal (whale_signal.py:126-135) advertises managed-exit performance the manual follower structurally cannot replicate. Fix needs: detect mgmt/trail changes per open pos_id, send an UPDATE message (or editMessageText via stored message_id) with the new SL/TP.",
+        "effort": "M",
+        "priority": "P0",
+        "dim": "signal-bot"
+      },
+      {
+        "title": "Limit-order signals fire only AFTER the paper fill — placements and cancellations are invisible",
+        "what_is_missing": "The model is explicitly prompted to prefer pullback LIMIT entries (llm_trader.py:943-949), which go into a PENDING book (llm_trader.py:1475-1486), fill only when a CLOSED 15m bar touches the level (llm_trader.py:1566-1572), and cancel after 8 bars ≈ 2h or a >2% run-away (llm_trader.py:1556, 1603-1613, events to pending_events.jsonl only). whale_signal never sees any of this: emit() is fed only _load(POSITIONS) (llm_trader.py:2214) and whale_signal.py contains zero references to the PENDING file — so the Telegram signal for every limit-path trade arrives at least one closed bar + one cycle AFTER the level already traded, and cancelled setups produce no message at all.",
+        "why_it_matters": "The signal tells the owner 'đặt LIMIT ở giá entry' (whale_signal.py:161-163) at a price that has already been hit — the owner's order fills only on a RETEST, while the paper book (and the advertised win rates) captured the first touch. On flush bounces that don't retest, the owner systematically misses the exact trades that carry the system's only confirmed edge, or the 0.5-0.8% chase tolerance converts them to auto-skips. A serious service signals at order PLACEMENT ('resting limit at X, valid ~2h') plus a cancel notice, so the owner's manual limit rests in the book alongside the paper one.",
+        "effort": "M",
+        "priority": "P0",
+        "dim": "signal-bot"
+      },
+      {
+        "title": "No signal timestamp, age filter, or expiry — stale positions broadcast as fresh 'KÈO MỚI'",
+        "what_is_missing": "_fmt_signal never reads entry_ts/opened_at (whale_signal.py:104-109 — fields exist on every position row, llm_trader.py:1532) and the message contains no timestamp or valid-until line (whale_signal.py:140-169). emit() has no max-age cutoff: on first enable sent_ids is empty so every already-open position — potentially hours old — is signaled as new (whale_signal.py:182-188), and a transiently failed send is retried on every later cycle indefinitely with no 'too old now' check (whale_signal.py:199). The paper bot itself expires resting limits after ~2h (llm_trader.py:1556) yet the signal gives the owner no validity window.",
+        "why_it_matters": "A 03:00 flush signal read at 08:00 (after the bounce completed and price round-tripped back inside the 0.5% chase tolerance) looks perfectly placeable — the owner enters a dead setup with the daily budget. Same failure at onboarding: enabling the bot mid-session floods hours-old entries labelled KÈO MỚI. The existing chase-tolerance line only protects against price having RUN, not against the setup being time-dead. Fix is small: skip rows older than ~2 cycles at send time, and print signal time + 'hết hạn sau X phút' in the message.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "signal-bot"
+      },
+      {
+        "title": "Delivery failures are completely silent — no logging, no error-code handling, no permanent-failure detection",
+        "what_is_missing": "_api swallows every exception and returns None (whale_signal.py:56-59); emit's failure branch is an unlogged non-mark — there is no else/logging path anywhere in whale_signal.py when res is None or ok:false (whale_signal.py:193-199); the governance hook in the loop fires only if emit RAISES (llm_trader.py:2215-2216), which its internal try/excepts prevent. There is no distinction between transient errors (429 rate-limit — retry_after is never read; network) and permanent ones (401 revoked token, 403 owner blocked the bot, 400 HTML parse error — the rationale is interpolated unescaped into parse_mode=HTML at whale_signal.py:124, 169, so a single '<' in a model rationale makes that signal fail on every retry forever), and no fallback such as a plain-text resend.",
+        "why_it_matters": "If the token is revoked or the owner accidentally blocks/archives the bot, signal flow stops silently and permanently; the owner reads days of silence as 'no setups' precisely while the flush edge is firing, and nothing anywhere (governance.jsonl included) records that N sends failed. Minimum fix: log every non-ok response with the Telegram error_code/description, stop retrying 4xx-permanent failures, honor retry_after for 429, and fall back to plain text when HTML parsing fails.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "signal-bot"
+      },
+      {
+        "title": "No aggregate prop-exposure awareness — each signal sizes in isolation against the $5K account",
+        "what_is_missing": "Per-signal sizing is computed solely from that trade's SL distance: notional = $50 / sl_pct with no cap versus ACCOUNT_USD and no margin-feasibility check (whale_signal.py:117-119) — a 0.4% SL yields $12.5K notional, $2.5K margin = 50% of the account for one trade. Nothing tracks concurrently-open signaled positions (the only state is sent_ids, whale_signal.py:182), even though the loop can open up to 50 concurrent (llm_trader.py:137) and the flush-mech path fires up to 3 correlated LONGs in a single cycle (llm_trader.py:698-706). Every message independently claims 'trần ngày −$200 = tối đa 4 lệnh thua' (whale_signal.py:120, 149) regardless of how many signals are already live.",
+        "why_it_matters": "A market-wide capitulation cycle emits 3 simultaneous correlated LONG signals, each presented as an independent 1% risk with 4-loser headroom; one more leg down stops all three at once = −$150 of the $200 daily cap (and half the $300 max DD) in one candle — the exact ruin pattern the paper side already caps with its own cluster limit but the prop signal does not. Also, tight-SL signals can demand more margin than the $5K account has when 2-3 are open, forcing the owner to improvise sizing. Fix: pass currently-open signaled rows into the formatter, cap margin vs account, and print 'kèo đang mở: N, tổng rủi ro nếu cùng SL: $X'.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "signal-bot"
+      },
+      {
+        "title": "No signal identity/sequence — re-fires on the same symbol are indistinguishable from duplicates",
+        "what_is_missing": "Messages carry no signal number or ID (whale_signal.py:140-169 — no counter, pos_id never surfaced), while the flush-mech path deliberately re-fires the same symbol as a NEW position once the 2h episode window passes (llm_trader.py:688-694) and the model can re-enter any symbol immediately after a close (open_positions only blocks while a position is open, llm_trader.py:1470). There is no 'kèo #N' numbering, no reference to the prior signal on that symbol, and no note like 'lệnh trước trên coin này đã đóng'.",
+        "why_it_matters": "The owner receives ADA LONG at 10:00 and another ADA LONG at 13:00; with no numbering and no linkage he cannot tell whether it is a resend glitch, the same setup, or a genuinely new entry — and if his first manual position is still open (his fills/exits differ from paper) he unknowingly doubles correlated exposure on a $5K account. Sequence numbers also make the (already-known-missing) recap and P&L tracking buildable later, since signals become referenceable.",
+        "effort": "S",
+        "priority": "P2",
+        "dim": "signal-bot"
+      },
+      {
+        "title": "Board-pass pick quality never scored (attention allocation has no counterfactual)",
+        "what_is_missing": "_board_pass (llm_trader.py:1023-1079) chooses which ~6 of ~60 coins get deep chart analysis, and only logs {\"event\":\"board_pass\",\"picks\":...} to governance.jsonl (llm_trader.py:1067-1070). Grep confirms no consumer scores these events: no code joins picks to subsequent N-bar returns, and there is no comparison of model-picks vs the activity-ranking fallback (llm_trader.py:1143,1154) or vs a random-6 baseline. calibration_report groups only by_setup/by_regime/by_trigger_path (llm_trader_learning.py:116-120) — nothing conditions on whether the coin was a board pick.",
+        "why_it_matters": "The board pass is selection stage 0: coins it skips can never become trades, so the whole pipeline's ceiling is set here invisibly. The lane forensic already showed triggers firing at exhaustion carry no directional information, and calibration's own verdict_hint says THESIS-WRONG dominates (fix = entry SELECTION, llm_trader_learning.py:130) — yet the earliest selection step is unmeasured. If the model systematically picks extended movers, every downstream metric blames decide()/stage-2 while the real leak is upstream, and no data exists to disprove 'the model never sees the tradeable coins'.",
+        "effort": "M",
+        "priority": "P1",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "Stage-2 rejections never shadow-scored — no answer to 'were the vetoes right?'",
+        "what_is_missing": "On REJECT, _stage2_confirm drops the full proposal with `continue` after logging only symbol/tf/reason (llm_trader.py:1328-1332). The complete bracket (entry price, sl_pct, tp_pct, size, side) is in `d` at that moment but is never persisted for counterfactual replay — unlike trigger paths, which DO have shadow_trigger_eval.py. Confirmed trades carry a stage2 tag to closed.jsonl (llm_trader.py:1949) but calibration_report has no by_stage2 grouping (llm_trader_learning.py:105-123; grep shows stage2 read only by the dashboard horizon_data.py), so even confirmed-vs-error_passthrough EV is unreported.",
+        "why_it_matters": "Stage-2 kills a large share of proposals (comments cite TAO rejected 29x in 8h, llm_trader.py:977; the pipeline captured only ~25% of flush fires, llm_trader.py:669-670). If it mostly vetoes winners, the R2 design destroys edge while looking prudent — and the rejection-memory injection (llm_trader.py:1246-1249) then actively teaches stage-1 to stop re-proposing good trades, compounding an unmeasured error. A shadow ledger replaying rejected brackets (same resolve math) is the only way to know whether the second look adds or subtracts EV.",
+        "effort": "M",
+        "priority": "P1",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "Mech-flush live outcomes never reconciled against the shadow expectation that armed them (no edge-decay monitor / auto-disarm)",
+        "what_is_missing": "_flush_mech_decisions fires deterministically at 10%/5% margin x10 (llm_trader.py:719-725) based on a shadow verdict frozen as HARDCODED constants: _PATH_RANK and _EDGE_NOTE literal strings claiming 'CONFIRMED live-positive (n_live>=30)' (llm_trader.py:2165-2170). Nothing at runtime re-reads shadow_stats.json for the flush paths or compares MISSION-realized flush_*_mech closes (tagged via mech_method, llm_trader.py:1947) against the shadow bracket's expected mean R. calibration_report EXCLUDES mech rows by default (discretionary_only=True, llm_trader_learning.py:82-84), the scorecard uses only net/r/reason with no mech split (llm_trader_scorecard.py header), and whale_signal.py:95 computes a flush WR only as a Telegram footer string. Survivor methods at least get forward_confirmed sizing haircuts (llm_trader.py:627-633); the flush path has no disarm condition at all.",
+        "why_it_matters": "This is the highest-throughput auto-firing path (up to 3 new 10%-margin x10 longs per cycle, no model in the loop). Capitulation-bounce edge is regime-dependent — the falling-knife episode already proved it flips sign by universe/regime. If the edge decays, the bot keeps buying every flush at full LAW size indefinitely while the prompt keeps telling the model the path is 'CONFIRMED', until a human manually reads closed.jsonl. A rolling mission-vs-shadow mean-R comparison with a disarm/alert threshold closes the loop the arming decision opened.",
+        "effort": "M",
+        "priority": "P0",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "Tide-adaptivity compliance unmeasured — market_tide never stamped on trades",
+        "what_is_missing": "market_tide (dumping/flat/pumping) is computed (llm_trader.py:1007-1014) and injected into the board-pass and decide prompts with a hard directive 'DIRECTION FOLLOWS THE TAPE ... flip when it flips' (llm_trader.py:1048-1049, 1250-1255, 1262), but the open-position record (llm_trader.py:1529-1540) and closed record (llm_trader.py:1941-1950) carry no tide field. Grep confirms no other file references tide; calibration has no by_tide or side-vs-tide alignment group.",
+        "why_it_matters": "The owner's 2026-07-13 core directive ('thị trường thay đổi long hay short nó phải theo') is unverifiable: nobody can tell whether the model actually flips SHORT when BTC dumps or long-biases through it (a known LLM failure mode), nor whether tide-aligned trades outperform counter-tide ones. One field at open (tide_at_entry + aligned:bool) plus one _group_stats call in calibration_report would answer both; today a persistent compliance failure would only surface as unattributed losses.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "No decision-provenance tagging on trades: model version, pipeline mode, vision-vs-numeric fallback all untracked",
+        "what_is_missing": "The closed record (llm_trader.py:1941-1950) contains no `model` field, no pipeline mode (PROVEN_ONLY / REDESIGN / plain discretionary — chosen at llm_trader.py:2148-2202), and no flag for whether the decision came from vision or the silent _decide_numeric fallback (llm_trader.py:1265-1268 falls back untagged). The MODEL was switched to cx/gpt-5.6-sol on 2026-07-13 (llm_trader.py:49) after major policy flips on 07-09 and 07-13 (llm_trader.py:61-65,75-79), yet scorecard (net/r/reason only) and calibration (blind last-40 window) pool all eras. whale_signal.py:80-82 already has to hack around this ('the replaced gpt-5.5 degen era') by blind recency slicing instead of tags.",
+        "why_it_matters": "The scorecard is documented as 'the ONLY thing allowed to answer is-the-LLM-any-good' (llm_trader.py:2012-2014), but every such answer is confounded across three models and multiple policy regimes — 'did the 5.6-sol switch help?' is unanswerable from the ledger. Worse, a degraded vision endpoint would silently route decisions through the numeric fallback for days, polluting the vision cohort's stats with no way to detect or exclude it. Stamping model/mode/decision_path at open is a few lines and makes every future A/B possible retroactively.",
+        "effort": "S",
+        "priority": "P0",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "Lesson/memory injection has no recency decay or policy-era windowing — the prompt is taught by a dead regime",
+        "what_is_missing": "memory_context() feeds decide() aggregates over the ENTIRE closed ledger (llm_trader.py:747-755 -> build_memory_context; aggregate_stats loops all rows with no time window or decay, llm_trader_memory.py:121-157), and distill_lessons ranks by |mean_r|*n (llm_trader_memory.py:189) so long-dead eras dominate forever — n only grows. There is no config-era or timestamp conditioning anywhere in the memory module (closed rows lack era tags, see provenance gap, so windowing by policy is currently impossible even if wanted). Same pattern in _symbol_history (last-200 rows regardless of age, llm_trader.py:956-972).",
+        "why_it_matters": "Trades produced by the abandoned gpt-5.5 'degen era' under removed gates permanently shape what the current model is told about itself ('SOLUSDT SHORT: 1W/4L') even though those trades were made by a different model under different rules. In a non-stationary market with a non-stationary POLICY, unwindowed lessons are anti-learning: the model gets punished/rewarded in the prompt for behavior it no longer exhibits, and a genuinely improved recent record can't outweigh the old mass until n catches up (weeks). A half-life decay or policy-era filter in aggregate_stats closes this.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "Cancelled/expired limit orders never counterfactually scored — the 'limit discipline' doctrine is unmeasured",
+        "what_is_missing": "The prompt strongly mandates limit entries ('PREFER A LIMIT ENTRY ... do NOT FOMO-chase', llm_trader.py:943-946), and _resolve_pending cancels on 2% run-away or ~2h expiry, logging only an event row to pending_events.jsonl (llm_trader.py:1603-1614). Grep confirms pending_events.jsonl has no analytical consumer (horizon_data.py:241 explicitly skips these rows; manual_trader.py only surfaces its own). Nothing replays what a cancelled limit would have done if filled, nor what a market entry at proposal time would have done, and fill-rate / cancelled-vs-filled expectancy is reported nowhere.",
+        "why_it_matters": "The limit-vs-market choice is a core behavioral rule pushed on the model every cycle with zero evidence behind it in THIS system. If most 'ran_away' cancels are missed winners (momentum setups that never pull back), the discipline is systematically deleting the best trades while the ledger only ever shows the fills — survivorship bias baked into the only measured evidence. A small shadow replay of cancelled limits (fill-at-limit + same resolve math, like the stage-2 shadow) would prove or kill the doctrine.",
+        "effort": "M",
+        "priority": "P2",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "No decision/cycle latency tracking; per-cycle reasoning is overwritten, price staleness at fill unmeasured",
+        "what_is_missing": "No timing instrumentation exists anywhere in llm_trader.py (grep for duration/elapsed/perf_counter: zero hits). A cycle chains context fetch -> board-pass LLM call -> up to ~18 chart fetch+renders -> vision decide (300s timeout, llm_trader.py:57) -> stage-2 vision calls, then fills at d[\"price\"] captured at context-build time (llm_trader.py:1500-1505); the wall-clock gap between the price the model saw and the paper fill is never recorded (heartbeat logs phases but no durations, llm_trader.py:1147,1290,2104; the closed record has no such field, llm_trader.py:1941-1950). The thinking trace is a single overwritten file (thinking_latest.json, llm_trader.py:1093-1099) — no per-cycle decision archive survives 90 seconds.",
+        "why_it_matters": "On a multi-minute LLM-bound pipeline, paper fills at stale prices are systematically wrong in exactly the moments that matter (flushes move percent-per-minute) — an execution-realism bias that quietly inflates or deflates the scorecard, the sole evidence gating any future live decision. Latency drift (endpoint slowdowns, more stage-2 calls) also silently cuts trade frequency with no metric flagging it. And with reasoning overwritten each cycle, a losing day can never be reconstructed against what the model actually claimed at the time.",
+        "effort": "S",
+        "priority": "P2",
+        "dim": "mission-loop"
+      },
+      {
+        "title": "Signal layer: no daily-cap-aware suppression of new entry signals",
+        "what_is_missing": "emit() (E:\\keo-moi-mail\\trading-agent\\whale_signal.py:175-203) sends a full-size $50-risk 'KÈO MỚI' for every new paper position unconditionally — it never calls _prop_day_est() and never compares against DAILY_LOSS_CAP. The only cap-awareness in the whole file is an advisory line appended to CLOSE notifications when est <= -$150 (whale_signal.py:290-291). There is no gate that stops, downsizes, or red-flags NEW entry signals once the estimated prop-day loss nears -$200, and the entry footer always prints the static 'tối đa 4 lệnh thua' computed from constants (whale_signal.py:120,149) regardless of how many losers have already landed today.",
+        "why_it_matters": "Day sits at est -$160 after 3 stop-outs; a flush fires and the bot sends a normal full-confidence entry signal with zero warning. Owner takes it, SL hits: -$210 > $200 TidalFi daily cap = challenge day breached and the Two-Step account reset/failed — by a signal the bot itself could have known to suppress.",
+        "effort": "S",
+        "priority": "P0",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Signal layer: no aggregate open-signal exposure tracking",
+        "what_is_missing": "Each signal is sized in isolation: risk_usd = $50, notional = risk/SL-distance (whale_signal.py:117-119). emit() loops open_rows independently with no count of concurrently-OPEN signaled positions, no 'total open risk = N × $50' line, and no RISK_PCT scaling by open count (RISK_PCT is a constant, whale_signal.py:26). _prop_day_est counts only CLOSED rows (whale_signal.py:223-225), so open unresolved risk is invisible everywhere. The mission feeds it up to 3 flush fires per cycle (llm_trader.py:704) plus discretionary entries under MAX_CONCURRENT=50 (llm_trader.py:137).",
+        "why_it_matters": "A busy flush day produces 4-6 concurrent open signals = $200-$300 of correlated open risk — the entire daily cap and the full $300 max DD live simultaneously, and neither the bot nor the owner sees the aggregate number. One market leg down stops them together: -$250 realized inside one window, daily cap and max DD blown in a single move.",
+        "effort": "S",
+        "priority": "P0",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Signal layer: no correlation/direction concentration warning",
+        "what_is_missing": "The confirmed edge path signals only LONG on alts (flush mech hardcodes action LONG, llm_trader.py:720). The paper side protects itself with a 3-fires-per-cycle correlated-cluster cap (llm_trader.py:698-707), but the signal layer has no equivalent: _fmt_signal sees exactly one position row (whale_signal.py:101) and no message ever says 'you already hold N alt LONGs — this is the same BTC-beta bet'. No signal-side cluster cap, no same-direction counter, no beta note.",
+        "why_it_matters": "Market-wide capitulation fires 3 alt-LONG signals in one cycle; on a $5K prop they are one BTC trade in disguise. BTC continues down, all three SLs hit near-simultaneously ≈ -$150 — 75% of the daily cap consumed by what the owner believed were three independent kèo.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Signal layer: no max-drawdown ($300) state or drawdown-adaptive tightening",
+        "what_is_missing": "The $300 Two-Step max DD exists only in the docstring (whale_signal.py:8); the only tracked constant is DAILY_LOSS_CAP (whale_signal.py:27, used at 284-286). There is no cumulative cross-day prop P&L estimate (running peak/trough), no drawdown-state awareness that tightens RISK_PCT (e.g. 1% -> 0.5%) or halts signaling as estimated cumulative DD approaches -$300, and the /status reply (llm_trader.py:2223-2228) reports only today's window.",
+        "why_it_matters": "Two individually 'compliant' days (-$150 then -$180) = -$330 cumulative — max DD breached and the challenge fee lost, while the daily tracker never once warned because each day stayed under $200. The nastier failure mode of a Two-Step is exactly the multi-day bleed this layer cannot see.",
+        "effort": "M",
+        "priority": "P1",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Signal layer: no notional/margin feasibility clamp vs the $5K account",
+        "what_is_missing": "notional = risk / (sl_pct/100) is unbounded (whale_signal.py:118) and margin = notional/lev (line 119) is never compared to ACCOUNT_USD or to margin already committed by other open signals. The paper side permits model SLs down to 0.3% (llm_trader.py:891) and the manage loop can move SLs tighter (llm_trader.py:1623-1637), so a 0.3% SL yields a $16,667 notional / $3,333 margin ticket — 67% of the whole prop account for one '= $50 risk' signal; two concurrent such tickets exceed the account.",
+        "why_it_matters": "Owner receives an unplaceable or over-concentrated ticket. If he places it anyway, a gap through the 0.3% stop loses a multiple of the advertised $50 (tight stops gap worst); if margin runs out mid-day, later signals silently become unexecutable and the real track record diverges from the risk plan the whole design assumes.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Paper mission: no directional/notional aggregate exposure cap on the discretionary path",
+        "what_is_missing": "lr.can_open caps only summed MARGIN (95%) and position COUNT (50) (llm_trader_risk.py:249-260, wired at llm_trader.py:1508-1510); per-trade clamps are size<=40% and lev<=25 (llm_trader.py:889-890). Nothing caps total NOTIONAL (95% margin at lev 25 ≈ 23x equity) or same-side concentration. Cluster/correlation controls exist only on the mech paths — flush cap 3/cycle (llm_trader.py:704) and mech_sizing's correlation divisor for proven fires (llm_trader.py:611-614) — the discretionary LLM path has neither, and _apply_gap_veto is strictly per-symbol (llm_trader.py:1423-1445).",
+        "why_it_matters": "The model opens 8 alt LONGs at x15-25 on one bounce thesis; a single BTC flush candle gaps all of them together — per-symbol gap veto passes each coin individually, but the portfolio-level tail approaches account wipeout (HMSTR -$14 ruin at portfolio scale). Those same entries fan out as prop signals, so the concentration exports to real money.",
+        "effort": "M",
+        "priority": "P1",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Paper mission: daily breaker is realized-only; no mark-to-market check and no equity floor / multi-day halt",
+        "what_is_missing": "The breaker is ON by default (llm_trader.py:149) but lr.daily_breaker sums only CLOSED-row net (llm_trader_risk.py:286-295) — unrealized losses on open positions contribute zero to the -15% check gating new opens (llm_trader.py:1460). And there is no multi-day control at all: the anchor resets every UTC day (llm_trader.py:1361-1366), and no equity floor or peak-to-trough drawdown halt exists anywhere ('peak' in the file is only trailing-stop logic, llm_trader.py:1798-1901; STOP_FILE at llm_trader.py:2299 is a manual kill only).",
+        "why_it_matters": "Flush day: 12 open LONGs each -8% unrealized (mark-to-market far past -15%) while realized = $0 — breaker reports 'ok' and the loop keeps adding up to 3 new fires per cycle until the losses realize at a -40% day. Separately, a -14.9%/day bleed never trips anything on any horizon, so the account (and the signal stream it drives) can grind to zero with every guard green.",
+        "effort": "M",
+        "priority": "P2",
+        "dim": "risk-prop"
+      },
+      {
+        "title": "Ops alerts never leave the machine — outbox has no sender, Telegram transport unused for ops",
+        "what_is_missing": "No process drains state/alert_outbox.jsonl or state/webhook_outbox.jsonl: alert_manager.py:51 hardcodes status 'queued_not_sent' and grep shows the outboxes are referenced only by alert_manager.py itself and tests/test_runtime_integration_batch.py. The whole alerting stack is library-code-only: evaluate_slo_burn (alert_manager.py:171, has a heartbeat_stale rule in ALERT_CATALOG line 23) and agent_health_monitor.evaluate_agent_health (agent_health_monitor.py:26) are each called ONLY from tests. A working Telegram sender exists in the repo (whale_signal.py:29,50 — bot_token/chat_id already configured in state/whale_signal.json) but it is wired only to trade signals, never to incidents. fleet_watchdog.ps1:57 kills a wedged supervisor and only Add-Contents a local log.",
+        "why_it_matters": "The exact scenario already happened: supervisor wedged 77 minutes on 2026-07-12 (agent_process_supervisor.py:806 comment) and llm_trader sat in 6h quarantine (restart_gate, line 431) — Sev2 incidents were written to state/incidents_history.jsonl (57.8KB accumulated) and nobody was told. Owner discovers a dead mission only by opening a Claude session and asking, losing hours of paper-forward samples the entire prove-or-KILL pipeline depends on.",
+        "effort": "M",
+        "priority": "P0",
+        "dim": "ops-data"
+      },
+      {
+        "title": "brain.db / events.jsonl have zero backups; recovery infra itself is unversioned",
+        "what_is_missing": "No backup has ever been taken: state/backups, state/backup_manifests and state/archive directories do not exist on disk, and backup_files() is called only from tests and the pre_schema_migration path (backup_restore.py:151) — never on a schedule, never for state/memory/. brain.db (3.6MB SQLite, 648-trial DSR registry), the hash-chained source-of-truth events.jsonl (6.3MB) and chain_head.txt all live on the single E: drive with no second copy anywhere. Additionally the boot-critical fleet_watchdog.ps1 / run_*.bat / dashboard_token.txt live OUTSIDE the git repo in E:\\keo-moi-mail\\horizon-ui\\, so the auto-recovery chain has no version control or copy either.",
+        "why_it_matters": "brain.py explicitly makes brain.db a projection rebuildable from events.jsonl (line 687) — but if the drive dies or the file corrupts, BOTH layers vanish together: every trial, autopsy, lesson and the deflated-Sharpe trial count that is the project's only answer to 'có edge không'. Months of paper-forward evidence are irreproducible (live market data can't be replayed). A half-day cron doing sqlite .backup() + copy of events.jsonl+chain_head to another disk/cloud eliminates the whole risk.",
+        "effort": "S",
+        "priority": "P0",
+        "dim": "ops-data"
+      },
+      {
+        "title": "Log retention/rotation exists as code but is wired to nothing — ~2GB and growing, with O(file) readers",
+        "what_is_missing": "retention_policy.evaluate_retention (retention_policy.py:18) has zero production callers (only tests/test_component_batch_missing_items.py), and archive_file (archive_manager.py:27) copies without ever truncating the source. Nothing rotates: state/agent_memory/whale_flow_history.jsonl 559MB, microstructure_flow_history.jsonl 486MB, whale_flow_events.jsonl 353MB, paper_candidate_feeder_history.jsonl 249MB, market_updates.jsonl 72MB, agent_process_supervisor.jsonl 6.4MB, llm_trader/governance.jsonl 479KB, trigger_log.jsonl 1.7MB. Several hot loops re-read whole files every cycle: shadow_trigger_eval.py:87 (_load_done_keys reads all of shadow_triggers.jsonl) and :117 (TRIGGER_LOG.read_text every 30-min run), brain.py:215 (EVENTS.read_text on rebuild).",
+        "why_it_matters": "Two concrete failure paths: (1) disk fill on E: — the machine already runs with C: at 97%, and observers append ~50MB+/day; when E: fills, every atomic-write (.tmp then replace) in every agent starts failing at once. (2) cycle-time creep — shadow_trigger_eval's per-run cost grows linearly with trigger_log/shadow file size until its heartbeat interval is blown, at which point the supervisor judges it stale and kill-loops a healthy agent (the exact quarantine failure mode already fixed once for other reasons).",
+        "effort": "M",
+        "priority": "P1",
+        "dim": "ops-data"
+      },
+      {
+        "title": "No per-process memory watchdog, despite a RAM leak having already killed the mission",
+        "what_is_missing": "Repo-wide grep finds zero uses of psutil, memory_info, WorkingSet or any RSS check. host_runtime_monitor.py monitors only disk (shutil.disk_usage at line 184, low_disk_space at 193), autostart proof and sleep/resume gaps. fleet_watchdog.ps1 checks heartbeat-file mtime only. The counterfactual_replay incident is documented at agent_process_supervisor.py:160-164 ('LEAKS ~750-860MB within 30min... starved NEW process creation, mission died at init') — the response was to cut that one agent, not to add monitoring for the other ~20 supervised Python processes.",
+        "why_it_matters": "On the 16GB laptop, the next slow leak in any supervised agent (many share the same fetch/cache libraries) reproduces the 2026-07-11 incident exactly: memory pressure silently blocks new process spawns, llm_trader dies at init with exit -1 and zero output, the circuit breaker quarantines it for 6h, and nothing identifies the leaking culprit — the supervisor already enumerates PIDs per agent (running_script_processes) so sampling WorkingSet per cycle and alerting/restarting over a threshold is a small, high-value addition.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "ops-data"
+      },
+      {
+        "title": "Shadow trigger-eval coverage gaps: backfill only for flush paths, news path never measured, backfill never scheduled",
+        "what_is_missing": "Historical backfill exists ONLY for flush_oi_dn/flush_no_oi (backfill_flush.py docstring + code — it detects only the flush condition, over a 24-symbol curated universe). chart_align, whale and funding_extreme paths get verdicts only from live samples with n_live>=25 required for CONFIRMED (shadow_trigger_eval.py:302) — the weeks-long wait that backfill was explicitly built to avoid (backfill_flush.py:1-3). The news trigger path is never evaluated at all: _direction() returns None for 'news' (shadow_trigger_eval.py:79-80), so every news-trigger fire is dropped from edge measurement. And backfill_flush.py is a manual __main__ one-shot absent from the supervisor roster (agent_process_supervisor.py specs(), lines 107-184), so even flush backfill coverage silently ages after the last manual run.",
+        "why_it_matters": "The per-path verdict engine is the project's decision mechanism for which triggers survive. Today it can only ever say 'cần thêm mẫu' for chart_align/whale/funding_extreme for weeks, and can never say anything about news — meaning the mission keeps firing (or the owner keeps trusting) trigger paths whose edge is structurally unmeasurable, exactly the 'no honest verdict' failure the shadow evaluator was created to fix.",
+        "effort": "M",
+        "priority": "P1",
+        "dim": "ops-data"
+      },
+      {
+        "title": "Universe blacklist is manual-reactive — no automated screen for new/renamed tokenized-stock perp listings",
+        "what_is_missing": "universe_filter.py NON_CRYPTO is a hand-edited frozenset with additions dated only AFTER money was lost: 'MU/DRAM 07-11', 'SKHY = renamed Hynix variant 07-13', 'CRCL (Circle) new 07-11' (universe_filter.py:34,40). There is no job that diffs the Binance perp listing set against known bases, no heuristic screen (RTH-only volume pattern, near-zero weekend ATR), and no alert when an unknown new base ticker starts trading in any lane/scanner universe.",
+        "why_it_matters": "The 2026-07-11 forensic (universe_filter.py:6-8) attributed ~50% of lane-farm losses to exactly these instruments, and the SKHY case proves even a RENAME of an already-blacklisted stock (Hynix) re-enters the tradable universe until a human notices. Binance lists new tokenized equities regularly; each one bleeds real (paper-evidence) capital and pollutes lane/autopsy statistics until the next manual audit.",
+        "effort": "S",
+        "priority": "P1",
+        "dim": "ops-data"
+      },
+      {
+        "title": "No daily system-health digest pushed to the owner",
+        "what_is_missing": "Nothing composes or delivers a daily summary. daily_exam_agent grades learning quality once per day (roster agent_process_supervisor.py:183) but writes only to state/agent_memory; horizon_data.py builds pull-only data.json/lanes.json for the web UI; incidents accumulate unread in state/incidents_history.jsonl. Repo-wide there is no digest/report scheduler, even though a working push channel already exists (whale_signal.py Telegram sender).",
+        "why_it_matters": "The owner's actual monitoring loop today is 'open a Claude session and ask' — which burns the $200 sub the owner is already angry about (cost-efficient redesign note) and means multi-day silent degradations (stale verdicts, culled lanes, quarantines that auto-released) are only discovered incidentally. A once-daily Telegram message with fleet state, open incidents, paper PnL and verdict changes closes the loop at near-zero cost by reusing gap-1's sender.",
+        "effort": "S",
+        "priority": "P2",
+        "dim": "ops-data"
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Audit"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Synthesize"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "audit:signal-bot",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a6a79ed0cca08aaa8",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1784021573570,
+      "queuedAt": 1784021572728,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You audit a Telegram SIGNAL BOT for missing capabilities. Read E:\\keo-moi-mail\\trading-agent\\whale_signal.py fully, and the hook in llm_trader.py (search \"whale_signal\"). Context: the bot mirrors paper-bot entries to a Telegram group; the owner MANUALLY places them on a TidalFi $5K prop challenge (daily loss cap $200, max DD $300, target $250, daily reset 07:00 GMT+7). Already known missing (do NO…",
+      "lastProgressAt": 1784021966835,
+      "tokens": 69598,
+      "toolCalls": 17,
+      "durationMs": 393254,
+      "resultPreview": "{\"gaps\":[{\"title\":\"SL/TP management updates never reach Telegram (and message_id is discarded, so the original signal can't even be edited)\",\"what_is_missing\":\"The paper bot actively manages positions after entry: the LLM manage pass runs every ~4 min and appends new SL/TP to p['mgmt'] (llm_trader.py:1620, 1741-1746) or requests early CLOSE (llm_trader.py:1708-1713), and resolve() runs a mechanica…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "audit:mission-loop",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a38cb8ca3f0919a67",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1784021573598,
+      "queuedAt": 1784021572729,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You audit a paper-trading LLM mission loop for missing MEASUREMENT/LEARNING capabilities (gaps, not bugs). Read E:\\keo-moi-mail\\trading-agent\\llm_trader.py (decide/_board_pass/_manage_positions_llm/_flush_mech_decisions/resolve/run_once) and skim llm_trader_learning.py + llm_trader_memory.py. Already known missing (do NOT re-report): manage-pass counterfactual scoring, auto-verdict engine, funding…",
+      "lastProgressAt": 1784021900406,
+      "tokens": 119792,
+      "toolCalls": 17,
+      "durationMs": 326807,
+      "resultPreview": "{\"gaps\":[{\"title\":\"Board-pass pick quality never scored (attention allocation has no counterfactual)\",\"what_is_missing\":\"_board_pass (llm_trader.py:1023-1079) chooses which ~6 of ~60 coins get deep chart analysis, and only logs {\\\"event\\\":\\\"board_pass\\\",\\\"picks\\\":...} to governance.jsonl (llm_trader.py:1067-1070). Grep confirms no consumer scores these events: no code joins picks to subsequent N-b…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "audit:risk-prop",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "ab044ca74b1eefbb6",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1784021573599,
+      "queuedAt": 1784021572729,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You audit RISK controls for missing pieces, for BOTH: (a) the paper mission (E:\\keo-moi-mail\\trading-agent\\llm_trader.py — gap veto, cluster cap, size/lev clamps, daily breaker config, margin caps) and (b) the SIGNAL layer for a TidalFi $5K prop challenge (whale_signal.py — risk 1%/trade, 5x cap; prop rules: daily loss $200 resets 07:00 GMT+7, max DD $300, target $250, Two-Step). Find missing risk…",
+      "lastProgressAt": 1784021908013,
+      "tokens": 95095,
+      "toolCalls": 18,
+      "durationMs": 334414,
+      "resultPreview": "{\"gaps\":[{\"title\":\"Signal layer: no daily-cap-aware suppression of new entry signals\",\"what_is_missing\":\"emit() (E:\\\\keo-moi-mail\\\\trading-agent\\\\whale_signal.py:175-203) sends a full-size $50-risk 'KÈO MỚI' for every new paper position unconditionally — it never calls _prop_day_est() and never compares against DAILY_LOSS_CAP. The only cap-awareness in the whole file is an advisory line appended t…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "audit:ops-data",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "ac0dec0f68647fa70",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1784021573600,
+      "queuedAt": 1784021572729,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You audit OPS + DATA for missing capabilities in E:\\keo-moi-mail\\trading-agent (gaps, not bugs). Skim: agent_process_supervisor.py roster (which agents are commented out/dead), state/ heartbeats, horizon_data.py, universe_filter.py, method_lab.py promote path, brain.py lesson flow, shadow_trigger_eval.py. Known missing (do NOT re-report): funding_z dead, kill-benchmark not in method_lab, 1h lane f…",
+      "lastProgressAt": 1784022405553,
+      "tokens": 116145,
+      "toolCalls": 53,
+      "durationMs": 831952,
+      "resultPreview": "{\"gaps\":[{\"title\":\"Ops alerts never leave the machine — outbox has no sender, Telegram transport unused for ops\",\"what_is_missing\":\"No process drains state/alert_outbox.jsonl or state/webhook_outbox.jsonl: alert_manager.py:51 hardcodes status 'queued_not_sent' and grep shows the outboxes are referenced only by alert_manager.py itself and tests/test_runtime_integration_batch.py. The whole alerting …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "synthesize",
+      "phaseIndex": 2,
+      "phaseTitle": "Synthesize",
+      "agentId": "a94131560024191c7",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1784022405691,
+      "queuedAt": 1784022405681,
+      "attempt": 1,
+      "promptPreview": "You are the head engineer. Merge these gap-audit findings from 4 dimensions of a crypto paper-trading system + Telegram signal bot into ONE ranked build plan. Dedupe overlaps, kill anything that is speculative/low-value, keep what genuinely protects money or closes a learning loop. Owner context: $5K prop challenge is REAL money at stake via manual trades; the paper mission is the signal source; m…",
+      "lastProgressAt": 1784022557688,
+      "tokens": 46578,
+      "toolCalls": 0,
+      "durationMs": 151995,
+      "resultPreview": "Skill: none — synthesis/ranking task, no code edits or debugging involved.\n\n# Build Plan hợp nhất — Gap Audit 4 chiều (signal-bot / mission-loop / risk-prop / ops-data)\n\n## 1. Executive Summary — 3 gap quan trọng nhất\n\n**① Signal layer mù hoàn toàn về trạng thái prop account (gộp 5 finding).** Mỗi signal size độc lập ($50 risk → notional không clamp), không đếm số kèo đang mở, không biết hôm nay đ…"
+    }
+  ],
+  "totalTokens": 447208,
+  "totalToolCalls": 105
+}
