@@ -405,7 +405,10 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
         if _send(token, chat, text):
             sent.add(pid)
             cfg["seq"] = exposure["seq"]     # "KÈO #N" advances only on a DELIVERED signal
-            n += 1
+            _ann = list(cfg.get("announced_ids") or [])
+            _ann.append(pid)                 # DELIVERED-entry registry: sent_ids conflates
+            cfg["announced_ids"] = _ann[-300:]   # "handled/suppressed" with "delivered" (the
+            n += 1                               # JPM ghost) — ghost gates key on THIS list
             _log({"sent": pid, "seq": exposure["seq"]})   # audit: success was unprovable from log
         # transient send failure -> NOT marked -> retried next cycle (a signal is worth retrying)
     if n or len(sent) != len(set(cfg.get("sent_ids") or [])):
@@ -551,7 +554,7 @@ def emit_closes(closed_rows: list[dict]) -> int:
     intact = True          # audit HIGH: wm used to advance past FAILED sends -> a close
     for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):   # notification (the
         _ts = float(r.get("closed_ts") or 0)          # boss's live exit!) was lost FOREVER on
-        _coin_ok = any(str(r.get("symbol")) in str(x) for x in (cfg.get("sent_ids") or []))
+        _coin_ok = any(str(r.get("symbol")) in str(x) for x in (cfg.get("announced_ids") or []))
         if not _on_prop(r.get("symbol")) or not _coin_ok:   # off-venue OR law-suppressed entry
             if intact:                                # first failure; that row + everything
                 wm = max(wm, _ts)                     # after retries next cycle (burst cap still
@@ -637,7 +640,8 @@ def emit_mgmt(open_rows: list[dict]) -> int:
         return 0
     seen = cfg.get("mgmt_seen") or {}
     n = 0
-    _announced = set(cfg.get("sent_ids") or [])
+    _announced = set(cfg.get("announced_ids") or [])   # DELIVERED only — sent_ids also
+                                                        # holds law-SUPPRESSED pids (JPM ghost)
     for p in open_rows or []:
         if not _on_prop(p.get("symbol")):             # entry was never signalled -> no updates
             continue
