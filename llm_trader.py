@@ -126,6 +126,19 @@ from universe_filter import NON_CRYPTO as UNIVERSE_EXCLUDE_BASES
 SCAN_TF = os.environ.get("LLM_TRADER_SCAN_TF", "1h")               # timeframe whose recent volume ranks the universe
 SCAN_WINDOW_BARS = int(os.environ.get("LLM_TRADER_SCAN_WINDOW", "24"))   # sum this many recent SCAN_TF bars = "hot money flow now"
 UNIVERSE_HOT_TOP = int(os.environ.get("LLM_TRADER_HOT_TOP", "60"))       # keep top-N liquid coins by recent SCAN_TF volume
+# Boss trades TidalFi MANUALLY off this bot's signals; the mission must always SEE the
+# prop-listed coins or it can structurally never signal them (2026-07-15: 8 closes/24h,
+# only 1 on-prop -> the Telegram group starved a whole day). Crypto subset of the 42
+# TidalFi perps that exist on Binance futures — appended to every universe build.
+PROP_ALWAYS_SCAN = frozenset({
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "ZECUSDT", "HYPEUSDT", "XRPUSDT", "DOGEUSDT",
+    "BNBUSDT", "NEARUSDT", "1000PEPEUSDT", "ADAUSDT", "LINKUSDT", "UNIUSDT",
+    "AVAXUSDT", "XLMUSDT", "TRXUSDT", "LTCUSDT", "DOTUSDT", "ASTERUSDT", "1000SHIBUSDT",
+})
+
+
+def _with_prop_syms(selected: list) -> list:
+    return list(selected) + [s for s in sorted(PROP_ALWAYS_SCAN) if s not in set(selected)]
 UNIVERSE_REFRESH_SEC = float(os.environ.get("LLM_TRADER_UNIVERSE_REFRESH", "1800"))  # rebuild the hot list every ~30 min (bounds klines API calls)
 UNIVERSE_CACHE = LT_DIR / "universe_cache.json"
 # Owner: UNLIMITED number of positions — accepts correlation risk for bigger
@@ -2242,7 +2255,7 @@ def _hot_universe(client: Any, now_ms: int) -> list[str]:
             c = _j.loads(UNIVERSE_CACHE.read_text(encoding="utf-8"))
             if (c.get("scan_tf") == SCAN_TF and c.get("selected")
                     and (now_ms - int(c.get("ts_ms", 0))) < UNIVERSE_REFRESH_SEC * 1000):
-                return list(c["selected"])
+                return _with_prop_syms(c["selected"])
     except Exception:
         pass
     ticks = client.futures_ticker()
@@ -2269,7 +2282,7 @@ def _hot_universe(client: Any, now_ms: int) -> list[str]:
             "selected": selected}), encoding="utf-8")
     except Exception:
         pass
-    return selected
+    return _with_prop_syms(selected)
 
 
 def _write_daily_progress(now_ms: int) -> None:
@@ -2339,9 +2352,10 @@ def run_once() -> dict[str, Any]:
         if not selected:
             raise ValueError("empty universe")
     except Exception:
-        selected = us.select_universe(client, end_ms=now_ms, months=1.0, timeframe="1h",
-                                      min_daily_quote_volume=UNIVERSE_MIN_QVOL,
-                                      max_symbols=UNIVERSE_MAX)["selected"]
+        selected = _with_prop_syms(
+            us.select_universe(client, end_ms=now_ms, months=1.0, timeframe="1h",
+                               min_daily_quote_volume=UNIVERSE_MIN_QVOL,
+                               max_symbols=UNIVERSE_MAX)["selected"])
     ctx = build_context(client, selected, now_ms)
     # R1 trigger engine — DARK measurement ONLY (plans/redesign_tin_va_chart_v1.md §5-R1): evaluates
     # which candidate-selection paths (news/whale/funding_oi/chart_align) each coin hits, logs the
