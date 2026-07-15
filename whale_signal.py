@@ -551,7 +551,8 @@ def emit_closes(closed_rows: list[dict]) -> int:
     intact = True          # audit HIGH: wm used to advance past FAILED sends -> a close
     for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):   # notification (the
         _ts = float(r.get("closed_ts") or 0)          # boss's live exit!) was lost FOREVER on
-        if not _on_prop(r.get("symbol")):             # a 429/DNS window. Now: wm freezes at the
+        _coin_ok = any(str(r.get("symbol")) in str(x) for x in (cfg.get("sent_ids") or []))
+        if not _on_prop(r.get("symbol")) or not _coin_ok:   # off-venue OR law-suppressed entry
             if intact:                                # first failure; that row + everything
                 wm = max(wm, _ts)                     # after retries next cycle (burst cap still
             continue                                  # bounds the replay).
@@ -636,10 +637,13 @@ def emit_mgmt(open_rows: list[dict]) -> int:
         return 0
     seen = cfg.get("mgmt_seen") or {}
     n = 0
+    _announced = set(cfg.get("sent_ids") or [])
     for p in open_rows or []:
         if not _on_prop(p.get("symbol")):             # entry was never signalled -> no updates
             continue
         pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
+        if pid not in _announced:                     # OWNER LAW coherence: entry suppressed
+            continue                                  # (winrate gate) -> GHOST update otherwise
         mg = p.get("mgmt") or []
         if len(mg) <= int(seen.get(pid, 0)):
             continue
@@ -745,6 +749,9 @@ def emit_pending(pending_rows: list[dict]) -> int:
         if _send(token, chat, text):
             n += 1
             seen_next.add(qid)
+            ap = list(cfg.get("announced_pending") or [])
+            ap.append(qid)
+            cfg["announced_pending"] = ap[-100:]
             _log({"sent_pending": qid})
         # failed place-send -> NOT seen -> retried next cycle
     for qid in prev - set(cur):                       # gone: cancelled/expired (not a fill)
@@ -753,6 +760,8 @@ def emit_pending(pending_rows: list[dict]) -> int:
         coin = qid.split("_")[0]
         if not _on_prop(coin):                        # never announced -> nothing to cancel
             continue
+        if qid not in (cfg.get("announced_pending") or []):   # law-suppressed place ->
+            continue                                          # its cancel is a GHOST too
         if any(coin in str(s) for s in filled):
             continue
         sym = coin.replace("USDT", "")
