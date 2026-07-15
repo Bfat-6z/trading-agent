@@ -93,7 +93,138 @@ def _iso_ms(ms: int) -> str:
     return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat(timespec="milliseconds")
 
 
+# ===========================================================================
+# CROSS-PROCESS klines cache + shared ban-backoff (2026-07-16, spam-agent design).
+# ROOT CAUSE of the recurring Binance -1003 IP bans: ~10 agents (mission, lane_farm,
+# shadow_eval, forward_test, observers...) each fetch the SAME hot coins' SAME bar every
+# cycle, on ONE IP, no shared cache, no shared backoff -> aggregate weight blows past
+# ~2400/min. Fix: (a) per-bar per-key on-disk cache -> same (coin,tf,bar) fetched by N
+# agents = ONE Binance call; (b) a shared backoff file -> a ban makes the WHOLE fleet
+# stand down instead of retry-hammering. Public signature UNCHANGED (all 20+ callers keep
+# working); backtests (months>2) bypass the cache but still honor the backoff. Cache
+# fail-OPEN (miss/error -> direct fetch = old behavior); backoff fail-CLOSED (return []
+# during a ban -> callers already treat empty as skip-symbol).
+# ===========================================================================
+import random as _random
+from pathlib import Path as _Path
+try:
+    from binance.exceptions import BinanceAPIException as _BinanceAPIException
+except Exception:                                   # pragma: no cover
+    class _BinanceAPIException(Exception):
+        status_code = None
+        code = None
+
+_CACHE_DIR = _Path(__file__).resolve().parent / "state" / "klines_cache"
+_BACKOFF_FILE = _CACHE_DIR / "_backoff.json"
+_MONTHS_TIERS = (0.12, 0.5, 1.0, 2.0)               # hot windows collapse to these; >2.0 = backtest = bypass
+_CACHE_MAX_MONTHS = 2.0
+
+
+def _months_bucket(months):
+    m = float(months)
+    if m > _CACHE_MAX_MONTHS + 1e-9:
+        return None                                 # backtest window -> not cacheable
+    for t in _MONTHS_TIERS:
+        if m <= t * 1.000001:
+            return t
+    return None
+
+
+def _bar_cache_key(symbol, timeframe, months, end_ms, with_deriv):
+    bucket = _months_bucket(months)
+    if bucket is None:
+        return None
+    tf_ms = _TF_MS[timeframe]
+    bar_idx = int(end_ms) // tf_ms                   # right-edge bar -> auto-invalidates each bar
+    return "%s_%s_%s_%d_%d" % (str(symbol).upper(), timeframe, bucket, bar_idx, int(bool(with_deriv)))
+
+
+def _klines_backoff_active(now=None):
+    try:
+        from atomic_state import read_json
+        p = read_json(_BACKOFF_FILE, default=None) or {}
+        now = time.time() if now is None else now
+        return float(p.get("backoff_until_epoch") or 0) > now
+    except Exception:
+        return False
+
+
+def _record_klines_ban(exc):
+    try:
+        from atomic_state import read_json, write_json_atomic
+        prev = float((read_json(_BACKOFF_FILE, default=None) or {}).get("cooldown_seconds") or 0)
+        ra = getattr(exc, "retry_after", None)
+        cooldown = float(ra) if ra else min(600.0, max(120.0, prev * 2 or 120.0))   # expo 120->600s
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(_BACKOFF_FILE, {"backoff_until_epoch": time.time() + cooldown,
+            "cooldown_seconds": cooldown, "status_code": getattr(exc, "status_code", None),
+            "reason": repr(exc)[:180]})
+    except Exception:
+        pass
+
+
+def _is_ban(exc):
+    return getattr(exc, "status_code", None) in (418, 429) or getattr(exc, "code", None) == -1003
+
+
+def _sweep_stale_klines(timeframe, end_ms):
+    try:
+        cur = int(end_ms) // _TF_MS[timeframe]
+        for f in _CACHE_DIR.glob("*.json"):
+            if f.name == "_backoff.json":
+                continue
+            try:
+                idx = int(f.stem.rsplit("_", 2)[-2])
+            except Exception:
+                continue
+            if idx < cur - 1:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms: int,
+                           client: Any, sleep_between: float = 0.02,
+                           with_deriv: bool = False) -> list[dict[str, Any]]:
+    """Cross-process cached + ban-backoff wrapper (public signature unchanged). See the
+    block above. Delegates to _fetch_klines_with_flow_direct for the real fetch."""
+    key = _bar_cache_key(symbol, timeframe, months, end_ms, with_deriv)
+    if key is None:                                  # backtest window -> bypass cache, keep ban gate
+        if _klines_backoff_active():
+            return []
+        return _fetch_klines_with_flow_direct(symbol, timeframe, months=months, end_ms=end_ms,
+                                              client=client, sleep_between=sleep_between, with_deriv=with_deriv)
+    _start_ms = int(end_ms) - int(months * 30 * 24 * 3600 * 1000)   # caller's exact window start
+    try:                                             # --- cache read (fail-open) ---
+        from atomic_state import read_json
+        hit = read_json(_CACHE_DIR / (key + ".json"), default=None)
+        if isinstance(hit, list):
+            return [b for b in hit if int(b.get("ts_ms", 0)) >= _start_ms]   # strict slice -> exact window
+    except Exception:
+        pass
+    if _klines_backoff_active():                     # --- ban gate: fail-CLOSED ---
+        return []
+    eff_months = _months_bucket(months)              # fetch the TIER window (shared superset content)
+    try:
+        bars = _fetch_klines_with_flow_direct(symbol, timeframe, months=eff_months, end_ms=end_ms,
+                                              client=client, sleep_between=sleep_between, with_deriv=with_deriv)
+    except _BinanceAPIException as exc:
+        if _is_ban(exc):
+            _record_klines_ban(exc)                  # whole fleet stands down
+        raise                                        # preserve caller semantics (skip symbol)
+    try:                                             # --- cache write (fail-open) ---
+        if bars:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            from atomic_state import write_json_atomic
+            write_json_atomic(_CACHE_DIR / (key + ".json"), bars)
+            if _random.random() < 0.05:
+                _sweep_stale_klines(timeframe, end_ms)
+    except Exception:
+        pass
+    return [b for b in bars if int(b.get("ts_ms", 0)) >= _start_ms]   # slice tier to caller's window
+
+
+def _fetch_klines_with_flow_direct(symbol: str, timeframe: str, *, months: float, end_ms: int,
                            client: Any, sleep_between: float = 0.02,
                            with_deriv: bool = False) -> list[dict[str, Any]]:
     """Page CLOSED klines and KEEP taker-buy volume so CVD can be computed. Only
