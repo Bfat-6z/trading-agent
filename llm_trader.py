@@ -175,7 +175,7 @@ DAILY_BREAKER_ON = os.environ.get("LLM_TRADER_DAILY_BREAKER", "1") != "0"
 # fast, instead of sitting idle waiting for the rare A+. Lower confluence gate +
 # an explicit "act, don't over-skip" directive. Honest tradeoff: more trades on a
 # not-yet-proven strategy = faster data AND faster bleed; the scorecard is the judge.
-MIN_CONFLUENCE = int(os.environ.get("LLM_TRADER_MIN_CONFLUENCE", "2"))
+MIN_CONFLUENCE = int(os.environ.get("LLM_TRADER_MIN_CONFLUENCE", "3"))   # playbook v2 (2026-07-16): was 2, contradicted the doc's ">=3 from distinct families"
 EXPLORE_MODE = os.environ.get("LLM_TRADER_EXPLORE", "1") == "1"
 # (wick/rút-râu is now an ADVISORY the model judges from wick_intensity in its context — no hard gate.)
 
@@ -1243,7 +1243,9 @@ _MEMORY_RULE = ("Learn from your MEMORY block CONTEXTUALLY: the counts are evide
                 "within ~3 ATR; code only clamps insanity (size<=40% margin, lev<=25). Bet bigger on A+ setups, "
                 "smaller on B — that judgment is the job. Your EMA+VOLUME+price method strongly PREFERS strong participation — quiet-bar "
                 "entries (vol_ratio<1.5) are your measured losing pattern, so weigh volume heavily and prefer "
-                "vol_ratio>=1.5 — but that is now YOUR call, not a code block; a limit into the volume bar is ideal.")
+                "vol_ratio>=1.5 — but that is now YOUR call, not a code block; never enter the volume/ignition bar itself; wait for the level to HOLD "
+                "(close-back-through + follow-through, or a sweep-and-reclaim) — a volume spike confirms "
+                "PARTICIPATION not DIRECTION (your lab proved ignition candles carry no directional edge).")
 _DECISION_SCHEMA = (
     "THINK step-by-step FIRST, then decide. Output EXACTLY two sections separated by a line '===DECISIONS==='.\n"
     "THINKING:\nReason out loud. For EACH charted coin, in order: (1) TREND — EMA stack + slope + MTF agree? "
@@ -1259,7 +1261,9 @@ _DECISION_SCHEMA = (
        "Be STRICT: default SKIP — most coins should be SKIP, taking a marginal trade is the mistake you keep making.")
     + " PREFER A LIMIT ENTRY: set entry_px at a PULLBACK level (support-zone edge / EMA20 for a long, "
     "resistance edge / EMA20 for a short) so you buy the dip / sell the rip at a GOOD price — do NOT FOMO-chase the "
-    "current extended price. Only omit entry_px (market enter) for a confirmed breakout that won't retrace. A limit "
+    "current extended price. Market-enter (omit entry_px) ONLY on a sweep-and-reclaim that already HELD, NEVER on a "
+    "fresh breakout — fresh breaks get faded (your measured #1 loss). A limit is allowed only at a pre-validated "
+    "level or a zone you expect price to pull back INTO, never resting into the ignition bar. A limit "
     "waits for price to come to you and cancels if it runs away — this is how a disciplined trader enters.\n"
     "===DECISIONS===\nThen a JSON ARRAY (may be empty) of ONLY coins that PASSED the gate: "
     "[{\"symbol\":\"BTCUSDT\",\"action\":\"LONG|SHORT|SKIP\",\"leverage\":<YOUR call, 1-25>,\"size_pct\":<YOUR call, % of equity, 1-40>,"
