@@ -352,8 +352,10 @@ def build_memory_context(closed: list[dict[str, Any]],
             closed = era[-200:]
         else:
             closed = disc[-60:]
-            era_note = ("stats mostly from the PREVIOUS model era — treat as "
-                        "system history, not your record")
+            if disc:      # review: on an EMPTY ledger the note would be factually
+                          # false ("from the previous era" of zero trades)
+                era_note = ("stats mostly from the PREVIOUS model era — treat as "
+                            "system history, not your record")
     stats = aggregate_stats(closed)
     lessons = distill_lessons(stats)
     recent = []

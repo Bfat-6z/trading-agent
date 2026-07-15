@@ -526,9 +526,10 @@ def open_restart_incident(spec: AgentSpec, gate: dict) -> None:
 
 def _env_float(name: str, fallback: float) -> float:
     try:
-        return float(os.environ.get(name, "") or fallback)
-    except Exception:
-        return fallback
+        v = float(os.environ.get(name, "") or fallback)
+        return v if v > 0 else fallback   # review: MEM_WATCHDOG_MB=0 ("disable" attempt)
+    except Exception:                     # would make EVERY agent over-cap -> fleet-wide
+        return fallback                   # kill every 30min. Zero/negative = fallback.
 
 
 def mem_threshold_mb(agent: str) -> float:
@@ -835,14 +836,29 @@ def ensure_agent(spec: AgentSpec) -> dict:
     mem_over = mem_watchdog_verdict(spec, pid) if running else None
     if running and not is_stale and mem_over is None:
         return {"agent": spec.name, "pid": pid, "running": True, "stale": False, "action": "ok"}
+    restart_state_path = spec.pid_file.parent / "agent_restart_state.json"
     if running and (is_stale or mem_over is not None):
         if mem_over is not None:
+            # Codex CRITICAL: consult the gate BEFORE killing — killing an agent whose
+            # respawn the gate then denies (backoff/quarantine) turns a recoverable
+            # memory breach into hard downtime. Over-cap-but-gated = leave it running,
+            # log, retry next cycle (the leak is bad; a dead mission is worse).
+            _pre_gate = restart_gate(spec.name, state_path=restart_state_path)
+            if not _pre_gate.get("allowed"):
+                append_jsonl("mem_watchdog_deferred_gate", {**mem_over, "restart_gate": _pre_gate})
+                return {"agent": spec.name, "pid": pid, "running": True, "stale": is_stale,
+                        "action": "mem_deferred_gate", "restart_gate": _pre_gate}
             # LOUD: a leaking agent once starved the whole box and killed the mission at spawn.
             append_jsonl("mem_watchdog_restart", {**mem_over, "cooldown_seconds": MEM_WATCHDOG_COOLDOWN_SECONDS})
             open_mem_incident(spec, mem_over)
             record_mem_restart(spec.name)
         stop_pid(pid, spec.script)
-    restart_state_path = spec.pid_file.parent / "agent_restart_state.json"
+        if mem_over is not None and is_pid_running(pid, spec.script):
+            # Codex: never start a duplicate next to a kill that silently failed;
+            # cooldown already stamped so this can't storm — next cycle retries.
+            append_jsonl("mem_watchdog_kill_failed", {"agent": spec.name, "pid": pid})
+            return {"agent": spec.name, "pid": pid, "running": True, "stale": is_stale,
+                    "action": "mem_kill_failed"}
     gate = restart_gate(spec.name, state_path=restart_state_path)
     if not gate.get("allowed"):
         if gate.get("reason") == "restart_circuit_breaker":

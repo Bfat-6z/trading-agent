@@ -2546,8 +2546,20 @@ if __name__ == "__main__":
                         import ctypes as _ct
                         _h = _ct.windll.kernel32.OpenProcess(0x1000, False, _opid)  # QUERY_LIMITED
                         if _h:
+                            # Opus review: OpenProcess success alone treats a REUSED pid as
+                            # "owner alive" -> new loop exits 1 each cycle -> circuit breaker
+                            # -> 6h mission quarantine. Require STILL_ACTIVE + a python image.
+                            _code = _ct.c_ulong(0)
+                            _ok = _ct.windll.kernel32.GetExitCodeProcess(_h, _ct.byref(_code))
+                            _alive = bool(_ok) and _code.value == 259          # STILL_ACTIVE
+                            if _alive:
+                                _buf = _ct.create_unicode_buffer(512)
+                                _sz = _ct.c_ulong(512)
+                                if _ct.windll.kernel32.QueryFullProcessImageNameW(
+                                        _h, 0, _buf, _ct.byref(_sz)):
+                                    _alive = "python" in _buf.value.lower()    # reused pid != our loop
                             _ct.windll.kernel32.CloseHandle(_h)
-                            _owner_alive = True
+                            _owner_alive = _alive
                         else:
                             _owner_alive = False        # PID not found -> dead -> stale lock
                     else:
