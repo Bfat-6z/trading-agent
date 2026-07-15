@@ -49,6 +49,7 @@ def _on_prop(sym) -> bool:
 #     READ ONLY: signal accuracy on the boss's actual venue. No order path exists here.)
 TIDALFI_API = "https://td.tidalfi.ai"
 _TF_META: dict = {"ts": 0.0, "by_sym": {}}
+_UPD_BACKOFF: dict = {"until": 0.0}     # getUpdates DNS-flap backoff (audit #7)
 
 
 def _tf_get(path: str, timeout: float = 5.0) -> dict | list | None:
@@ -65,8 +66,12 @@ def _tf_get(path: str, timeout: float = 5.0) -> dict | list | None:
 def _tf_meta(sym) -> dict | None:
     """Per-symbol tick/step/minNotional from TidalFi (cached 6h; None = fail-open)."""
     import time as _t
-    if not _TF_META["by_sym"] or _t.time() - _TF_META["ts"] > 6 * 3600:
+    if _t.time() - float(_TF_META.get("fail_ts") or 0) < 300:
+        return _TF_META["by_sym"].get(str(sym or ""))   # negative-cache 5min (audit LOW:
+    if not _TF_META["by_sym"] or _t.time() - _TF_META["ts"] > 6 * 3600:   # no 6s stall per call)
         rows = _tf_get("/api/market-data/symbols?status=TRADING", timeout=6.0)
+        if not rows:
+            _TF_META["fail_ts"] = _t.time()
         if isinstance(rows, dict):                 # venue wraps: data -> {symbols:[...]}
             rows = rows.get("symbols") or rows.get("list") or []
         if isinstance(rows, list) and rows:
@@ -114,8 +119,10 @@ def _save(d: dict) -> None:
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
         import os
         os.replace(tmp, CFG)
-    except Exception:
-        pass
+    except Exception as e:
+        # audit: a silently-lost save = lost sent_ids = RESEND FLOOD after restart.
+        # Can't persist, but we CAN leave evidence.
+        _log({"save_fail": repr(e)[:100]})
 
 
 LOG = ROOT / "state" / "whale_signal.log"
@@ -362,7 +369,11 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
         except Exception:
             _age_min = 0.0
         if _age_min > 45:                    # bot was down / backlog -> entry price is gone
-            sent.add(pid)
+            sent.add(pid)                    # (audit: silence left the boss blind if HIS limit
+            _sym = str(p.get("symbol") or "").replace("USDT", "")   # also filled during the stall
+            _send(token, chat,               # -> downgraded notice, one-shot, best-effort)
+                  f"⏰ <b>KHỚP TRỄ — {_sym}</b> (mở ~{round(_age_min)} phút trước, bot vừa hồi). "
+                  f"Kèo KHÔNG còn fresh — nếu limit của mày cũng đã khớp thì check vị thế + đặt SL.")
             _log({"skip_stale_entry": str(p.get("symbol")), "age_min": round(_age_min)})
             continue
         exposure["seq"] = int(cfg.get("seq") or 0) + 1
@@ -374,6 +385,7 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
             sent.add(pid)
             cfg["seq"] = exposure["seq"]     # "KÈO #N" advances only on a DELIVERED signal
             n += 1
+            _log({"sent": pid, "seq": exposure["seq"]})   # audit: success was unprovable from log
         # transient send failure -> NOT marked -> retried next cycle (a signal is worth retrying)
     if n or len(sent) != len(set(cfg.get("sent_ids") or [])):
         cfg["sent_ids"] = list(sent)[-500:]
@@ -498,8 +510,10 @@ def emit_closes(closed_rows: list[dict]) -> int:
     if not new:
         return 0
     if len(new) > 5:                 # safety cap: never burst more than 5 closes/cycle (429 guard)
-        new = sorted(new, key=lambda x: float(x.get("closed_ts") or 0))[-5:]
-        cfg["last_close_ts"] = max(wm, min(float(r.get("closed_ts") or 0) for r in new) - 1)
+        # audit LOW: keep the OLDEST 5 — wm then naturally stops before the remainder,
+        # which drains next cycle (the old newest-5 + wm-rewind line was dead code that
+        # silently dropped the older rows forever).
+        new = sorted(new, key=lambda x: float(x.get("closed_ts") or 0))[:5]
     now_s = _t.time()
     est, w, l = _prop_day_est(closed_rows, now_s)
     left = DAILY_LOSS_CAP + est if est < 0 else DAILY_LOSS_CAP
@@ -513,16 +527,25 @@ def emit_closes(closed_rows: list[dict]) -> int:
         day_line += (f"\n📉 DD từ đỉnh: <b>−${_dd:,.0f}</b> / trần ${MAX_DD_CAP:.0f}"
                      + (" — <b>DỪNG ĐÁNH</b>" if _dd >= MAX_DD_CAP else ""))
     n = 0
-    for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):
-        if not _on_prop(r.get("symbol")):             # unlisted coin: entry was never signalled;
-            wm = max(wm, float(r.get("closed_ts") or 0))   # advance watermark, send nothing
-            continue
+    intact = True          # audit HIGH: wm used to advance past FAILED sends -> a close
+    for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):   # notification (the
+        _ts = float(r.get("closed_ts") or 0)          # boss's live exit!) was lost FOREVER on
+        if not _on_prop(r.get("symbol")):             # a 429/DNS window. Now: wm freezes at the
+            if intact:                                # first failure; that row + everything
+                wm = max(wm, _ts)                     # after retries next cycle (burst cap still
+            continue                                  # bounds the replay).
         text = _fmt_close(r, day_line)
         if text and est <= -150:
             text += "\n⛔ <b>GẦN TRẦN NGÀY — khuyên NGỪNG đánh tới 07:00 mai.</b>"
-        if text and _send(token, chat, text):
+        ok = (not text) or _send(token, chat, text)   # malformed row = skip forever by design
+        if text and ok:
             n += 1
-        wm = max(wm, float(r.get("closed_ts") or 0))
+            _log({"sent_close": r.get("symbol"), "ts": _ts})
+        if ok and intact:
+            wm = max(wm, _ts)
+        elif not ok:
+            intact = False
+            _log({"close_send_fail_wm_hold": r.get("symbol"), "ts": _ts})
     cfg["last_close_ts"] = wm
     _save(cfg)
     return n
@@ -535,10 +558,15 @@ def handle_commands(status_fn=None) -> int:
     token, chat = cfg.get("bot_token"), cfg.get("chat_id")
     if not token or chat is None:
         return 0
+    import time as _t
+    if _t.time() < float(_UPD_BACKOFF.get("until") or 0):
+        return 0                       # audit: 44min DNS outage = one failed lookup + log
     d = _api(token, "getUpdates", {"offset": int(cfg.get("upd_offset") or 0) + 1, "limit": 10,
                                    "timeout": 0}, timeout=10.0)
     if not d or not d.get("ok"):
+        _UPD_BACKOFF["until"] = _t.time() + 600   # spam per cycle -> back off 10min
         return 0
+    _UPD_BACKOFF["until"] = 0.0
     n = 0
     last = int(cfg.get("upd_offset") or 0)
     for upd in d.get("result") or []:
@@ -624,15 +652,19 @@ def emit_pending(pending_rows: list[dict]) -> int:
         qid = f"{q.get('symbol')}_{q.get('placed_ms')}"
         cur[qid] = q
     n = 0
-    for qid, q in cur.items():                        # NEW pending -> place signal
-        if qid in prev:
+    seen_next = set()          # audit HIGH: pending_seen was replaced with cur UNCONDITIONALLY —
+    for qid, q in cur.items():                        # a failed place-send was recorded as "seen"
+        if qid in prev:                               # and never retried (the boss's EARLY entry
+            seen_next.add(qid)                        # ticket, lost). Now: a qid enters the seen
+            continue                                  # set only after a DELIVERED place notice
+        if not _on_prop(q.get("symbol")):             # (or is by-design silent: off-venue rows).
+            seen_next.add(qid)                        # not on TidalFi -> never announced
             continue
-        if not _on_prop(q.get("symbol")):             # not on TidalFi -> skip (cancel notice
-            continue                                  # also naturally suppressed via prev)
         sym = str(q.get("symbol") or "").replace("USDT", "")
         side = str(q.get("side") or "").upper()
         ep = q.get("entry_px")
         if ep is None:
+            seen_next.add(qid)                        # malformed -> don't retry forever
             continue
 
         def px(v):
@@ -673,6 +705,9 @@ def emit_pending(pending_rows: list[dict]) -> int:
                 f"   👉 đặt limit trên TidalFi ngay để nằm cùng book.")
         if _send(token, chat, text):
             n += 1
+            seen_next.add(qid)
+            _log({"sent_pending": qid})
+        # failed place-send -> NOT seen -> retried next cycle
     for qid in prev - set(cur):                       # gone: cancelled/expired (not a fill)
         # a pos_id for a filled pending contains the coin; if we already signalled a same-coin
         # position recently, treat as fill (silent). Heuristic: coin part present in sent_ids.
@@ -684,7 +719,10 @@ def emit_pending(pending_rows: list[dict]) -> int:
         sym = coin.replace("USDT", "")
         if _send(token, chat, f"❌ <b>HỦY LIMIT — {sym}</b> (giá chạy quá / hết hạn). Nếu mày đã đặt limit trên TidalFi thì HỦY."):
             n += 1
-    cfg["pending_seen"] = list(cur.keys())[-100:]
+        else:
+            seen_next.add(qid)    # failed CANCEL notice: keep it "seen" so prev-cur
+                                  # re-fires the cancel next cycle instead of losing it
+    cfg["pending_seen"] = list(seen_next)[-100:]
     _save(cfg)
     return n
 
