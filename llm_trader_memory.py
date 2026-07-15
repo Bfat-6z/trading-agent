@@ -268,6 +268,21 @@ def mistake_lessons(closed: list[dict[str, Any]], min_n: int = 8) -> list[str]:
             out.append(f"STAND ASIDE in '{rg}': {c} trades there, only {w/c*100:.0f}% win — this regime is not "
                        f"tradeable for you; wait for a cleaner trend/structure before engaging.")
 
+    # 6. THESIS-WRONG dominance (P0 instrumentation, owner 2026-07-16 "não nó chưa
+    # phân tích được thị trường"): resolve stamps thesis_wrong (direction failed)
+    # vs noise_stop (direction fine, stop clipped). When the thesis itself fails
+    # >=40% and dominates noise-stops, the leak is the ANALYSIS — textbook
+    # BOS/retest/volume confluences read at exactly the levels that get faded.
+    ins = [t for t in trades if t.get("thesis_wrong") is not None]
+    if len(ins) >= 8:
+        twr = sum(1 for t in ins if t.get("thesis_wrong")) / len(ins)
+        nsr = sum(1 for t in ins if t.get("noise_stop")) / len(ins)
+        if twr >= 0.4 and twr > nsr:
+            out.insert(0, f"THESIS WRONG {twr*100:.0f}% (n={len(ins)}; noise-stops only {nsr*100:.0f}%): your "
+                          f"DIRECTION reads are failing, not your stops. The clean-looking BOS/retest + "
+                          f"volume-spike confluences you cite are exactly where breakouts get FADED. Demand "
+                          f"evidence the level HELD (close back above/below + follow-through bar), consider "
+                          f"the opposite read of the same level, and skip textbook-perfect setups in chop.")
     return out[:6]
 
 

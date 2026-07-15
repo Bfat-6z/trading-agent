@@ -993,7 +993,7 @@ def _mistakes_block() -> str:
     if not ms:
         return ""
     def _rank(line: str) -> int:                      # actionable first, blanket last
-        for i, pfx in enumerate(("NOISE-STOPPED", "WEAK R:R", "STAND ASIDE",
+        for i, pfx in enumerate(("THESIS WRONG", "NOISE-STOPPED", "WEAK R:R", "STAND ASIDE",
                                  "AVOID", "OVER-TRADING")):    # prefixes: llm_trader_memory lockstep
             if line.startswith(pfx):
                 return i
@@ -1026,7 +1026,19 @@ def memory_context() -> dict[str, Any]:
     guarantees malformed rows are skipped, so this can't kill the loop.
     model=MODEL era-windows the stats (P1 #11) — same policy as
     _mistakes_block, so 5.6-sol isn't taught with 5.5's record."""
-    return ltm.build_memory_context(_dedupe_closed(_load(CLOSED)), model=MODEL)
+    ctx = ltm.build_memory_context(_dedupe_closed(_load(CLOSED)), model=MODEL)
+    try:
+        # the calibration report was BUILT (P1 2026-07-10) as the honest feedback channel
+        # replacing the degenerate mistakes block — and then never wired into any prompt
+        # (loop-forensic). The model now sees its measured noise-vs-thesis split + hint.
+        import llm_trader_learning as ltl
+        cal = ltl.calibration_report(_dedupe_closed(_load(CLOSED)), window=40)
+        ctx["calibration"] = {k: cal.get(k) for k in
+                              ("n", "win_rate", "mean_actual_R", "noise_stop_rate",
+                               "thesis_wrong_rate", "over_optimism_R", "verdict_hint")}
+    except Exception:
+        pass
+    return ctx
 
 
 # ---------------------------------------------------------------------------
