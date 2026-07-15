@@ -197,14 +197,21 @@ def _fmt_signal(p: dict, wr: dict | None = None, exp: dict | None = None) -> str
             return f"{v:,.6f}".rstrip("0").rstrip(".") if v < 1 else f"{v:,.2f}"
 
         exp = exp or {}
-        head = "🐋 <b>CÁ VOI TẬP SỰ</b> — KÈO MỚI"
-        if exp.get("near_cap"):
+        _n = exp.get("seq")
+        head = f"🐋 <b>CÁ VOI TẬP SỰ</b> — KÈO {'#%d' % _n if _n else 'MỚI'}"
+        if exp.get("dd_stop"):               # gap #10: max-DD $300 = challenge DEAD — loudest banner
+            head = (f"🟥 <b>MAX-DD CHẠM TRẦN (−${exp.get('dd_now', 0):,.0f} / ${MAX_DD_CAP:.0f}) — "
+                    f"DỪNG ĐÁNH HẲN.</b>\n" + head + " (chỉ tham khảo, KHÔNG vào)")
+        elif exp.get("near_cap"):
             head = ("⛔ <b>GẦN TRẦN NGÀY — KÈO NÀY KHÔNG KHUYÊN VÀO</b>\n"
                     f"   (hôm nay ước tính {exp.get('day_est'):,.0f}$ / trần −${DAILY_LOSS_CAP:.0f})\n"
                     "🐋 <b>CÁ VOI TẬP SỰ</b> — kèo (tham khảo, cân nhắc BỎ)")
+        import time as _t
+        _lt = _t.gmtime(_t.time() + 7 * 3600)
         lines = [
             head,
             "━━━━━━━━━━━━━━",
+            f"🕐 {_t.strftime('%H:%M', _lt)} (GMT+7) · hiệu lực ~<b>30 phút</b> — trễ hơn thì BỎ",
             f"📊 <b>{sym}</b> · {arrow} · x{lev}   <i>({src})</i>",
             f"📍 Entry: <code>{px(entry)}</code>",
             f"🛑 SL: <code>{px(sl)}</code>  (−{sl_pct:.2f}%)",
@@ -221,6 +228,9 @@ def _fmt_signal(p: dict, wr: dict | None = None, exp: dict | None = None) -> str
             lines.append(f"📊 Đang mở <b>{exp['n_open']}</b> kèo · tổng risk ~<b>${exp.get('risk_usd',0)}</b>{warn}")
         lines.append(f"📅 Hôm nay: <b>{'+' if exp.get('day_est',0) >= 0 else ''}{exp.get('day_est',0):,.0f}$</b>"
                      f" (ước tính) · trần −${DAILY_LOSS_CAP:.0f}")
+        if exp.get("dd_warn") or exp.get("dd_stop"):     # multi-day bleed line (gap #10)
+            lines.append(f"📉 DD từ đỉnh: <b>−${exp.get('dd_now', 0):,.0f}</b> / trần ${MAX_DD_CAP:.0f}"
+                         f"{' — SẮP CHÁY CHALLENGE, đánh nhỏ lại hoặc nghỉ' if not exp.get('dd_stop') else ''}")
         # DELAY GUARD (owner: "báo rồi đánh tay thì có độ trễ"): a manual fill lags the signal, so
         # place a LIMIT at the entry (fills at the right price or not at all — never chase Market),
         # and if price has already run toward TP past a small tolerance, SKIP instead of chasing.
@@ -262,9 +272,16 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
     for p in opens:
         same_dir[str(p.get("side"))] = same_dir.get(str(p.get("side")), 0) + 1
     risk = ACCOUNT_USD * RISK_PCT / 100.0
+    import time as _t
+    if not cfg.get("prop_start_ts"):                     # DD anchor: set ONCE, persist NOW
+        cfg["prop_start_ts"] = int(_t.time() * 1000)     # (before any conditional save path)
+        _save(cfg)
+    _cum, _dd = _prop_maxdd(closed_rows or [], cfg["prop_start_ts"])
     exposure = {"n_open": n_open, "risk_usd": round(n_open * risk),
                 "concentration": max(same_dir.values()) if same_dir else 0,
-                "day_est": est, "near_cap": est <= -(DAILY_LOSS_CAP * 0.75)}
+                "day_est": est, "near_cap": est <= -(DAILY_LOSS_CAP * 0.75),
+                "cum": _cum, "dd_now": _dd,                       # gap #10: multi-day bleed
+                "dd_warn": _dd >= MAX_DD_CAP * 0.75, "dd_stop": _dd >= MAX_DD_CAP}
     n = 0
     for p in opens:
         pid = p.get("pos_id") or f"{p.get('symbol')}_{p.get('entry_ts')}"
@@ -274,12 +291,22 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
             sent.add(pid)                    # (marked so we never retry it)
             _log({"skip_not_on_prop": str(p.get("symbol"))})
             continue
+        try:                                 # gap #9: never tell the owner to enter a STALE
+            _age_min = (_t.time() * 1000 - float(p.get("entry_ts") or 0)) / 60000.0
+        except Exception:
+            _age_min = 0.0
+        if _age_min > 45:                    # bot was down / backlog -> entry price is gone
+            sent.add(pid)
+            _log({"skip_stale_entry": str(p.get("symbol")), "age_min": round(_age_min)})
+            continue
+        exposure["seq"] = int(cfg.get("seq") or 0) + 1
         text = _fmt_signal(p, wr, exposure)
         if not text:
             sent.add(pid)                # malformed -> mark so we don't retry every cycle
             continue
         if _send(token, chat, text):
             sent.add(pid)
+            cfg["seq"] = exposure["seq"]     # "KÈO #N" advances only on a DELIVERED signal
             n += 1
         # transient send failure -> NOT marked -> retried next cycle (a signal is worth retrying)
     if n or len(sent) != len(set(cfg.get("sent_ids") or [])):
@@ -309,6 +336,8 @@ def _prop_day_est(closed_rows: list[dict], now_s: float) -> tuple[float, int, in
         try:
             if float(r.get("closed_ts") or 0) < start_ms:
                 continue
+            if not _on_prop(r.get("symbol")):              # only trades the owner could follow
+                continue
             aR = r.get("actual_R")
             if aR is None:                                 # fallback: net/margin r (leverage-scaled)
                 continue
@@ -318,6 +347,36 @@ def _prop_day_est(closed_rows: list[dict], now_s: float) -> tuple[float, int, in
         except Exception:
             continue
     return round(est, 2), w, l
+
+
+MAX_DD_CAP = 300.0        # TidalFi Two-Step: max total drawdown $300 = challenge DEAD
+
+
+def _prop_maxdd(closed_rows: list[dict], start_ms: float) -> tuple[float, float]:
+    """Cumulative prop estimate + trailing max-drawdown since the tracker anchor (gap #10:
+    Two-Step challenges die from MULTI-DAY bleed the daily tracker never sees). PURE —
+    the anchor (cfg['prop_start_ts']) is owned by the CALLER: this helper must not
+    load+save its own config copy or the caller's later _save of a pre-anchor snapshot
+    would silently drop the anchor and reset the DD clock every cycle. Trailing
+    peak-to-now — stricter than a static floor, so warnings fire early, never late."""
+    start = float(start_ms or 0)
+    risk = ACCOUNT_USD * RISK_PCT / 100.0
+    rows = []
+    for r in closed_rows or []:
+        try:
+            ts = float(r.get("closed_ts") or 0)
+            if ts >= start and _on_prop(r.get("symbol")) and r.get("actual_R") is not None:
+                rows.append((ts, float(r["actual_R"]) * risk))
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x[0])
+    cum = peak = 0.0
+    dd = 0.0
+    for _ts, v in rows:
+        cum += v
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    return round(cum, 2), round(max(0.0, peak - cum), 2)   # (cum PnL, CURRENT drawdown)
 
 
 def _fmt_close(r: dict, day_line: str) -> str | None:
@@ -380,6 +439,13 @@ def emit_closes(closed_rows: list[dict]) -> int:
     left = DAILY_LOSS_CAP + est if est < 0 else DAILY_LOSS_CAP
     day_line = (f"📅 Hôm nay (reset 07:00): <b>{'+' if est >= 0 else ''}{est:,.0f}$</b> ước tính"
                 f" ({w}W/{l}L) · trần −${DAILY_LOSS_CAP:.0f}")
+    if not cfg.get("prop_start_ts"):                     # DD anchor (gap #10) — same as emit()
+        cfg["prop_start_ts"] = int(now_s * 1000)
+        _save(cfg)
+    _cum, _dd = _prop_maxdd(closed_rows, cfg["prop_start_ts"])
+    if _dd >= MAX_DD_CAP * 0.5:                          # only surface once it matters
+        day_line += (f"\n📉 DD từ đỉnh: <b>−${_dd:,.0f}</b> / trần ${MAX_DD_CAP:.0f}"
+                     + (" — <b>DỪNG ĐÁNH</b>" if _dd >= MAX_DD_CAP else ""))
     n = 0
     for r in sorted(new, key=lambda x: float(x.get("closed_ts") or 0)):
         if not _on_prop(r.get("symbol")):             # unlisted coin: entry was never signalled;
