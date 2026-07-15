@@ -42,6 +42,61 @@ TIDALFI_SYMBOLS = frozenset({
 
 def _on_prop(sym) -> bool:
     return str(sym or "") in TIDALFI_SYMBOLS
+
+
+# --- TidalFi PUBLIC read-only API (boss's other agent validated it, 2026-07-15;
+#     td.tidalfi.ai — no auth; /api/trading/terminal etc. are 401 and NOT used.
+#     READ ONLY: signal accuracy on the boss's actual venue. No order path exists here.)
+TIDALFI_API = "https://td.tidalfi.ai"
+_TF_META: dict = {"ts": 0.0, "by_sym": {}}
+
+
+def _tf_get(path: str, timeout: float = 5.0) -> dict | list | None:
+    try:
+        req = urllib.request.Request(TIDALFI_API + path, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read().decode())
+        return d.get("data") if isinstance(d, dict) and "data" in d else d
+    except Exception as e:
+        _log({"tf_api_err": path.split("?")[0], "error": repr(e)[:80]})
+        return None
+
+
+def _tf_meta(sym) -> dict | None:
+    """Per-symbol tick/step/minNotional from TidalFi (cached 6h; None = fail-open)."""
+    import time as _t
+    if not _TF_META["by_sym"] or _t.time() - _TF_META["ts"] > 6 * 3600:
+        rows = _tf_get("/api/market-data/symbols?status=TRADING", timeout=6.0)
+        if isinstance(rows, dict):                 # venue wraps: data -> {symbols:[...]}
+            rows = rows.get("symbols") or rows.get("list") or []
+        if isinstance(rows, list) and rows:
+            _TF_META["by_sym"] = {x["symbol"]: x for x in rows
+                                  if isinstance(x, dict) and x.get("symbol")}
+            _TF_META["ts"] = _t.time()
+    return _TF_META["by_sym"].get(str(sym or ""))
+
+
+def _tf_quote(sym) -> dict | None:
+    """Live top-of-book on the boss's venue (None = fail-open, ticket keeps paper px)."""
+    d = _tf_get(f"/api/trading/orderbook?symbol={sym}&limit=5", timeout=4.0)
+    try:
+        bid, ask = float(d["bids"][0][0]), float(d["asks"][0][0])
+        return {"bid": bid, "ask": ask, "spread_pct": (ask - bid) / ask * 100 if ask else 0.0}
+    except Exception:
+        return None
+
+
+def _tf_round(px: float, tick) -> float:
+    """Round a price to the venue tick so a copied ticket is accepted verbatim."""
+    try:
+        t = float(tick)
+        if t <= 0:
+            return px
+        s = f"{t:f}".rstrip("0")
+        dec = len(s.split(".")[1]) if "." in s else 0
+        return round(round(px / t) * t, dec)
+    except Exception:
+        return px
 _API = "https://api.telegram.org/bot{}/{}"
 
 
@@ -168,6 +223,11 @@ def _fmt_signal(p: dict, wr: dict | None = None, exp: dict | None = None) -> str
         lev = min(int(p.get("leverage") or 5), PROP_MAX_LEV)   # prop signal capped at 5x (boss)
         if not sym or side not in ("LONG", "SHORT") or entry <= 0 or sl <= 0 or tp <= 0:
             return None
+        _meta = _tf_meta(p.get("symbol"))
+        if _meta and _meta.get("tickSize"):        # venue-exact prices: copy = accepted verbatim
+            _tk = _meta["tickSize"]
+            entry, sl, tp = _tf_round(entry, _tk), _tf_round(sl, _tk), _tf_round(tp, _tk)
+        _q = _tf_quote(p.get("symbol")) if _meta else None
         sl_pct = abs(entry - sl) / entry * 100
         tp_pct = abs(tp - entry) / entry * 100
         if sl_pct <= 0:
@@ -214,6 +274,12 @@ def _fmt_signal(p: dict, wr: dict | None = None, exp: dict | None = None) -> str
             f"🕐 {_t.strftime('%H:%M', _lt)} (GMT+7) · hiệu lực ~<b>30 phút</b> — trễ hơn thì BỎ",
             f"📊 <b>{sym}</b> · {arrow} · x{lev}   <i>({src})</i>",
             f"📍 Entry: <code>{px(entry)}</code>",
+        ]
+        if _q:                                     # the boss's VENUE price, not Binance's —
+            _sw = " ⚠️ spread rộng — LIMIT only" if _q["spread_pct"] > 0.10 else ""
+            lines.append(f"🌊 TidalFi: bid <code>{px(_q['bid'])}</code> / ask "
+                         f"<code>{px(_q['ask'])}</code> · spread {_q['spread_pct']:.3f}%{_sw}")
+        lines += [
             f"🛑 SL: <code>{px(sl)}</code>  (−{sl_pct:.2f}%)",
             f"🎯 TP: <code>{px(tp)}</code>  (+{tp_pct:.2f}%)  ·  R:R <b>{rr:.1f}</b>",
             "━━━━━━━━━━━━━━",
