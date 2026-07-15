@@ -138,7 +138,15 @@ PROP_ALWAYS_SCAN = frozenset({
 
 
 def _with_prop_syms(selected: list) -> list:
-    return list(selected) + [s for s in sorted(PROP_ALWAYS_SCAN) if s not in set(selected)]
+    have = set(selected)
+    extra = [s for s in sorted(PROP_ALWAYS_SCAN) if s not in have]
+    try:                                   # + the 22 TidalFi-only TradFi perps (NVDA/XAU...)
+        import tidalfi_data as td          # — injected AFTER the NON_CRYPTO universe filter,
+        extra += [s for s in sorted(td.tidalfi_only_symbols())   # never through it
+                  if s not in have and s not in extra]
+    except Exception:
+        pass
+    return list(selected) + extra
 UNIVERSE_REFRESH_SEC = float(os.environ.get("LLM_TRADER_UNIVERSE_REFRESH", "1800"))  # rebuild the hot list every ~30 min (bounds klines API calls)
 UNIVERSE_CACHE = LT_DIR / "universe_cache.json"
 # Owner: UNLIMITED number of positions — accepts correlation risk for bigger
@@ -352,10 +360,30 @@ def _whale_flow_map() -> dict[str, dict[str, Any]]:
         return {}
 
 
+def _fetch_bars_any(sym: str, tf: str, months: float, end_ms: int, client: Any,
+                    **kw) -> list[dict]:
+    """Venue-aware bar fetch: Binance for crypto, the TidalFi UDF adapter for the 22
+    TradFi-only perps. CRITICAL for resolve/_resolve_pending — without this a TradFi
+    position could OPEN but never CLOSE (the exact lane_farm zombie disease)."""
+    try:
+        import tidalfi_data as td
+        if sym in td.tidalfi_only_symbols():
+            _lim = min(1000, max(60, int(months * 30 * 86_400_000 / of._TF_MS[tf])))
+            return td.fetch_klines(sym, tf, limit=_lim, end_ms=end_ms)
+    except Exception:
+        pass
+    return of.fetch_klines_with_flow(sym, tf, months=months, end_ms=end_ms, client=client, **kw)
+
+
 def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str, Any]]:
     import backtest_data_fetcher as bf
     out = []
     whale = _whale_flow_map()   # per-symbol Telegram whale/liquidation pressure
+    try:
+        import tidalfi_data as td
+        _tf_only = td.tidalfi_only_symbols()   # the 22 TradFi perps (NVDA/TSLA/XAU...) the
+    except Exception:                          # boss can trade on TidalFi but Binance lacks
+        td, _tf_only = None, set()
     for sym in symbols:
         try:
             # with_deriv=False on the live hot path (ck:debug 2026-07-08 root cause): the OI/LS
@@ -364,7 +392,21 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
             # mission looked dead. Mission doesn't need deriv: no OI method is armed, and the
             # gap-veto's gap_risk_pct is computed from OHLC, not deriv. Re-enable only when an OI
             # method promotes AND fetch_deriv_series is proven hang-proof.
-            fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02, with_deriv=False)
+            if td is not None and sym in _tf_only:
+                # TidalFi-only TradFi perp: bars from the venue's own UDF feed (adapter
+                # returns the exact orderflow_data bar contract; 11/11 tests incl. the
+                # fail-closed enrich join). Session gate: equities print synthetic 24/7
+                # bars — skip when stale/flat (weekend, market closed) instead of feeding
+                # the model dead candles (the stock-perp lane-loss lesson).
+                fb = td.fetch_klines(sym, TF, limit=300, end_ms=now_ms)
+                _sm = td.session_meta(sym, fb, TF, now_ms)
+                if not _sm.get("fresh") or (_sm.get("flat_bar_frac") or 0) > 0.3:
+                    continue
+                fund = []                          # no funding on TidalFi TradFi perps ->
+                                                   # enrich emits funding_rate=0.0 (verified)
+            else:
+                fb = of.fetch_klines_with_flow(sym, TF, months=0.12, end_ms=now_ms, client=client, sleep_between=0.02, with_deriv=False)
+                fund = of.fetch_funding_series(sym, months=0.12, end_ms=now_ms, client=client)
             # CLOSED bars only (plan #13, VTL time-gating): drop the still-forming
             # candle so every decision input is immutable — its high/low/close and
             # derived indicators would otherwise repaint within the bar.
@@ -372,7 +414,6 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
             fb = [b for b in fb if int(b["ts_ms"]) + bar_ms <= now_ms]
             if len(fb) < 40:
                 continue
-            fund = of.fetch_funding_series(sym, months=0.12, end_ms=now_ms, client=client)
             ind = cs.compute_indicators(fb)
             enr = of.enrich_indicator_df(ind, fb, fund)
             i = len(enr) - 1
@@ -1057,6 +1098,14 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
         sym = str(dec.get("symbol", "")); ctx = by_sym.get(sym)
         action = str(dec.get("action", "SKIP")).upper()
         if not ctx or action not in ("LONG", "SHORT"):
+            if action in ("LONG", "SHORT") and sym:
+                # funnel audit SILENT-DROP (a): the prompt shows a 20-coin market_overview,
+                # so the model CAN pick a coin outside its charted shortlist — that decision
+                # vanished with no trace. Still dropped (no ctx = no price/bars to book
+                # against), but now it's VISIBLE, and its frequency tells us whether the
+                # overview->shortlist gap is starving real intent.
+                _append(LT_DIR / "governance.jsonl",
+                        {"event": "llm_pick_outside_shortlist", "symbol": sym, "action": action})
             continue
         try:                                                              # bughunt LLM#2 + Codex#3: a
             import math as _math                                          # malformed LLM field
@@ -1090,6 +1139,13 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
             if ep > 0 and abs(ep / px - 1) <= 0.05 and (
                     (action == "LONG" and ep < px) or (action == "SHORT" and ep > px)):
                 entry_px = round(ep, 8)
+            elif ep > 0:
+                # funnel audit SILENT-DROP (b): a limit >5% away / wrong side was silently
+                # converted to a MARKET fill — doctrine inversion (the model wanted a much
+                # better price; code filled it NOW). Behavior kept for now, but logged loud.
+                _append(LT_DIR / "governance.jsonl",
+                        {"event": "llm_limit_coerced_to_market", "symbol": sym,
+                         "entry_px": ep, "spot": px})
         except Exception:
             entry_px = None
         # FULL TRUST (owner 2026-07-09: "the brain is gpt-5.5"): the chase gate (LONG RSI>=65 extended)
@@ -1463,9 +1519,24 @@ def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -
     '0 trades' trap) — it is logged and visible, not a silent block. Never raises."""
     if not REDESIGN or not decisions:
         return decisions
+    # funnel audit: ZBT was re-proposed + re-rejected 25x/16h (~60 wasted vision calls/day).
+    # A (symbol, side) stage-2 REJECT is binding for 2h in CODE — the prompt-side rejection
+    # memory has proven the model ignores it. Fail-open on a corrupt file.
+    _rej_f = LT_DIR / "stage2_rejects.json"
+    try:
+        _rej = json.loads(_rej_f.read_text(encoding="utf-8"))
+        _rej = _rej if isinstance(_rej, dict) else {}
+    except Exception:
+        _rej = {}
     out: list[dict[str, Any]] = []
     looked = 0
     for d in decisions:
+        _rk = f"{d.get('symbol')}|{str(d.get('action')).upper()}"
+        if now_ms - int(_rej.get(_rk) or 0) < 2 * 3600 * 1000:
+            _append(LT_DIR / "governance.jsonl",
+                    {"ts_ms": now_ms, "event": "stage2_dedup_skip", "symbol": d.get("symbol"),
+                     "side": d.get("action")})
+            continue                           # rejected <2h ago -> no new vision call
         if looked >= STAGE2_MAX:               # over budget: pass through untagged-looked
             d["_stage2"] = "skipped_budget"
             out.append(d)
@@ -1490,10 +1561,21 @@ def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -
             b64 = ltc.render_chart(sym, bars[-260:], tf=tf, hlines=(sm.get("hlines") or None))
             if not b64:
                 raise ValueError("stage-2 render failed")
+            # funnel audit: judging "entry RIGHT NOW" killed ~1/3 of proposals for being
+            # limits — "await retest / entry missed" IS what a resting limit is for. The
+            # judge must evaluate the PROPOSED entry price, not the current spot.
+            _entry_frame = ("does structure on THIS timeframe still support the entry RIGHT NOW? "
+                            if not d.get("entry_px") else
+                            "this is a RESTING LIMIT at entry_px=" + str(d.get("entry_px")) +
+                            " (NOT a market entry now): judge whether structure supports the plan "
+                            "IF price pulls back to that level — 'entry missed'/'await retest' are "
+                            "NOT valid reject reasons for a limit; reject only if the LEVEL or the "
+                            "thesis is wrong (zone broken, trend flipped, level on the wrong side). ")
             sys2 = ("SECOND LOOK — you are the same trader. On your broad 3-timeframe scan you proposed "
                     "the trade below and chose the " + tf + " timeframe as its basis. This is that SAME "
                     "coin redrawn FRESH on " + tf + " only, with more bars and S/R zones. Decide FINAL: "
-                    "does structure on THIS timeframe still support the entry RIGHT NOW? Be strict — a "
+                    + _entry_frame +
+                    "Be strict — a "
                     "marginal setup on the second look is a REJECT (rejecting is free, a bad entry is not). "
                     "Reply STRICT JSON only: {\"confirm\": true|false, \"reason\": \"<=120 chars\", "
                     "\"sl_pct\": <number or null>, \"tp_pct\": <number or null>} — set sl/tp to THIS "
@@ -1515,6 +1597,14 @@ def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -
                 _append(LT_DIR / "governance.jsonl",
                         {"ts_ms": now_ms, "event": "stage2_reject", "symbol": sym, "tf": tf,
                          "reason": str(v.get("reason", ""))[:140]})
+                try:                            # 2h code-side dedupe (see head of function)
+                    _rej[f"{sym}|{str(d.get('action')).upper()}"] = now_ms
+                    _rej = {k: t for k, t in sorted(_rej.items(), key=lambda kv: -kv[1])[:80]}
+                    _tmpf = _rej_f.with_suffix(".tmp")
+                    _tmpf.write_text(json.dumps(_rej), encoding="utf-8")
+                    os.replace(_tmpf, _rej_f)
+                except Exception:
+                    pass
                 continue                        # model rejected its own idea on the focused look -> drop
             import math as _m
             for k, lo, hi in (("sl_pct", 0.3, 8.0), ("tp_pct", 0.3, 15.0)):
@@ -1625,7 +1715,9 @@ def _apply_gap_veto(decisions: list[dict[str, Any]], ctx: list[dict[str, Any]]) 
         if (_atr is None or _atr != _atr or float(_atr) <= 0 or float(_atr) * GAP_LIQ_ATR_MULT > _liq
                 or _gr is None or _gr != _gr or float(_gr) * GAP_RISK_MULT > _liq):
             _append(LT_DIR / "governance.jsonl",
-                    {"ts_ms": now_ms, "event": "gate_block_gap_risk_llm", "symbol": d.get("symbol")})
+                    {"ts_ms": now_ms, "event": "gate_block_gap_risk_llm", "symbol": d.get("symbol"),
+                     "atr_pct": _atr, "gap_risk_pct": _gr, "liq_dist_pct": _liq,   # audit: numbers
+                     "lev": d.get("leverage")})                                     # were unlogged
             continue
         out.append(d)
     return out
@@ -1762,7 +1854,7 @@ def _resolve_pending(client: Any, equity: float, now_iso: str, now_ms: int) -> i
                     {"symbol": sym, "side": side, "event": "dropped_position_exists", "ts": now_ms})
             continue
         try:
-            fb = of.fetch_klines_with_flow(sym, TF, months=0.05, end_ms=now_ms, client=client, sleep_between=0.02)
+            fb = _fetch_bars_any(sym, TF, 0.05, now_ms, client, sleep_between=0.02)
             fut = [b for b in fb if int(b["ts_ms"]) > int(po["placed_ms"]) and int(b["ts_ms"]) + bar_ms <= now_ms]
         except Exception:
             still.append(po); continue
@@ -1869,7 +1961,7 @@ def _manage_positions_llm(client: Any, now_ms: int) -> int:
     bar_ms = of._TF_MS[TF]
     for p in cand[:4]:
         try:
-            fb = of.fetch_klines_with_flow(p["symbol"], TF, months=0.03, end_ms=now_ms,
+            fb = _fetch_bars_any(p["symbol"], TF, 0.03, now_ms,
                                            client=client, sleep_between=0.02)
             bars = [b for b in fb if int(b["ts_ms"]) + bar_ms <= now_ms]
             if len(bars) < 30:
@@ -1989,7 +2081,7 @@ def resolve(client: Any, now_ms: int) -> int:
     still, closed_n = [], 0
     for p in open_pos:
         try:
-            fb = of.fetch_klines_with_flow(p["symbol"], TF, months=0.06, end_ms=now_ms, client=client, sleep_between=0.02)
+            fb = _fetch_bars_any(p["symbol"], TF, 0.06, now_ms, client, sleep_between=0.02)
             # CLOSED bars only (plan #13): exits are judged on immutable candles;
             # the forming bar is re-examined next cycle once it closes.
             bar_ms = of._TF_MS[TF]
@@ -2440,7 +2532,14 @@ def run_once() -> dict[str, Any]:
         # "wired but inert" disease the funnel redesign exists to cure). Scope: ONLY rows
         # tagged source=lane_promoted — hand-armed behavior in REDESIGN is unchanged (off).
         try:
-            _lp = [m for m in _survivor_methods() if m.get("source") == "lane_promoted"]
+            # funnel audit: the repo's STRONGEST validated method (wr_flush_notknife,
+            # lockbox p=0.0002, mean_r 1.156) could never fire in REDESIGN — the active
+            # mode since 07-10. It now rides the same guarded mech path as lane_promoted
+            # (gap-veto, episode memo 2h, concurrent cap 3, symbol dedup).
+            # capitulation_long stays DARK: owner culled its lane (18.8% win, n=16) and
+            # the flush-mech path already owns the capitulation-LONG side.
+            _lp = [m for m in _survivor_methods()
+                   if m.get("source") == "lane_promoted" or m.get("id") == "wr_flush_notknife"]
             if _lp:
                 # churn guards (audit#2 F3 — parity with flush-mech, which got these from a
                 # Codex CRITICAL): a still-true condition re-fires every 90s cycle after a
@@ -2533,7 +2632,7 @@ def run_once() -> dict[str, Any]:
     return {"equity": acct["equity"], "trades": acct["trades"], "win_rate": wr,
             "opened": opened, "resolved": resolved, "open": len(_load(POSITIONS)),
             "considered": len(ctx), "acted": len(decisions), "model": MODEL,
-            "mode": "PROVEN_ONLY" if PROVEN_ONLY else "DISCRETIONARY",
+            "mode": "PROVEN_ONLY" if PROVEN_ONLY else ("REDESIGN" if REDESIGN else "DISCRETIONARY"),
             "verdict": card["verdict"]["code"], "breaker": status["capacity"]["daily_breaker"],
             "live": "LOCKED"}
 
