@@ -919,8 +919,10 @@ def memory_context() -> dict[str, Any]:
     data-phrased lessons and rationale-vs-outcome recents via the pure
     llm_trader_memory module — plan 260702 checklist #10/#11. Reads CLOSED
     (canonical append-only log written by resolve); llm_trader_memory
-    guarantees malformed rows are skipped, so this can't kill the loop."""
-    return ltm.build_memory_context(_dedupe_closed(_load(CLOSED)))
+    guarantees malformed rows are skipped, so this can't kill the loop.
+    model=MODEL era-windows the stats (P1 #11) — same policy as
+    _mistakes_block, so 5.6-sol isn't taught with 5.5's record."""
+    return ltm.build_memory_context(_dedupe_closed(_load(CLOSED)), model=MODEL)
 
 
 # ---------------------------------------------------------------------------

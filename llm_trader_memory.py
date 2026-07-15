@@ -323,14 +323,37 @@ def _trim_stats(stats: dict[str, Any]) -> dict[str, Any]:
     return trimmed
 
 
-def build_memory_context(closed: list[dict[str, Any]]) -> dict[str, Any]:
+def build_memory_context(closed: list[dict[str, Any]],
+                         model: str | None = None) -> dict[str, Any]:
     """Compact {"stats", "lessons", "recent"} dict for the decide() prompt.
 
     Target ~2000 chars of JSON at 100 closed trades (plan contract): stats are
     trimmed to the top groups, lessons are the capped distilled lines, and
     recent rationales are re-truncated harder than recent_trades' 120-char cap
     because ten of them dominate the budget otherwise.
+
+    model (P1 #11 era-window): pooling the LIFETIME ledger taught the new
+    brain with the dead previous model's record (anti-learning). When model is
+    given, stats/lessons/recent come from the CURRENT model's own
+    discretionary era (rows stamped model==model, no mech_method — mech rows
+    fire without the LLM so they say nothing about its decisions) once >=8
+    exist, capped at the last 200 so a long era can't go stale. Until then:
+    the last 60 discretionary rows plus an "era_note" flag so the LLM reads
+    them as system history, not its own record. Mirrors the era policy in
+    llm_trader._mistakes_block — keep in lockstep. model=None = exact legacy
+    lifetime pooling (other callers/tests unchanged). Still pure: no I/O.
     """
+    era_note = None
+    if model is not None:
+        disc = [r for r in closed or []
+                if isinstance(r, dict) and not r.get("mech_method")]
+        era = [r for r in disc if r.get("model") == model]
+        if len(era) >= 8:
+            closed = era[-200:]
+        else:
+            closed = disc[-60:]
+            era_note = ("stats mostly from the PREVIOUS model era — treat as "
+                        "system history, not your record")
     stats = aggregate_stats(closed)
     lessons = distill_lessons(stats)
     recent = []
@@ -338,4 +361,7 @@ def build_memory_context(closed: list[dict[str, Any]]) -> dict[str, Any]:
         row = dict(row)
         row["rationale"] = (row.get("rationale") or "")[:_CONTEXT_RATIONALE_MAX]
         recent.append(row)
-    return {"stats": _trim_stats(stats), "lessons": lessons, "recent": recent}
+    ctx = {"stats": _trim_stats(stats), "lessons": lessons, "recent": recent}
+    if era_note:
+        ctx["era_note"] = era_note   # key only exists on the fallback path
+    return ctx
