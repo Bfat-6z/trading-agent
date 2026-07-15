@@ -408,16 +408,20 @@ def test_decide_memory_fail_open_without_history(tmp_path, monkeypatch):
 
 
 def test_decide_rule_enforcement_survives_memory_wiring(tmp_path, monkeypatch):
-    # The wiring change must not break decision validation (x5/x10, 5-10%).
+    # LAW AMENDMENT 2026-07-13 (owner): the x5/x10 + 5-10% band is GONE on the
+    # discretionary path — the model owns size/leverage; code keeps only the RUIN
+    # floors (lev<=25, size<=40%, per-trade notional<=100%/lev). This pin used to
+    # assert the dead band (lev 7 -> clamp 5) and failed on HEAD ever since.
     import llm_trader as lt
     monkeypatch.setattr(lt, "CLOSED", tmp_path / "missing.jsonl")
-    reply = json.dumps([{"symbol": "SOLUSDT", "action": "LONG", "leverage": 7,
-                         "size_pct": 50, "sl_pct": 2, "tp_pct": 3,
+    reply = json.dumps([{"symbol": "SOLUSDT", "action": "LONG", "leverage": 30,
+                         "size_pct": 90, "sl_pct": 2, "tp_pct": 3,
                          "rationale": "test"}])
     _capture_llm(monkeypatch, lt, reply=reply)
     out = lt.decide(_decide_market_ctx(), 100.0)
     assert len(out) == 1
-    assert out[0]["leverage"] == 5 and out[0]["size_pct"] == 10.0
+    assert out[0]["leverage"] == 25                      # ruin ceiling, not the old band
+    assert out[0]["size_pct"] <= 100.0 / out[0]["leverage"]   # per-trade notional cap
 
 
 def test_llm_trader_source_wires_memory_module():
