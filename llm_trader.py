@@ -372,6 +372,7 @@ TIDALFI_TRADFI_STATIC = frozenset({
 
 _TD_ADAPTER_ERR_LOGGED: set = set()
 _TD_BAR_CACHE: dict = {}
+_DAILY_CACHE: dict = {}     # (sym, utc_day) -> daily bars; 1 fetch/coin/day (range-location + 1d chart)
 
 
 def _fetch_bars_any(sym: str, tf: str, months: float, end_ms: int, client: Any,
@@ -1442,6 +1443,35 @@ def _activity_score(c: dict[str, Any]) -> float:
             + 3.0 * abs(float(c.get("cvd_norm", 0) or 0)))
 
 
+def _range_location(dbars: list[dict[str, Any]], price: float) -> dict[str, Any] | None:
+    """WHERE price sits in the multi-week range (audit 2026-07-16: the #1 thesis-wrong
+    driver was buying breakouts at range highs the model could not see — its sight
+    horizon was ~10 days, no daily/range context). PURE, from daily bars. None on
+    insufficient/degenerate input (fail-open: the field is simply absent)."""
+    try:
+        px = float(price)
+        highs = [float(b["high"]) for b in dbars if float(b.get("high") or 0) > 0]
+        lows = [float(b["low"]) for b in dbars if float(b.get("low") or 0) > 0]
+        if len(highs) < 5 or len(lows) < 5 or px <= 0:
+            return None
+
+        def _rng(n: int) -> dict[str, Any]:
+            h = max(highs[-n:]); l = min(lows[-n:]); span = h - l
+            pos = (px - l) / span * 100 if span > 0 else 50.0
+            return {"hi": round(h, 6), "lo": round(l, 6),
+                    "pos_pct": round(max(0.0, min(100.0, pos)), 1),   # 0=at low, 100=at high
+                    "to_hi_pct": round((h - px) / px * 100, 2),
+                    "to_lo_pct": round((px - l) / px * 100, 2)}
+
+        out: dict[str, Any] = {"d30": _rng(min(30, len(highs))), "d7": _rng(min(7, len(highs)))}
+        if len(dbars) >= 2:    # last daily bar may be today (partial); prev-day = last CLOSED day
+            pd = dbars[-2]
+            out["prev_day"] = {"hi": round(float(pd["high"]), 6), "lo": round(float(pd["low"]), 6)}
+        return out
+    except Exception:
+        return None
+
+
 def decide(context: list[dict[str, Any]], equity: float,
            status: dict[str, Any] | None = None, *, max_charts: int = 6,   # owner 2026-07-13 "vắt kiệt model": see MORE coins/cycle (4->6)
            client: Any = None, now_ms: int | None = None) -> list[dict[str, Any]]:
@@ -1515,6 +1545,30 @@ def decide(context: list[dict[str, Any]], equity: float,
                                 images.append((c["symbol"] + " " + _tf, _b64tf))
                     except Exception:
                         pass
+                # DAILY + RANGE-LOCATION (audit 2026-07-16: the model's sight horizon was
+                # ~10 days and it could not see WHERE price sat in the multi-week range —
+                # the measured #1 thesis-wrong driver, buying breakouts at range highs).
+                # Daily bars raw (a daily chart's last partial candle is legit context);
+                # 90-bar 1d chart = 3-month horizon. Additive + best-effort (fail-open).
+                try:
+                    _dk = (c["symbol"], _nowms // 86_400_000)   # daily bars change once/UTC-day
+                    _db = _DAILY_CACHE.get(_dk)                  # -> fetch 1x/coin/day, not 1x/cycle
+                    if _db is None:
+                        _db = _fetch_bars_any(c["symbol"], "1d", 3.0, _nowms, client,
+                                              sleep_between=0.02, with_deriv=False)
+                        if _db:
+                            if len(_DAILY_CACHE) > 128:
+                                _DAILY_CACHE.clear()
+                            _DAILY_CACHE[_dk] = _db
+                    if _db and len(_db) >= 5:
+                        _rl = _range_location(_db, c.get("price"))
+                        if _rl:
+                            c["range_ctx"] = _rl
+                        _b64d = ltc.render_chart(c["symbol"], _db[-90:], tf="1d")
+                        if _b64d:
+                            images.append((c["symbol"] + " 1d", _b64d))
+                except Exception:
+                    pass
     if not images:
         return _decide_numeric(shortlist, equity, status)   # nothing rendered -> numeric
     _btc = _btc_context_chart(client, _nowms) if client is not None else None
@@ -1568,11 +1622,29 @@ def decide(context: list[dict[str, Any]], equity: float,
            "the high-probability side and longs need exceptional justification; when it is PUMPING, the "
            "reverse. When the tide FLIPS, you flip with it. (A mechanical path already buys capitulation "
            "flushes automatically — do not duplicate it; your job is the directional judgment it lacks.)\n\n"
+           "RANGE LOCATION + TIME (2026-07-16 — your measured #1 leak was buying breakouts where they "
+           "FADE): each coin carries 'range_ctx' = where price sits in its 7d and 30d range (pos_pct: "
+           "0=range LOW, 100=range HIGH) with distance to the range hi/lo and the previous day's hi/lo, "
+           "plus a '<SYM> 1d' daily chart (≈3-month view). USE IT: a LONG 'breakout' when pos_pct is "
+           "already ~85-100 (pinned to the 30d high) is buying the exact spot longs get trapped — prefer "
+           "LONGs in the LOWER half of the range off support, SHORTS in the UPPER half into resistance; a "
+           "with-trend entry at a range extreme needs exceptional justification. 'now' gives UTC time, "
+           "weekday and session — the 22 tokenized-stock perps (NVDA/TSLA/JPM/META/XAU/...) only have REAL "
+           "liquidity when us_equity_open is true; outside cash hours and on WEEKENDS their candles are "
+           "thin/synthetic, so do NOT trade a 'breakout' on a TradFi perp outside cash hours.\n\n"
            + (_playbook() and ("=== TRADING PLAYBOOK (apply this) ===\n" + _playbook() + "\n=== END PLAYBOOK ===\n\n"))
            + _proven_methods_block() + _mistakes_block() + _MEMORY_RULE + " " + _DECISION_SCHEMA)
            # _mistakes_block RE-WIRED 2026-07-15: era-windowed + capped-2 + de-conflicted — the
            # P1-2026-07-09 degeneracy (all-four storm on lifetime 17% WR) can no longer fire.
+    import time as _tt
+    _utc = _tt.gmtime(_nowms / 1000)
+    _hr = _utc.tm_hour; _wknd = _utc.tm_wday >= 5
+    _now_ctx = {"utc": _tt.strftime("%Y-%m-%d %H:%M", _utc), "weekday": _tt.strftime("%a", _utc),
+                "session": ("WEEKEND" if _wknd else "Asia" if _hr < 7 else "EU" if _hr < 13
+                            else "US-cash" if _hr < 20 else "US-late"),
+                "us_equity_open": bool(not _wknd and 13 <= _hr < 20)}   # NYSE ~13:30-20:00 UTC
     text = json.dumps({"equity": round(equity, 2), "your_status": status or {},
+                       "now": _now_ctx,                                  # clock/session (audit #3)
                        "market_tide": getattr(_btc_context_chart, "_tide", None),   # numeric tide (sếp: side must follow the tape)
                        "memory": mem, "charted_coins": coins_txt,
                        "market_overview": market_overview}, default=str)
