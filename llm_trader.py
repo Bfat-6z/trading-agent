@@ -2414,8 +2414,23 @@ def run_once() -> dict[str, Any]:
         # MECHANICAL FLUSH (2026-07-13): the CONFIRMED path fires without asking the model or
         # stage-2 — runs regardless of what the model decided (dedup inside; gap-veto applied).
         try:
-            mech_flush = _apply_gap_veto(
-                _flush_mech_decisions(ctx, trig_map, decisions, now_ms), ctx)
+            _raw_flush = _flush_mech_decisions(ctx, trig_map, decisions, now_ms)
+            mech_flush = _apply_gap_veto(_raw_flush, ctx)
+            # ADAPTIVE DE-RISK (2026-07-15 funnel forensic): capitulation candles are BY
+            # DEFINITION huge bars, so the gap-veto at x10 blocked 34/43 flush fires in 16h
+            # and starved the ONLY confirmed +edge path. Within the owner's mech band {5,10}:
+            # a fire vetoed at x10 retries at x5 (liq distance 10%->20%, margin unchanged =>
+            # notional HALVES — strictly safer). Still blocked at x5 = genuinely too wild.
+            _kept = {d.get("symbol") for d in mech_flush}
+            for _d in _raw_flush:
+                if _d.get("symbol") in _kept or int(_d.get("leverage") or 0) <= 5:
+                    continue
+                _d5 = {**_d, "leverage": 5}
+                if _apply_gap_veto([_d5], ctx):
+                    _append(LT_DIR / "governance.jsonl",
+                            {"ts_ms": now_ms, "event": "flush_mech_derisk_x5",
+                             "symbol": _d.get("symbol")})
+                    mech_flush.append(_d5)
             decisions = decisions + mech_flush
         except Exception as _fme:
             _append(LT_DIR / "governance.jsonl",
