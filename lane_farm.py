@@ -217,7 +217,12 @@ def run_once(client):
         if k in culled:                              # owner cull: freeze like a bust but manual + reversible
             info = culled[k] if isinstance(culled[k], dict) else {}
             _t = int(a.get("trades", 0) or 0)
-            summary[k] = {"equity": a.get("equity"), "busted": True, "closed": True,
+            summary[k] = {"equity": a.get("equity"), "busted": bool(a.get("busted")),
+                          "closed": True,
+                          # honesty fix 2026-07-15: a CULLED lane is frozen, not burned —
+                          # hardcoding busted:True made the boss's +10.6%/100%-win lane
+                          # render as CHÁY on the dashboard. busted now reflects the
+                          # ACCOUNT truth; 'closed' alone marks the owner-freeze.
                           "trades": _t, "win": round(a.get("wins", 0) / _t, 3) if _t else None,
                           "reason": info.get("reason", "owner-closed"),
                           "desc": cfg.get("desc", ""), "family": cfg.get("family", "?"),
