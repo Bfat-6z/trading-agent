@@ -372,7 +372,8 @@ TIDALFI_TRADFI_STATIC = frozenset({
 
 _TD_ADAPTER_ERR_LOGGED: set = set()
 _TD_BAR_CACHE: dict = {}
-_DAILY_CACHE: dict = {}     # (sym, utc_day) -> daily bars; 1 fetch/coin/day (range-location + 1d chart)
+_DAILY_CACHE: dict = {}     # (sym, utc_day) -> {bars, b64}; 1 fetch+render/coin/day (range + 1d chart)
+_DAILY_COOLDOWN: dict = {"until": 0.0}   # skip daily fetches after a ban/429 (Codex: do not hammer a banned source)
 
 
 def _fetch_bars_any(sym: str, tf: str, months: float, end_ms: int, client: Any,
@@ -1468,8 +1469,8 @@ def _range_location(dbars: list[dict[str, Any]], price: float) -> dict[str, Any]
                     "to_lo_pct": round((px - l) / px * 100, 2)}
 
         out: dict[str, Any] = {"d30": _rng(min(30, len(highs))), "d7": _rng(min(7, len(highs)))}
-        if len(dbars) >= 2:    # last daily bar may be today (partial); prev-day = last CLOSED day
-            pd = dbars[-2]
+        if dbars:              # both venues drop the forming bar -> dbars[-1] IS the last CLOSED
+            pd = dbars[-1]     # day (Codex: [-2] was one day too old). = prev completed day's levels.
             out["prev_day"] = {"hi": round(float(pd["high"]), 6), "lo": round(float(pd["low"]), 6)}
         return out
     except Exception:
@@ -1555,22 +1556,29 @@ def decide(context: list[dict[str, Any]], equity: float,
                 # Daily bars raw (a daily chart's last partial candle is legit context);
                 # 90-bar 1d chart = 3-month horizon. Additive + best-effort (fail-open).
                 try:
+                    import time as _tc
                     _dk = (c["symbol"], _nowms // 86_400_000)   # daily bars change once/UTC-day
-                    _db = _DAILY_CACHE.get(_dk)                  # -> fetch 1x/coin/day, not 1x/cycle
-                    if _db is None:
-                        _db = _fetch_bars_any(c["symbol"], "1d", 3.0, _nowms, client,
-                                              sleep_between=0.02, with_deriv=False)
-                        if _db:
+                    _dc = _DAILY_CACHE.get(_dk)                  # {bars, b64} -> render ONCE/coin/day
+                    if _dc is None and _tc.time() >= _DAILY_COOLDOWN.get("until", 0.0):
+                        try:
+                            _db = _fetch_bars_any(c["symbol"], "1d", 3.0, _nowms, client,
+                                                  sleep_between=0.02, with_deriv=False)
+                        except Exception as _de:                # Codex: a banned source must not be hammered
+                            if any(k in repr(_de) for k in ("418", "429", "-1003", "banned", "Too many")):
+                                _DAILY_COOLDOWN["until"] = _tc.time() + 600
+                            _db = None
+                        if _db and len(_db) >= 5:
                             if len(_DAILY_CACHE) > 128:
                                 _DAILY_CACHE.clear()
-                            _DAILY_CACHE[_dk] = _db
-                    if _db and len(_db) >= 5:
-                        _rl = _range_location(_db, c.get("price"))
+                            _dc = {"bars": _db, "b64": ltc.render_chart(c["symbol"], _db[-90:], tf="1d")}
+                            _DAILY_CACHE[_dk] = _dc
+                    if _dc and _dc.get("bars"):
+                        _rl = _range_location(_dc["bars"], c.get("price"))
                         if _rl:
-                            c["range_ctx"] = _rl
-                        _b64d = ltc.render_chart(c["symbol"], _db[-90:], tf="1d")
-                        if _b64d:
-                            images.append((c["symbol"] + " 1d", _b64d))
+                            c["range_ctx"] = _rl               # numeric range ALWAYS (cheap)
+                            _pp = (_rl.get("d30") or {}).get("pos_pct", 50)   # 1d IMAGE only near a range
+                            if _dc.get("b64") and (_pp >= 78 or _pp <= 22):   # extreme (the trap zone) -> cut
+                                images.append((c["symbol"] + " 1d", _dc["b64"]))   # ~+6 imgs to ~+2 (Codex cost)
                 except Exception:
                     pass
     if not images:
@@ -1612,19 +1620,22 @@ def decide(context: list[dict[str, Any]], equity: float,
            "\"tf_basis\": one of \"15m\"|\"1h\"|\"4h\".\n\n"
            "wick_intensity (0.0-1.0) = fraction of the last 12 bars dominated by WICK (long tails, small "
            "body) = a stop-hunt 'rút râu' chop where tight stops get clipped by noise (your measured 75%-"
-           "SL leak). It is NOT a hard block anymore — YOU judge it: when it's high (~0.5+), either stand "
-           "aside or take only a high-conviction setup with a WIDE structure stop that clears the wicks. "
-           "Likewise 'regime':'choppy' has been your worst zone (7% win) — trade it only with a genuine "
-           "edge, not a marginal one. These are YOUR calls now, not code gates.\n\n"
+           "SL leak). Per your playbook §1 (REGIME FIRST): wick_intensity>=0.5 or regime=='choppy' (your 7%-win "
+           "zone) is DEFAULT NO-TRADE — not a coin-flip you judge, the place you bleed. The ONLY override is a "
+           "MEASURED edge (a capitulation flush at real support, or an OI-exhaustion mean-reversion) with a WIDE "
+           "structure stop clearing the wicks; a marginal with-trend setup in chop is exactly the trap. This is "
+           "doctrine, not a code gate — but treat it as a gate.\n\n"
            "REJECTION MEMORY: 'your_recent_rejections_here' = how many times YOUR OWN second look already "
            "rejected this coin recently and why. Do NOT re-propose the same idea unless the chart shows the "
            "exact thing the rejection said was missing (e.g. the retest/confirmation has now printed). "
            "Re-knocking on a closed door burns calls and is your measured over-trading pattern.\n\n"
            "DIRECTION IS ADAPTIVE (owner directive): LONG and SHORT are equal citizens — your side must "
            "FOLLOW the current tape, never a habit. Check 'market_tide' + the BTCUSDT MARKET CONTEXT "
-           "chart FIRST: when the market is DUMPING, breakdown continuations and bounce-fade SHORTS are "
-           "the high-probability side and longs need exceptional justification; when it is PUMPING, the "
-           "reverse. When the tide FLIPS, you flip with it. (A mechanical path already buys capitulation "
+           "chart FIRST: when the market is DUMPING the high-probability side is SHORT — but per playbook §2/§3 "
+           "prefer FADING the low-volume bounce into resistance / a lower-high over chasing a FRESH breakdown "
+           "(fresh breaks get swept; breakdown-CONTINUATION needs OI-up + a held retest). Longs need exceptional "
+           "justification. When it is PUMPING, mirror it. When the tide FLIPS, you flip with it. (A mechanical "
+           "path already buys capitulation "
            "flushes automatically — do not duplicate it; your job is the directional judgment it lacks.)\n\n"
            "RANGE LOCATION + TIME (2026-07-16 — your measured #1 leak was buying breakouts where they "
            "FADE): each coin carries 'range_ctx' = where price sits in its 7d and 30d range (pos_pct: "
