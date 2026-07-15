@@ -35,6 +35,17 @@ RESTART_STATE_PATH = STATE_DIR / "agent_restart_state.json"
 RESTART_WINDOW_SECONDS = 900
 RESTART_MAX_PER_WINDOW = 3
 RESTART_BASE_BACKOFF_SECONDS = 5
+# P1 #13 (2026-07-15): per-process memory watchdog. A ~750MB leak (counterfactual_replay,
+# 2026-07-11) once starved the 16GB box so badly that NEW process creation failed and the
+# mission died at spawn. Each supervisor cycle samples every tracked agent's WorkingSet;
+# an over-cap agent gets ONE loud incident + kill/respawn through the normal restart path
+# (restart_gate/start_agent), throttled to one mem-restart per agent per 30min. Unknown
+# sample => do nothing (fail-safe: never kill on a measurement error).
+MEM_WATCHDOG_STATE_PATH = STATE_DIR / "mem_watchdog_state.json"
+MEM_WATCHDOG_DEFAULT_MB = 900.0
+MEM_WATCHDOG_MISSION_MB = 1400.0            # llm_trader legitimately spikes during vision cycles
+MEM_WATCHDOG_MISSION_AGENTS = {"llm_trader"}
+MEM_WATCHDOG_COOLDOWN_SECONDS = 1800.0      # at most one mem-restart per agent per 30min
 CHILD_ENV_ALLOWLIST = {
     "ALLUSERSPROFILE",
     "APPDATA",
@@ -513,6 +524,130 @@ def open_restart_incident(spec: AgentSpec, gate: dict) -> None:
         append_jsonl("incident_emit_error", {"agent": spec.name, "error": str(exc)[:200]})
 
 
+def _env_float(name: str, fallback: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or fallback)
+    except Exception:
+        return fallback
+
+
+def mem_threshold_mb(agent: str) -> float:
+    if agent in MEM_WATCHDOG_MISSION_AGENTS:
+        return _env_float("MEM_WATCHDOG_MISSION_MB", MEM_WATCHDOG_MISSION_MB)
+    return _env_float("MEM_WATCHDOG_MB", MEM_WATCHDOG_DEFAULT_MB)
+
+
+class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def process_working_set_mb(pid: int | None) -> float | None:
+    """Best-effort WorkingSet (RSS) in MB; None = unknown and the watchdog must NOT act."""
+    if not pid:
+        return None
+    try:  # psutil if the venv ever grows it; not required (absent as of 2026-07-15)
+        import psutil  # type: ignore
+        return float(psutil.Process(int(pid)).memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    if os.name != "nt":
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text(errors="ignore").splitlines():
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+        except Exception:
+            return None
+        return None
+    try:  # same OpenProcess access (PROCESS_QUERY_LIMITED_INFORMATION) as is_pid_running
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if handle:
+            try:
+                counters = _PROCESS_MEMORY_COUNTERS()
+                counters.cb = ctypes.sizeof(counters)
+                fn = getattr(kernel32, "K32GetProcessMemoryInfo", None) or ctypes.windll.psapi.GetProcessMemoryInfo
+                if fn(handle, ctypes.byref(counters), counters.cb):
+                    return float(counters.WorkingSetSize) / (1024.0 * 1024.0)
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    try:  # last resort: the same WMI/CIM channel the rest of this file leans on
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}').WorkingSetSize"],
+            capture_output=True, text=True, timeout=5, **hidden_subprocess_kwargs(),
+        )
+        raw = (result.stdout or "").strip()
+        if result.returncode == 0 and raw:
+            return float(raw) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    return None
+
+
+def mem_restart_throttled(agent: str, *, now: datetime | None = None) -> float | None:
+    """Seconds left in the per-agent mem-restart cooldown, or None if a restart is allowed."""
+    current = now or datetime.now(timezone.utc)
+    last = read_json(MEM_WATCHDOG_STATE_PATH).get("last_restart")
+    ts = parse_ts(last.get(agent)) if isinstance(last, dict) else None
+    if ts is None:
+        return None
+    remaining = MEM_WATCHDOG_COOLDOWN_SECONDS - (current - ts).total_seconds()
+    return round(remaining, 1) if remaining > 0 else None
+
+
+def record_mem_restart(agent: str, *, now: datetime | None = None) -> None:
+    current = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    state = read_json(MEM_WATCHDOG_STATE_PATH)
+    last = state.get("last_restart") if isinstance(state.get("last_restart"), dict) else {}
+    last[agent] = current
+    write_json(MEM_WATCHDOG_STATE_PATH, {"schema_version": 1, "updated_at": current, "cooldown_seconds": MEM_WATCHDOG_COOLDOWN_SECONDS, "last_restart": last})
+
+
+def mem_watchdog_verdict(spec: AgentSpec, pid: int | None) -> dict | None:
+    """Over-cap verdict for a RUNNING agent, else None (under cap / unknown / throttled)."""
+    ws_mb = process_working_set_mb(pid)
+    if ws_mb is None:
+        return None
+    cap = mem_threshold_mb(spec.name)
+    if ws_mb <= cap:
+        return None
+    verdict = {"agent": spec.name, "pid": pid, "working_set_mb": round(ws_mb, 1), "threshold_mb": cap}
+    throttle = mem_restart_throttled(spec.name)
+    if throttle is not None:
+        append_jsonl("mem_watchdog_throttled", {**verdict, "retry_after_seconds": throttle})
+        return None
+    return verdict
+
+
+def open_mem_incident(spec: AgentSpec, verdict: dict) -> None:
+    try:
+        open_incident(
+            "Sev2",
+            "agent memory watchdog restart",
+            {"script": spec.script, **verdict},
+            source="agent_process_supervisor",
+            owner="operator",
+            runbook_id="runbook_mem_watchdog",
+            dedupe_key=f"mem_watchdog:{spec.name}",
+            action_required="find_and_fix_memory_leak",
+        )
+    except Exception as exc:
+        append_jsonl("incident_emit_error", {"agent": spec.name, "error": str(exc)[:200]})
+
+
 def stop_pid(pid: int | None, expected_script: str) -> None:
     if not is_pid_running(pid, expected_script):
         return
@@ -695,9 +830,17 @@ def ensure_agent(spec: AgentSpec) -> dict:
         pid = deduped_pid
     running = is_pid_running(pid, spec.script)
     is_stale = stale(spec)
-    if running and not is_stale:
+    # P1 #13: mem watchdog piggybacks this cycle — no new resident process. None when
+    # under cap, sample unknown, or inside the 30min per-agent cooldown.
+    mem_over = mem_watchdog_verdict(spec, pid) if running else None
+    if running and not is_stale and mem_over is None:
         return {"agent": spec.name, "pid": pid, "running": True, "stale": False, "action": "ok"}
-    if running and is_stale:
+    if running and (is_stale or mem_over is not None):
+        if mem_over is not None:
+            # LOUD: a leaking agent once starved the whole box and killed the mission at spawn.
+            append_jsonl("mem_watchdog_restart", {**mem_over, "cooldown_seconds": MEM_WATCHDOG_COOLDOWN_SECONDS})
+            open_mem_incident(spec, mem_over)
+            record_mem_restart(spec.name)
         stop_pid(pid, spec.script)
     restart_state_path = spec.pid_file.parent / "agent_restart_state.json"
     gate = restart_gate(spec.name, state_path=restart_state_path)
@@ -723,7 +866,8 @@ def ensure_agent(spec: AgentSpec) -> dict:
             open_restart_incident(spec, failure_gate)
         return {"agent": spec.name, "pid": pid, "running": False, "stale": is_stale, "action": "start_failed", "restart_gate": failure_gate, "error": str(exc)[:240]}
     record_restart_attempt(spec.name, state_path=restart_state_path)
-    return {"agent": spec.name, "pid": new_pid, "running": True, "stale": is_stale, "action": "restarted" if running else "started"}
+    action = ("mem_restarted" if mem_over is not None else "restarted") if running else "started"
+    return {"agent": spec.name, "pid": new_pid, "running": True, "stale": is_stale, "action": action}
 
 
 def write_heartbeat(rows: list[dict]) -> None:
