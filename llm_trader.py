@@ -360,18 +360,40 @@ def _whale_flow_map() -> dict[str, dict[str, Any]]:
         return {}
 
 
+_TD_ADAPTER_ERR_LOGGED: set = set()
+_TD_BAR_CACHE: dict = {}
+
+
 def _fetch_bars_any(sym: str, tf: str, months: float, end_ms: int, client: Any,
                     **kw) -> list[dict]:
     """Venue-aware bar fetch: Binance for crypto, the TidalFi UDF adapter for the 22
     TradFi-only perps. CRITICAL for resolve/_resolve_pending — without this a TradFi
-    position could OPEN but never CLOSE (the exact lane_farm zombie disease)."""
+    position could OPEN but never CLOSE (the exact lane_farm zombie disease).
+    Bar-boundary cache (review): the 90s cycle refetched identical 300-bar payloads
+    ~10x per 15m bar (+12s/cycle median; 176s venue-degraded worst case) — now ONE
+    fetch per (symbol, tf, bar boundary), the rest served from memory."""
     try:
         import tidalfi_data as td
         if sym in td.tidalfi_only_symbols():
             _lim = min(1000, max(60, int(months * 30 * 86_400_000 / of._TF_MS[tf])))
-            return td.fetch_klines(sym, tf, limit=_lim, end_ms=end_ms)
-    except Exception:
-        pass
+            _ck = (sym, tf, int(end_ms) // of._TF_MS[tf], _lim)
+            hit = _TD_BAR_CACHE.get(_ck)
+            if hit is not None:
+                return list(hit)
+            bars = td.fetch_klines(sym, tf, limit=_lim, end_ms=end_ms)
+            if bars:
+                if len(_TD_BAR_CACHE) > 256:
+                    _TD_BAR_CACHE.clear()          # tiny bound; repopulates in one cycle
+                _TD_BAR_CACHE[_ck] = list(bars)
+            return bars
+    except Exception as _e:
+        # review FIX-FIRST #3: this except used to be SILENT — an import/meta failure sent
+        # a TidalFi symbol to Binance ("Invalid symbol") and resolve parked the position
+        # FOREVER with zero trace. Log once per symbol per process.
+        if sym not in _TD_ADAPTER_ERR_LOGGED:
+            _TD_ADAPTER_ERR_LOGGED.add(sym)
+            _append(LT_DIR / "governance.jsonl",
+                    {"event": "tidalfi_adapter_error", "symbol": sym, "error": repr(_e)[:120]})
     return of.fetch_klines_with_flow(sym, tf, months=months, end_ms=end_ms, client=client, **kw)
 
 
@@ -400,7 +422,8 @@ def build_context(client: Any, symbols: list[str], now_ms: int) -> list[dict[str
                 # the model dead candles (the stock-perp lane-loss lesson).
                 fb = td.fetch_klines(sym, TF, limit=300, end_ms=now_ms)
                 _sm = td.session_meta(sym, fb, TF, now_ms)
-                if not _sm.get("fresh") or (_sm.get("flat_bar_frac") or 0) > 0.3:
+                if (not _sm.get("fresh") or (_sm.get("flat_bar_frac") or 0) > 0.3
+                        or (_sm.get("longest_gap_bars") or 0) > 2):
                     continue
                 fund = []                          # no funding on TidalFi TradFi perps ->
                                                    # enrich emits funding_rate=0.0 (verified)
@@ -834,6 +857,20 @@ def _flush_armed(now_ms: int) -> bool:
         return True
 
 
+def _non_tidalfi_ctx(ctx: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mech auto-fire is validated on CRYPTO only (review FIX-FIRST #2): the flush path's
+    OI probe returns None for TidalFi symbols, which classifies EVERY equity flush as
+    'confirmed no-OI' BY CONSTRUCTION — x10 auto-fires on earnings knives, mirrored to the
+    boss's real prop account. TradFi symbols stay on the model+stage-2 discretionary path
+    (the stated Phase-2 goal) until per-venue expectancy exists."""
+    try:
+        import tidalfi_data as td
+        _tf = td.tidalfi_only_symbols()
+        return [c for c in ctx if c.get("symbol") not in _tf]
+    except Exception:
+        return ctx
+
+
 def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
                           already: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
     """MECHANICAL executor for the measured-positive flush paths (owner 2026-07-13: "m sợ quá
@@ -1105,7 +1142,7 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
                 # against), but now it's VISIBLE, and its frequency tells us whether the
                 # overview->shortlist gap is starving real intent.
                 _append(LT_DIR / "governance.jsonl",
-                        {"event": "llm_pick_outside_shortlist", "symbol": sym, "action": action})
+                        {"ts_ms": int(__import__("time").time()*1000), "event": "llm_pick_outside_shortlist", "symbol": sym, "action": action})
             continue
         try:                                                              # bughunt LLM#2 + Codex#3: a
             import math as _math                                          # malformed LLM field
@@ -1144,7 +1181,7 @@ def _validate_decisions(arr: Any, by_sym: dict[str, dict[str, Any]]) -> list[dic
                 # converted to a MARKET fill — doctrine inversion (the model wanted a much
                 # better price; code filled it NOW). Behavior kept for now, but logged loud.
                 _append(LT_DIR / "governance.jsonl",
-                        {"event": "llm_limit_coerced_to_market", "symbol": sym,
+                        {"ts_ms": int(__import__("time").time()*1000), "event": "llm_limit_coerced_to_market", "symbol": sym,
                          "entry_px": ep, "spot": px})
         except Exception:
             entry_px = None
@@ -1434,8 +1471,8 @@ def decide(context: list[dict[str, Any]], equity: float,
             if client is not None:
                 for _tf, _mo in (("1h", 0.5), ("4h", 2.0)):
                     try:
-                        _tfb = of.fetch_klines_with_flow(c["symbol"], _tf, months=_mo, end_ms=_nowms,
-                                                         client=client, sleep_between=0.02, with_deriv=False)
+                        _tfb = _fetch_bars_any(c["symbol"], _tf, _mo, _nowms, client,
+                                               sleep_between=0.02, with_deriv=False)
                         _tfb = [b for b in _tfb if int(b["ts_ms"]) + of._TF_MS[_tf] <= _nowms]
                         if len(_tfb) >= 30:
                             _b64tf = ltc.render_chart(c["symbol"], _tfb[-160:], tf=_tf)
@@ -1531,7 +1568,7 @@ def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -
     out: list[dict[str, Any]] = []
     looked = 0
     for d in decisions:
-        _rk = f"{d.get('symbol')}|{str(d.get('action')).upper()}"
+        _rk = f"{d.get('symbol')}|{str(d.get('action')).upper()}|{d.get('tf_basis') or '15m'}"
         if now_ms - int(_rej.get(_rk) or 0) < 2 * 3600 * 1000:
             _append(LT_DIR / "governance.jsonl",
                     {"ts_ms": now_ms, "event": "stage2_dedup_skip", "symbol": d.get("symbol"),
@@ -1552,9 +1589,11 @@ def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -
                 bars = list(d.get("_bars") or [])
             else:
                 _mo = 0.5 if tf == "1h" else 2.0
-                bars = of.fetch_klines_with_flow(sym, tf, months=_mo, end_ms=now_ms,
-                                                 client=client, sleep_between=0.02, with_deriv=False)
+                bars = _fetch_bars_any(sym, tf, _mo, now_ms, client,   # review FIX-FIRST #1:
+                                       sleep_between=0.02, with_deriv=False)   # Binance-only fetch
                 bars = [b for b in bars if int(b["ts_ms"]) + of._TF_MS[tf] <= now_ms]
+                # made stage-2 error_passthrough BYPASS the confirm gate for every TidalFi
+                # symbol on a 1h/4h basis — the newest asset class skipped review entirely.
             if len(bars) < 30:
                 raise ValueError("not enough bars for stage-2")
             sm = smc.smc_summary(bars, sym, tf)
@@ -1598,7 +1637,7 @@ def _stage2_confirm(decisions: list[dict[str, Any]], client: Any, now_ms: int) -
                         {"ts_ms": now_ms, "event": "stage2_reject", "symbol": sym, "tf": tf,
                          "reason": str(v.get("reason", ""))[:140]})
                 try:                            # 2h code-side dedupe (see head of function)
-                    _rej[f"{sym}|{str(d.get('action')).upper()}"] = now_ms
+                    _rej[f"{sym}|{str(d.get('action')).upper()}|{d.get('tf_basis') or '15m'}"] = now_ms
                     _rej = {k: t for k, t in sorted(_rej.items(), key=lambda kv: -kv[1])[:80]}
                     _tmpf = _rej_f.with_suffix(".tmp")
                     _tmpf.write_text(json.dumps(_rej), encoding="utf-8")
@@ -2464,7 +2503,7 @@ def run_once() -> dict[str, Any]:
                 {"ts_ms": now_ms, "event": "trigger_engine_error", "error": repr(_te)[:150]})
     if PROVEN_ONLY:
         # the bleed fix: no discretionary entries — only lab-proven survivors fire.
-        decisions = _mechanical_decisions(ctx)
+        decisions = _mechanical_decisions(_non_tidalfi_ctx(ctx))
     elif REDESIGN:
         # R2 (owner-approved redesign): candidates are GATED to trigger-hit coins — no trigger, the
         # model never sees the coin as a trade option this cycle (selection in CODE, not prompt: the
@@ -2506,7 +2545,7 @@ def run_once() -> dict[str, Any]:
         # MECHANICAL FLUSH (2026-07-13): the CONFIRMED path fires without asking the model or
         # stage-2 — runs regardless of what the model decided (dedup inside; gap-veto applied).
         try:
-            _raw_flush = _flush_mech_decisions(ctx, trig_map, decisions, now_ms)
+            _raw_flush = _flush_mech_decisions(_non_tidalfi_ctx(ctx), trig_map, decisions, now_ms)
             mech_flush = _apply_gap_veto(_raw_flush, ctx)
             # ADAPTIVE DE-RISK (2026-07-15 funnel forensic): capitulation candles are BY
             # DEFINITION huge bars, so the gap-veto at x10 blocked 34/43 flush fires in 16h
@@ -2557,7 +2596,7 @@ def run_once() -> dict[str, Any]:
                 _lp_ids = {m["id"] for m in _lp}
                 _n_open = sum(1 for p in _load(POSITIONS) if p.get("mech_method") in _lp_ids)
                 mech_lane = []
-                for d in _apply_gap_veto(_mechanical_decisions(ctx, methods=_lp), ctx):
+                for d in _apply_gap_veto(_mechanical_decisions(_non_tidalfi_ctx(ctx), methods=_lp), ctx):
                     _k = f"{d.get('symbol')}|{d.get('_mech_method') or ''}"
                     if (d.get("symbol") in _have or _n_open + len(mech_lane) >= 3
                             or now_ms - int(_eps.get(_k) or 0) < 2 * 3600 * 1000):
