@@ -94,5 +94,35 @@ def test_klines_cache_and_backoff():
     assert r4 and c4.calls == 1, "corrupt cache did not fail-open! calls=%d" % c4.calls
     print("8 fail-open on corrupt cache OK")
     
+    # --- 9. Codex #4: a ban raised on the BACKTEST (months=5) path is RECORDED to _backoff.json ---
+    of._BACKOFF_FILE.unlink(missing_ok=True) if of._BACKOFF_FILE.exists() else None
+    class BX(of._BinanceAPIException):
+        def __init__(self):
+            self.status_code = 418
+            self.code = -1003
+            self.retry_after = None
+    class BanClient:
+        def futures_klines(self, **kw):
+            raise BX()
+    try:
+        of.fetch_klines_with_flow("ADAUSDT", "15m", months=5.0, end_ms=NOW, client=BanClient(), with_deriv=False)
+    except Exception:
+        pass
+    assert of._klines_backoff_active(), "backtest ban did NOT record backoff (Codex #4)"
+    print("9 backtest-path ban records backoff OK")
+    of._BACKOFF_FILE.write_text('{"backoff_until_epoch":0}', encoding="utf-8")
+    
+    # --- 10. Codex #5: a 15m sweep must NOT delete a valid CURRENT 1h cache file ---
+    of._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cur15 = NOW // of._TF_MS["15m"]
+    cur1h = NOW // of._TF_MS["1h"]
+    f_stale15 = of._CACHE_DIR / ("AAAUSDT_15m_0.12_%d_0.json" % (cur15 - 5))     # stale 15m -> should die
+    f_cur1h = of._CACHE_DIR / ("AAAUSDT_1h_0.5_%d_0.json" % cur1h)               # current 1h -> must live
+    f_stale15.write_text("[]", encoding="utf-8"); f_cur1h.write_text("[]", encoding="utf-8")
+    of._sweep_stale_klines("15m", NOW)
+    assert not f_stale15.exists(), "stale 15m not swept"
+    assert f_cur1h.exists(), "sweep wrongly deleted current 1h file (Codex #5)"
+    print("10 sweep respects timeframe OK")
+    
     shutil.rmtree(of._CACHE_DIR, ignore_errors=True)
     print("ALL PASS")

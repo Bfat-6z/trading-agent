@@ -105,6 +105,7 @@ def _iso_ms(ms: int) -> str:
 # fail-OPEN (miss/error -> direct fetch = old behavior); backoff fail-CLOSED (return []
 # during a ban -> callers already treat empty as skip-symbol).
 # ===========================================================================
+import os as _os
 import random as _random
 from pathlib import Path as _Path
 try:
@@ -170,11 +171,14 @@ def _is_ban(exc):
 def _sweep_stale_klines(timeframe, end_ms):
     try:
         cur = int(end_ms) // _TF_MS[timeframe]
-        for f in _CACHE_DIR.glob("*.json"):
-            if f.name == "_backoff.json":
+        for f in _CACHE_DIR.glob("*_%s_*.json" % timeframe):   # Codex #5: ONLY this timeframe's
+            if f.name == "_backoff.json":                       # keys — a 15m sweep must not evict
+                continue                                        # valid current 1h/4h/1d cache files
+            parts = f.stem.split("_")
+            if len(parts) < 5 or parts[1] != timeframe:         # key = SYM_tf_bucket_baridx_deriv
                 continue
             try:
-                idx = int(f.stem.rsplit("_", 2)[-2])
+                idx = int(parts[-2])
             except Exception:
                 continue
             if idx < cur - 1:
@@ -192,8 +196,13 @@ def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms
     if key is None:                                  # backtest window -> bypass cache, keep ban gate
         if _klines_backoff_active():
             return []
-        return _fetch_klines_with_flow_direct(symbol, timeframe, months=months, end_ms=end_ms,
-                                              client=client, sleep_between=sleep_between, with_deriv=with_deriv)
+        try:
+            return _fetch_klines_with_flow_direct(symbol, timeframe, months=months, end_ms=end_ms,
+                                                  client=client, sleep_between=sleep_between, with_deriv=with_deriv)
+        except _BinanceAPIException as exc:          # Codex CRITICAL #4: a ban during a months=5
+            if _is_ban(exc):                          # backtest must ALSO stand the fleet down
+                _record_klines_ban(exc)
+            raise
     _start_ms = int(end_ms) - int(months * 30 * 24 * 3600 * 1000)   # caller's exact window start
     try:                                             # --- cache read (fail-open) ---
         from atomic_state import read_json
@@ -204,23 +213,64 @@ def fetch_klines_with_flow(symbol: str, timeframe: str, *, months: float, end_ms
         pass
     if _klines_backoff_active():                     # --- ban gate: fail-CLOSED ---
         return []
-    eff_months = _months_bucket(months)              # fetch the TIER window (shared superset content)
+    # Codex CRITICAL #3: serialize the first-of-bar miss so ~20 agents don't all fetch the
+    # same key at once (which would recreate the burst). O_EXCL claim lock; losers wait for
+    # the winner's cache write, then fail-open to a direct fetch if it never appears.
+    _cache_path = _CACHE_DIR / (key + ".json")
+    _lock = _CACHE_DIR / (key + ".lock")
+    _got_lock = False
     try:
-        bars = _fetch_klines_with_flow_direct(symbol, timeframe, months=eff_months, end_ms=end_ms,
-                                              client=client, sleep_between=sleep_between, with_deriv=with_deriv)
-    except _BinanceAPIException as exc:
-        if _is_ban(exc):
-            _record_klines_ban(exc)                  # whole fleet stands down
-        raise                                        # preserve caller semantics (skip symbol)
-    try:                                             # --- cache write (fail-open) ---
-        if bars:
-            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            from atomic_state import write_json_atomic
-            write_json_atomic(_CACHE_DIR / (key + ".json"), bars)
-            if _random.random() < 0.05:
-                _sweep_stale_klines(timeframe, end_ms)
-    except Exception:
-        pass
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            _fd = _os.open(str(_lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
+            _os.close(_fd)
+            _got_lock = True
+        except FileExistsError:
+            try:                                     # steal a STALE lock (dead writer) after 10s
+                if time.time() - _lock.stat().st_mtime > 10:
+                    _lock.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if not _got_lock:
+                from atomic_state import read_json as _rj
+                for _ in range(20):                  # wait up to ~2s for the winner's write
+                    time.sleep(0.1)
+                    try:
+                        h = _rj(_cache_path, default=None)
+                        if isinstance(h, list):
+                            return [b for b in h if int(b.get("ts_ms", 0)) >= _start_ms]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Codex #2: fetch a DETERMINISTIC window per (tier, bar) — normalize end to the bar
+        # boundary so every caller in this bar fetches the byte-identical superset payload.
+        eff_months = _months_bucket(months)
+        _end_norm = (int(end_ms) // _TF_MS[timeframe]) * _TF_MS[timeframe]
+        try:
+            bars = _fetch_klines_with_flow_direct(symbol, timeframe, months=eff_months, end_ms=_end_norm,
+                                                  client=client, sleep_between=sleep_between, with_deriv=with_deriv)
+        except _BinanceAPIException as exc:
+            if _is_ban(exc):
+                _record_klines_ban(exc)              # whole fleet stands down
+            raise                                    # preserve caller semantics (skip symbol)
+        try:                                         # --- cache write (fail-open) ---
+            # Codex #2: never cache a DEGRADED with_deriv payload (deriv fetch fail-soft ->
+            # no oi/ls) over a potentially-richer one; skip the write, next call retries.
+            _deriv_ok = (not with_deriv) or any("oi" in b for b in bars)
+            if bars and _deriv_ok:
+                from atomic_state import write_json_atomic
+                write_json_atomic(_cache_path, bars)
+                if _random.random() < 0.05:
+                    _sweep_stale_klines(timeframe, end_ms)
+        except Exception:
+            pass
+    finally:
+        if _got_lock:
+            try:
+                _lock.unlink(missing_ok=True)
+            except Exception:
+                pass
     return [b for b in bars if int(b.get("ts_ms", 0)) >= _start_ms]   # slice tier to caller's window
 
 
