@@ -546,6 +546,17 @@ def emit_closes(closed_rows: list[dict]) -> int:
         elif not ok:
             intact = False
             _log({"close_send_fail_wm_hold": r.get("symbol"), "ts": _ts})
+            # Codex blocker: rows AFTER a failure used to send fine while wm stayed frozen
+            # -> resent every cycle until the failed one went through (spam x4). STOP at the
+            # first failure; chronological retry next cycle keeps ordering + exactly-once.
+            fr = cfg.get("close_fail") or {}
+            fr = {"ts": _ts, "n": (fr.get("n") or 0) + 1} if fr.get("ts") == _ts else {"ts": _ts, "n": 1}
+            cfg["close_fail"] = fr
+            if fr["n"] >= 12:                     # dead-letter: ~12 cycles of the SAME row
+                wm = max(wm, _ts)                 # failing = poison payload; advance past it
+                _log({"close_dead_letter": r.get("symbol"), "ts": _ts})
+                cfg.pop("close_fail", None)
+            break
     cfg["last_close_ts"] = wm
     _save(cfg)
     return n

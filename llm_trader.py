@@ -360,6 +360,16 @@ def _whale_flow_map() -> dict[str, dict[str, Any]]:
         return {}
 
 
+# Codex blocker (fail-OPEN): when venue metadata is unavailable the dynamic set is
+# empty and every TradFi symbol slipped BACK into mech auto-fire + got mis-routed to
+# Binance. Static fallback = the 22 known TidalFi-only markets; gates take the UNION.
+TIDALFI_TRADFI_STATIC = frozenset({
+    "XAUUSDT", "XAGUSDT", "MUUSDT", "SPCXUSDT", "INTCUSDT", "NVDAUSDT", "AMDUSDT",
+    "METAUSDT", "TSLAUSDT", "ORCLUSDT", "TSMUSDT", "MSFTUSDT", "GOOGLUSDT", "AAPLUSDT",
+    "AVGOUSDT", "AMZNUSDT", "OPENAIUSDT", "JPMUSDT", "CSCOUSDT", "WMTUSDT",
+    "BRKBUSDT", "VUSDT",
+})
+
 _TD_ADAPTER_ERR_LOGGED: set = set()
 _TD_BAR_CACHE: dict = {}
 
@@ -374,7 +384,7 @@ def _fetch_bars_any(sym: str, tf: str, months: float, end_ms: int, client: Any,
     fetch per (symbol, tf, bar boundary), the rest served from memory."""
     try:
         import tidalfi_data as td
-        if sym in td.tidalfi_only_symbols():
+        if sym in (TIDALFI_TRADFI_STATIC | set(td.tidalfi_only_symbols() or ())):
             _lim = min(1000, max(60, int(months * 30 * 86_400_000 / of._TF_MS[tf])))
             _ck = (sym, tf, int(end_ms) // of._TF_MS[tf], _lim)
             hit = _TD_BAR_CACHE.get(_ck)
@@ -394,6 +404,9 @@ def _fetch_bars_any(sym: str, tf: str, months: float, end_ms: int, client: Any,
             _TD_ADAPTER_ERR_LOGGED.add(sym)
             _append(LT_DIR / "governance.jsonl",
                     {"event": "tidalfi_adapter_error", "symbol": sym, "error": repr(_e)[:120]})
+        if sym in TIDALFI_TRADFI_STATIC:
+            return []      # fail-CLOSED: NEVER route a TradFi symbol to Binance
+                           # ("Invalid symbol" -> silent park); [] parks WITH the log above
     return of.fetch_klines_with_flow(sym, tf, months=months, end_ms=end_ms, client=client, **kw)
 
 
@@ -865,10 +878,10 @@ def _non_tidalfi_ctx(ctx: list[dict[str, Any]]) -> list[dict[str, Any]]:
     (the stated Phase-2 goal) until per-venue expectancy exists."""
     try:
         import tidalfi_data as td
-        _tf = td.tidalfi_only_symbols()
-        return [c for c in ctx if c.get("symbol") not in _tf]
+        _tf = TIDALFI_TRADFI_STATIC | set(td.tidalfi_only_symbols() or ())
     except Exception:
-        return ctx
+        _tf = TIDALFI_TRADFI_STATIC    # Codex blocker: fail-CLOSED — a metadata outage must
+    return [c for c in ctx if c.get("symbol") not in _tf]   # never re-arm mech on TradFi
 
 
 def _flush_mech_decisions(ctx: list[dict[str, Any]], trig_map: dict[str, Any],
