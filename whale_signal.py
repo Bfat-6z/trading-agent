@@ -212,9 +212,16 @@ def _winrates() -> dict:
         w = sum(1 for r in sub if float(r.get("net", 0) or 0) > 0)
         return f"{round(w / len(sub) * 100)}% ({w}/{len(sub)})"
 
-    out["flush"] = wr([r for r in rows if r.get("mech_method") == "flush_no_oi_mech"])
-    out["model"] = wr([r for r in rows if not r.get("mech_method")][-40:])   # recent model only
+    def stat(sub):
+        return (sum(1 for r in sub if float(r.get("net", 0) or 0) > 0), len(sub))
+
+    _fl = [r for r in rows if r.get("mech_method") == "flush_no_oi_mech"]
+    _md = [r for r in rows if not r.get("mech_method")][-40:]   # recent model only
+    out["flush"] = wr(_fl)
+    out["model"] = wr(_md)
     out["recent"] = wr(rows[-30:])
+    out["flush_stat"] = stat(_fl)    # numeric (wins, n) for the OWNER LAW winrate gate
+    out["model_stat"] = stat(_md)
     return out
 
 
@@ -375,6 +382,20 @@ def emit(open_rows: list[dict], closed_rows: list[dict] | None = None) -> int:
                   f"⏰ <b>KHỚP TRỄ — {_sym}</b> (mở ~{round(_age_min)} phút trước, bot vừa hồi). "
                   f"Kèo KHÔNG còn fresh — nếu limit của mày cũng đã khớp thì check vị thế + đặt SL.")
             _log({"skip_stale_entry": str(p.get("symbol")), "age_min": round(_age_min)})
+            continue
+        # OWNER LAW 2026-07-15: "winrate phải trên 50%" — a signal reaches the boss's
+        # REAL prop account only from a source with a PROVEN >50% win rate (n>=10).
+        # Unproven (n<10) = not proven >50% = no signal; the paper book keeps building
+        # the track record regardless. min_wr/min_wr_n overridable in config.
+        _is_fl = str(p.get("mech_method") or "").startswith("flush")
+        _w, _n = (wr.get("flush_stat") if _is_fl else wr.get("model_stat")) or (0, 0)
+        _min_wr = float(cfg.get("min_wr") or 50.0)
+        _min_n = int(cfg.get("min_wr_n") or 10)
+        if _n < _min_n or (_w / _n * 100.0) <= _min_wr:
+            sent.add(pid)
+            _log({"skip_low_winrate": str(p.get("symbol")),
+                  "src": "flush" if _is_fl else "model",
+                  "wr": round(_w / _n * 100.0, 1) if _n else None, "n": _n})
             continue
         exposure["seq"] = int(cfg.get("seq") or 0) + 1
         text = _fmt_signal(p, wr, exposure)
@@ -697,6 +718,13 @@ def emit_pending(pending_rows: list[dict]) -> int:
         is_flush = str(q.get("mech_method") or "").startswith("flush")
         src = "🤖 máy (flush)" if is_flush else "🧠 model"
         wr = _winrates()
+        # OWNER LAW 2026-07-15: >50% proven win rate (n>=10) or no ticket — same gate as emit().
+        _w, _n = (wr.get("flush_stat") if is_flush else wr.get("model_stat")) or (0, 0)
+        if _n < int(cfg.get("min_wr_n") or 10) or (_w / _n * 100.0) <= float(cfg.get("min_wr") or 50.0):
+            seen_next.add(qid)               # suppressed by law -> also no cancel-notice later
+            _log({"skip_low_winrate": str(q.get("symbol")), "src": "flush" if is_flush else "model",
+                  "wr": round(_w / _n * 100.0, 1) if _n else None, "n": _n, "path": "pending"})
+            continue
         wr_src = wr.get("flush") if is_flush else wr.get("model")
         wr_bits = []
         if wr_src:
