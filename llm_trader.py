@@ -1032,10 +1032,20 @@ def memory_context() -> dict[str, Any]:
         # replacing the degenerate mistakes block — and then never wired into any prompt
         # (loop-forensic). The model now sees its measured noise-vs-thesis split + hint.
         import llm_trader_learning as ltl
-        cal = ltl.calibration_report(_dedupe_closed(_load(CLOSED)), window=40)
+        _rows = _dedupe_closed(_load(CLOSED))
+        _disc = [r for r in _rows if isinstance(r, dict) and not r.get("mech_method")]
+        _era = [r for r in _disc if r.get("model") == MODEL
+                and r.get("thesis_wrong") is not None]
+        # Codex review: calibration must follow the SAME era policy the memory block
+        # claims — own-era once >=8 instrumented rows exist, else the recent mixed
+        # window HONESTLY LABELLED as prior-era system history.
+        _own = len(_era) >= 8
+        cal = ltl.calibration_report(_era if _own else _disc[-40:], window=40)
         ctx["calibration"] = {k: cal.get(k) for k in
                               ("n", "win_rate", "mean_actual_R", "noise_stop_rate",
                                "thesis_wrong_rate", "over_optimism_R", "verdict_hint")}
+        ctx["calibration"]["scope"] = ("your OWN record (current model)" if _own else
+                                       "mostly PREVIOUS model era — system history, not your record")
     except Exception:
         pass
     return ctx

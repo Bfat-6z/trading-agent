@@ -386,7 +386,10 @@ def test_decide_prompt_carries_build_memory_context(tmp_path, monkeypatch):
     # The injected block is EXACTLY this module's distilled context, era-windowed
     # to the current model (P1 #11) — not the old 8-raw-rows relevant_lessons
     # payload. HAND8 carries no model stamps -> prior-era fallback + era_note.
-    assert sent["memory"] == ltm.build_memory_context(HAND8, model=lt.MODEL)
+    _mem = dict(sent["memory"])
+    _cal = _mem.pop("calibration", None)          # memory_context also rides the calibration
+    assert _mem == ltm.build_memory_context(HAND8, model=lt.MODEL)   # report (thesis-feedback)
+    assert _cal is not None and "thesis_wrong_rate" in _cal and "scope" in _cal
     assert "era_note" in sent["memory"]
     assert "SOLUSDT SHORT: 1W/2L, mean -0.17R" in sent["memory"]["lessons"]
     assert all("your_past_outcomes" not in coin for coin in sent["coins"])
@@ -404,7 +407,9 @@ def test_decide_memory_fail_open_without_history(tmp_path, monkeypatch):
     captured = _capture_llm(monkeypatch, lt)
     assert lt.decide(_decide_market_ctx(), 100.0) == []
     sent = json.loads(captured["user"])
-    assert sent["memory"] == ltm.build_memory_context([], model=lt.MODEL)
+    _mem = dict(sent["memory"])
+    _mem.pop("calibration", None)
+    assert _mem == ltm.build_memory_context([], model=lt.MODEL)
 
 
 def test_decide_rule_enforcement_survives_memory_wiring(tmp_path, monkeypatch):

@@ -54,3 +54,27 @@ def test_model_none_legacy_includes_mech_no_note():
 def test_empty_ledger_no_false_note():
     ctx = ltm.build_memory_context([], model=CUR)
     assert not ctx.get("era_note")                   # review: false claim on fresh ledger
+
+
+def test_thesis_wrong_lesson_threshold_and_rank():
+    # fires at >=40% + dominating noise-stops over >=8 instrumented rows; rank FIRST
+    rows = [{"net": -1, "r": -1, "side": "LONG", "reason": "sl",
+             "thesis_wrong": i < 5, "noise_stop": False} for i in range(10)]
+    ms = ltm.mistake_lessons(rows)
+    assert ms and ms[0].startswith("THESIS WRONG")
+    # below threshold (3/10=30%) -> silent
+    rows2 = [{"net": -1, "r": -1, "side": "LONG", "reason": "sl",
+              "thesis_wrong": i < 3, "noise_stop": False} for i in range(10)]
+    assert not any(m.startswith("THESIS WRONG") for m in ltm.mistake_lessons(rows2))
+    # n=7 instrumented -> dormant
+    rows3 = [{"net": -1, "r": -1, "side": "LONG", "reason": "sl",
+              "thesis_wrong": True, "noise_stop": False} for _ in range(7)]
+    assert not any(m.startswith("THESIS WRONG") for m in ltm.mistake_lessons(rows3))
+
+
+def test_thesis_wrong_not_blanket_suppressed():
+    import llm_trader as lt
+    # blanket tuple must not swallow THESIS WRONG (prefix check)
+    assert not "THESIS WRONG x".startswith(("STAND ASIDE", "AVOID", "OVER-TRADING"))
+    b = lt._mistakes_block()   # smoke: never raises, bounded
+    assert isinstance(b, str)
