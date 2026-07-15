@@ -677,7 +677,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval-seconds", type=float, default=20.0)
-    ap.add_argument("--mark-refresh-seconds", type=float, default=5.0)   # fast live-price cadence
+    ap.add_argument("--mark-refresh-seconds", type=float, default=30.0)   # fast live-price cadence
     a = ap.parse_args()
     if a.loop:
         stop = UI / "horizon_data.stop"
