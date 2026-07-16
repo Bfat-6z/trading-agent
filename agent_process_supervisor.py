@@ -122,7 +122,8 @@ def specs() -> list[AgentSpec]:
         # file). Without that env the dashboard falls back to local-only.
         AgentSpec("dashboard", "agent_status_dashboard.py", ("--host", "0.0.0.0", "--port", "8090"), STATE_DIR / "agent_status_dashboard.pid", None, None),
         AgentSpec("host_runtime_monitor", "host_runtime_monitor.py", ("--interval-seconds", "300"), STATE_DIR / "host_runtime_monitor.pid", STATE_DIR / "host_runtime_monitor_heartbeat.json", 900),
-        AgentSpec("market_observer", "market_observer.py", tuple(), STATE_DIR / "market_observer.pid", STATE_DIR / "market_observer_heartbeat.json", 420),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("market_observer", "market_observer.py", tuple(), STATE_DIR / "market_observer.pid", STATE_DIR / "market_observer_heartbeat.json", 420),
         AgentSpec("news_observer", "news_observer.py", tuple(), STATE_DIR / "news_observer.pid", STATE_DIR / "news_observer_heartbeat.json", 900),
         # CUT (gpt-5.5 architecture review 2026-07-05): alpha theater — the mission bot,
         # method lab, deep_validation and forward_test have ZERO dependency on it. Kept
@@ -132,13 +133,20 @@ def specs() -> list[AgentSpec]:
         # near-zero signal, off every decision path; lesson mining is now deterministic
         # in brain.mine_lessons() from real trade autopsies. Re-add to revive.
         # AgentSpec("reflection_agent", "reflection_agent.py", ("--interval-hours", "0.5"), STATE_DIR / "reflection_agent.pid", STATE_DIR / "reflection_agent_heartbeat.json", 2400),
-        AgentSpec("cognitive_supervisor", "cognitive_supervisor.py", ("--interval-minutes", "20"), STATE_DIR / "cognitive_supervisor.pid", STATE_DIR / "cognitive_supervisor_heartbeat.json", 1500),
-        AgentSpec("llm_reasoning_agent", "llm_reasoning_agent.py", ("--interval-minutes", "60"), STATE_DIR / "llm_reasoning_agent.pid", STATE_DIR / "llm_reasoning_agent_heartbeat.json", 900),
-        AgentSpec("paper_candidate_feeder", "paper_candidate_feeder.py", ("--interval-seconds", "60"), STATE_DIR / "paper_candidate_feeder.pid", STATE_DIR / "paper_candidate_feeder_heartbeat.json", 180),
-        AgentSpec("autonomous_paper_trading_loop", "autonomous_paper_trading_loop.py", ("--interval-seconds", "60"), STATE_DIR / "autonomous_paper_trading_loop.pid", STATE_DIR / "autonomous_paper_trading_loop_heartbeat.json", 180),
-        AgentSpec("paper_execution_lifecycle_loop", "paper_execution_lifecycle_loop.py", ("--interval-seconds", "30"), STATE_DIR / "paper_execution_lifecycle_loop.pid", STATE_DIR / "paper_execution_lifecycle_loop_heartbeat.json", 120),
-        AgentSpec("microstructure_observer_loop", "microstructure_observer_loop.py", ("--interval-seconds", "60"), STATE_DIR / "microstructure_observer_loop.pid", STATE_DIR / "microstructure_observer_loop_heartbeat.json", 180),
-        AgentSpec("microstructure_flow_factory", "microstructure_flow_factory.py", ("--interval-seconds", "60"), STATE_DIR / "microstructure_flow_factory.pid", STATE_DIR / "microstructure_flow_factory_heartbeat.json", 180),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("cognitive_supervisor", "cognitive_supervisor.py", ("--interval-minutes", "20"), STATE_DIR / "cognitive_supervisor.pid", STATE_DIR / "cognitive_supervisor_heartbeat.json", 1500),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("llm_reasoning_agent", "llm_reasoning_agent.py", ("--interval-minutes", "60"), STATE_DIR / "llm_reasoning_agent.pid", STATE_DIR / "llm_reasoning_agent_heartbeat.json", 900),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("paper_candidate_feeder", "paper_candidate_feeder.py", ("--interval-seconds", "60"), STATE_DIR / "paper_candidate_feeder.pid", STATE_DIR / "paper_candidate_feeder_heartbeat.json", 180),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("autonomous_paper_trading_loop", "autonomous_paper_trading_loop.py", ("--interval-seconds", "60"), STATE_DIR / "autonomous_paper_trading_loop.pid", STATE_DIR / "autonomous_paper_trading_loop_heartbeat.json", 180),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("paper_execution_lifecycle_loop", "paper_execution_lifecycle_loop.py", ("--interval-seconds", "30"), STATE_DIR / "paper_execution_lifecycle_loop.pid", STATE_DIR / "paper_execution_lifecycle_loop_heartbeat.json", 120),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("microstructure_observer_loop", "microstructure_observer_loop.py", ("--interval-seconds", "60"), STATE_DIR / "microstructure_observer_loop.pid", STATE_DIR / "microstructure_observer_loop_heartbeat.json", 180),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("microstructure_flow_factory", "microstructure_flow_factory.py", ("--interval-seconds", "60"), STATE_DIR / "microstructure_flow_factory.pid", STATE_DIR / "microstructure_flow_factory_heartbeat.json", 180),
         AgentSpec("whale_flow_observer", "whale_flow_observer.py", ("--interval-seconds", "180"), STATE_DIR / "whale_flow_observer.pid", STATE_DIR / "whale_flow_observer_heartbeat.json", 600),
         AgentSpec("forward_test_harness", "forward_test_harness.py", ("--interval-seconds", "900"), STATE_DIR / "forward_test" / "forward_test_harness.pid", STATE_DIR / "forward_test" / "forward_test_harness_heartbeat.json", 2700),
         AgentSpec("forward_strategy_paper", "forward_strategy_paper.py", ("--interval-seconds", "1800"), STATE_DIR / "forward_strategy" / "forward_strategy_paper.pid", STATE_DIR / "forward_strategy" / "forward_strategy_paper_heartbeat.json", 4200),
@@ -191,7 +199,8 @@ def specs() -> list[AgentSpec]:
         # CUT (post-ship sweep 2026-07-06): its food chain is gone — it consumed
         # reflection_agent's profile.json (cut) and fed self_model (cut). Theater tier.
         # AgentSpec("self_improvement_agent", "self_improvement_agent.py", ("--interval-hours", "6"), STATE_DIR / "self_improvement_agent.pid", STATE_DIR / "self_improvement_agent_heartbeat.json", 28800),
-        AgentSpec("daily_exam_agent", "daily_exam_agent.py", ("--check-seconds", "300"), STATE_DIR / "daily_exam_agent.pid", STATE_DIR / "daily_exam_agent_heartbeat.json", 900),
+        # CUT 2026-07-16 (ban+RAM forensic: 0 mission/funnel consumers): 
+        # AgentSpec("daily_exam_agent", "daily_exam_agent.py", ("--check-seconds", "300"), STATE_DIR / "daily_exam_agent.pid", STATE_DIR / "daily_exam_agent_heartbeat.json", 900),
     ]
 
 
